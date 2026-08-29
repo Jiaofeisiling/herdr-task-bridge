@@ -143,3 +143,45 @@ def test_init_db_orphans_stale_running_rows_on_restart(tmp_path, monkeypatch):
     task = bridge.get_task(task_id)
     assert task["status"] == "orphaned"
     assert "restarted" in task["error_text"]
+
+
+import json as json_module
+
+
+def test_get_agent_status_idle(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True,
+        "stdout": json_module.dumps({"result": {"agent": {"agent_status": "idle"}}}),
+        "stderr": "",
+    })
+
+    status, _ = bridge.get_agent_status()
+
+    assert status == "idle"
+
+
+def test_get_agent_status_herdr_failure_returns_none(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "stdout": "", "stderr": "connection refused",
+    })
+
+    status, result = bridge.get_agent_status()
+
+    assert status is None
+    assert result["ok"] is False
+
+
+def test_get_agent_status_bad_json_returns_none(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "not json", "stderr": "",
+    })
+
+    status, result = bridge.get_agent_status()
+
+    assert status is None
+    assert result["ok"] is False
+    assert "Unable to parse" in result["error"]
+
+
+def test_available_states_contains_idle_and_done():
+    assert bridge.AVAILABLE_STATES == {"idle", "done"}

@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
 import uuid
 
@@ -163,6 +164,44 @@ def orphan_task(task_id, error_text):
             SET status = 'orphaned', error_text = ?, finished_at = ?
             WHERE task_id = ?
         """, (error_text, now_iso(), task_id))
+
+
+AGENT_LOCK = threading.Lock()
+
+AVAILABLE_STATES = {
+    "idle",
+    "done",
+}
+
+
+def get_agent_status():
+    result = run_herdr(
+        "agent",
+        "get",
+        SENTINEL,
+        timeout=10,
+    )
+
+    if not result["ok"]:
+        return None, result
+
+    try:
+        payload = json.loads(result["stdout"])
+
+        agent = (
+            payload
+            .get("result", {})
+            .get("agent", {})
+        )
+
+        return agent.get("agent_status"), result
+
+    except Exception as e:
+        return None, {
+            "ok": False,
+            "error": f"Unable to parse Herdr status: {e}",
+            "raw": result["stdout"],
+        }
 
 
 def run_herdr(*args, timeout=None):
