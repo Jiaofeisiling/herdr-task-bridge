@@ -1,9 +1,13 @@
+import contextlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
+import time
 import uuid
 
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -12,6 +16,153 @@ PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 SENTINEL = os.environ.get("SENTINEL_AGENT", "sentinel")
+
+DB_PATH = os.environ.get(
+    "SENTINEL_DB",
+    os.path.expanduser("~/sentinel-bridge/tasks.db"),
+)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextlib.contextmanager
+def db_session():
+    # sqlite3.Connection used as `with conn:` only commits/rolls back —
+    # it does NOT close the connection, so close it explicitly here.
+    conn = db_connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+    with db_session() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                task TEXT NOT NULL,
+
+                status TEXT NOT NULL,
+
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+
+                timeout_ms INTEGER NOT NULL,
+
+                result_text TEXT,
+                error_text TEXT
+            )
+        """)
+
+        # 如果 bridge 在一个任务执行期间崩溃，
+        # 千万不要自动重新运行它，否则可能重复执行危险操作。
+        conn.execute("""
+            UPDATE tasks
+            SET
+                status = 'orphaned',
+                finished_at = ?,
+                error_text = COALESCE(
+                    error_text,
+                    'Bridge restarted while this task was running. Sentinel may have partially or fully executed it.'
+                )
+            WHERE status = 'running'
+        """, (now_iso(),))
+
+
+def create_task(task, timeout_ms):
+    task_id = str(uuid.uuid4())
+
+    with db_session() as conn:
+        conn.execute("""
+            INSERT INTO tasks (
+                task_id, task, status, created_at, timeout_ms
+            )
+            VALUES (?, ?, 'queued', ?, ?)
+        """, (task_id, task, now_iso(), timeout_ms))
+
+    return task_id
+
+
+def get_task(task_id):
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def list_tasks(limit=20):
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def peek_next_task():
+    with db_session() as conn:
+        row = conn.execute("""
+            SELECT * FROM tasks
+            WHERE status = 'queued'
+            ORDER BY created_at ASC
+            LIMIT 1
+        """).fetchone()
+
+    return dict(row) if row else None
+
+
+def claim_task(task_id):
+    with db_session() as conn:
+        cursor = conn.execute("""
+            UPDATE tasks
+            SET status = 'running', started_at = ?
+            WHERE task_id = ? AND status = 'queued'
+        """, (now_iso(), task_id))
+
+        return cursor.rowcount == 1
+
+
+def complete_task(task_id, result_text):
+    with db_session() as conn:
+        conn.execute("""
+            UPDATE tasks
+            SET status = 'done', result_text = ?, finished_at = ?
+            WHERE task_id = ?
+        """, (result_text, now_iso(), task_id))
+
+
+def fail_task(task_id, error_text):
+    with db_session() as conn:
+        conn.execute("""
+            UPDATE tasks
+            SET status = 'error', error_text = ?, finished_at = ?
+            WHERE task_id = ?
+        """, (error_text, now_iso(), task_id))
+
+
+def orphan_task(task_id, error_text):
+    with db_session() as conn:
+        conn.execute("""
+            UPDATE tasks
+            SET status = 'orphaned', error_text = ?, finished_at = ?
+            WHERE task_id = ?
+        """, (error_text, now_iso(), task_id))
 
 
 def run_herdr(*args, timeout=None):

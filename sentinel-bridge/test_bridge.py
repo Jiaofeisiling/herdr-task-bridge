@@ -42,3 +42,104 @@ def test_extract_task_response_falls_back_without_assistant_marker():
     result = bridge.extract_task_response(raw, task_id)
 
     assert result == "raw terminal text with no bullet marker"
+
+
+def _fresh_db(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    bridge.init_db()
+    return db_path
+
+
+def test_create_and_get_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("check disk space", 60000)
+    task = bridge.get_task(task_id)
+
+    assert task["status"] == "queued"
+    assert task["task"] == "check disk space"
+    assert task["timeout_ms"] == 60000
+    assert task["result_text"] is None
+    assert task["error_text"] is None
+
+
+def test_get_task_missing_returns_none(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    assert bridge.get_task("does-not-exist") is None
+
+
+def test_list_tasks_orders_newest_first(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    first = bridge.create_task("first", 1000)
+    second = bridge.create_task("second", 1000)
+
+    tasks = bridge.list_tasks()
+
+    assert [t["task_id"] for t in tasks] == [second, first]
+
+
+def test_claim_task_only_succeeds_once(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("t", 1000)
+
+    assert bridge.claim_task(task_id) is True
+    assert bridge.claim_task(task_id) is False
+    assert bridge.get_task(task_id)["status"] == "running"
+
+
+def test_peek_next_task_returns_oldest_queued(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    first = bridge.create_task("first", 1000)
+    bridge.create_task("second", 1000)
+
+    assert bridge.peek_next_task()["task_id"] == first
+
+
+def test_peek_next_task_returns_none_when_empty(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    assert bridge.peek_next_task() is None
+
+
+def test_complete_task_sets_result(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("t", 1000)
+    bridge.claim_task(task_id)
+    bridge.complete_task(task_id, "all good")
+
+    task = bridge.get_task(task_id)
+    assert task["status"] == "done"
+    assert task["result_text"] == "all good"
+    assert task["finished_at"] is not None
+
+
+def test_fail_task_sets_error(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("t", 1000)
+    bridge.claim_task(task_id)
+    bridge.fail_task(task_id, "boom")
+
+    task = bridge.get_task(task_id)
+    assert task["status"] == "error"
+    assert task["error_text"] == "boom"
+
+
+def test_init_db_orphans_stale_running_rows_on_restart(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("t", 1000)
+    bridge.claim_task(task_id)
+
+    # simulate a bridge restart against the same database file
+    bridge.init_db()
+
+    task = bridge.get_task(task_id)
+    assert task["status"] == "orphaned"
+    assert "restarted" in task["error_text"]
