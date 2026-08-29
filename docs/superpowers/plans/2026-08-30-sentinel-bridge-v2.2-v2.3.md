@@ -872,6 +872,17 @@ def test_acquire_agent_for_delegation_releases_lock_when_body_raises(monkeypatch
         with bridge.acquire_agent_for_delegation():
             raise ValueError("boom from caller body")
 
+
+def test_acquire_agent_for_delegation_converts_status_query_exception(monkeypatch):
+    def boom():
+        raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=10)
+
+    monkeypatch.setattr(bridge, "get_agent_status", boom)
+
+    with pytest.raises(bridge.SentinelUnavailableError):
+        with bridge.acquire_agent_for_delegation():
+            pass
+
     assert bridge.AGENT_LOCK.locked() is False
 ```
 
@@ -881,7 +892,7 @@ def test_acquire_agent_for_delegation_releases_lock_when_body_raises(monkeypatch
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: the 5 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'acquire_agent_for_delegation'`.
+Expected: the 6 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'acquire_agent_for_delegation'`.
 
 - [ ] **Step 3: Implement**
 
@@ -904,7 +915,18 @@ def acquire_agent_for_delegation():
         raise SentinelBusyError("locked")
 
     try:
-        agent_status, status_result = get_agent_status()
+        try:
+            agent_status, status_result = get_agent_status()
+        except Exception as e:
+            # get_agent_status() only returns (None, ...) for herdr/JSON
+            # failures it can see coming — a hung herdr process still
+            # raises subprocess.TimeoutExpired out of run_herdr(). Catch
+            # that (and anything else unexpected) here so callers only
+            # ever see SentinelBusyError/SentinelUnavailableError, never
+            # a raw exception escaping this contextmanager.
+            raise SentinelUnavailableError(
+                f"unable to query Sentinel status: {e}"
+            )
 
         if agent_status is None:
             raise SentinelUnavailableError(
@@ -927,7 +949,7 @@ def acquire_agent_for_delegation():
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 28 passed.
+Expected: 29 passed.
 
 ---
 
@@ -1164,7 +1186,7 @@ Note two intentional small fixes versus the original: `/read` is now matched wit
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 36 passed.
+Expected: 37 passed.
 
 ---
 
@@ -1471,7 +1493,7 @@ Replace the entire `do_POST` method with:
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 45 passed.
+Expected: 46 passed.
 
 ---
 
@@ -1638,7 +1660,7 @@ if __name__ == "__main__":
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 47 passed.
+Expected: 48 passed.
 
 - [ ] **Step 5: Run the full suite one more time to confirm nothing earlier regressed**
 
@@ -1646,7 +1668,7 @@ Expected: 47 passed.
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 47 passed, 0 failed.
+Expected: 48 passed, 0 failed.
 
 ---
 
