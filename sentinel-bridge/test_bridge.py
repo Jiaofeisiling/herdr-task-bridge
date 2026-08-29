@@ -276,3 +276,32 @@ def test_execute_sentinel_task_marker_missing_after_recovery_raises(monkeypatch)
         bridge.execute_sentinel_task(
             "33333333-3333-3333-3333-333333333333", "task", 60000
         )
+
+
+def test_execute_sentinel_task_raises_marker_missing_when_recovery_prompt_fails(monkeypatch):
+    task_id = "44444444-4444-4444-4444-444444444444"
+    state = {"prompt_calls": 0, "read_calls": 0}
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            state["prompt_calls"] += 1
+            if state["prompt_calls"] == 1:
+                # First prompt (delegation) succeeds
+                return {"ok": True, "stdout": "", "stderr": ""}
+            else:
+                # Second prompt (recovery) fails
+                return {"ok": False, "stdout": "", "stderr": "recovery failed"}
+
+        if args[1] == "read":
+            state["read_calls"] += 1
+            # All reads return no marker
+            return {"ok": True, "stdout": "没有 marker 的输出", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(bridge.SentinelMarkerMissingError):
+        bridge.execute_sentinel_task(task_id, "task", 60000)
+
+    # Verify that we got exactly 2 prompt calls (initial + recovery) and 1 read call (no second read after failed recovery)
+    assert state["prompt_calls"] == 2
+    assert state["read_calls"] == 1
