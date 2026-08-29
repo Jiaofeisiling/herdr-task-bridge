@@ -12,6 +12,7 @@
 
 - No new runtime dependencies in `bridge.py` (stdlib only) — matches the user's explicit "don't introduce Redis/Temporal/etc." constraint for v2.3.
 - `pytest` is installed locally only, for developing/testing the working copy before it is deployed to the remote host; it must NOT be required on the remote NeSI-reachable host to run `bridge.py`.
+- All local pytest runs use the project virtualenv at `C:\Tools\sentinel-bridge\.venv` (its interpreter: `C:\Tools\sentinel-bridge\.venv\Scripts\python.exe`, or `/c/Tools/sentinel-bridge/.venv/Scripts/python.exe` from Git Bash) — never the bare `/e/ProgramData/miniforge3/python`, which cannot `pip install` anything as a non-admin user. `.venv/` is git-ignored.
 - All new/changed HTTP responses stay `ensure_ascii=False`, UTF-8 encoded JSON (already the existing pattern in `send_json`) — Chinese text in `result.text` must round-trip without mangling.
 - `/health` must never call `run_herdr`, `get_agent_status`, or touch the SQLite DB — it only proves the bridge process itself is alive. This is deliberate: it is the tool that lets you tell "bridge process dead" apart from "bridge alive but Sentinel busy".
 - `/delegate` never checks Sentinel's busy state and never touches `AGENT_LOCK` — it only enqueues. Busy/idle gating happens later, when the worker (or `/ask`) actually tries to run the task.
@@ -37,13 +38,15 @@
 - Consumes: `build_delegation_prompt(task, task_id)`, `extract_task_response(raw, task_id)` — both already exist in the seeded file.
 - Produces: nothing new; this task only locks in existing behavior with tests before any refactor touches it.
 
-- [ ] **Step 1: Install pytest locally**
+- [ ] **Step 1: Confirm the project virtualenv has pytest installed**
+
+`C:\Tools\sentinel-bridge\.venv` already exists (created once against the base `/e/ProgramData/miniforge3/python` interpreter — that conda installation refuses `pip install` for non-admin users, including `--user`, since it has `site.ENABLE_USER_SITE = False`, so every task in this plan uses this project-local venv instead). Confirm pytest is present; install it if this is a fresh checkout without the venv:
 
 ```bash
-/e/ProgramData/miniforge3/python -m pip install pytest
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pip install pytest
 ```
 
-Expected: pytest installs successfully.
+Expected: `Requirement already satisfied` (or a fresh install if the venv didn't exist yet).
 
 - [ ] **Step 2: Write characterization tests for the existing marker-extraction logic**
 
@@ -101,7 +104,7 @@ def test_extract_task_response_falls_back_without_assistant_marker():
 - [ ] **Step 3: Run the tests and confirm they pass against the untouched baseline**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 4 passed. (Fix the first characterization test's redundant assert lines if they read oddly — keep only the two meaningful assertions: `token in prompt` and `"检查磁盘" in prompt` and `"SENTINEL_DONE_" in prompt`; drop the three `not in` sanity lines, they were scratch reasoning, not real assertions.)
@@ -243,7 +246,7 @@ def test_init_db_orphans_stale_running_rows_on_restart(tmp_path, monkeypatch):
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: the 9 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'create_task'` (or similar).
@@ -417,7 +420,7 @@ Note: `uuid` is already imported at the top of the existing file (used by `do_PO
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 13 passed.
@@ -484,7 +487,7 @@ def test_available_states_contains_idle_and_done():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: the 4 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'get_agent_status'`.
@@ -537,7 +540,7 @@ def get_agent_status():
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 17 passed.
@@ -653,7 +656,7 @@ def test_execute_sentinel_task_marker_missing_after_recovery_raises(monkeypatch)
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: the 6 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'execute_sentinel_task'`.
@@ -795,7 +798,7 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 23 passed.
@@ -876,7 +879,7 @@ def test_acquire_agent_for_delegation_releases_lock_when_body_raises(monkeypatch
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: the 5 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'acquire_agent_for_delegation'`.
@@ -922,7 +925,7 @@ def acquire_agent_for_delegation():
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 28 passed.
@@ -1051,7 +1054,7 @@ def test_task_get_found(live_server):
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: the new `/ready`, `/tasks`, `/tasks/<id>` tests FAIL (404 "not found" instead of the expected responses); `/health` test passes already (no change needed there yet).
@@ -1159,7 +1162,7 @@ Note two intentional small fixes versus the original: `/read` is now matched wit
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 36 passed.
@@ -1297,7 +1300,7 @@ def test_ask_rejects_empty_task(live_server):
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: the `/delegate` tests fail with 404 (route doesn't exist yet); the `/ask` busy/unavailable tests fail because there's no lock/status check yet; `test_ask_happy_path` currently passes by coincidence with the old code (leave it, it'll still pass after the rewrite) — check its actual result carefully, it may already pass since old `/ask` doesn't check busy state.
@@ -1466,7 +1469,7 @@ Replace the entire `do_POST` method with:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 45 passed.
@@ -1538,7 +1541,7 @@ def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: both FAIL with `AttributeError: module 'bridge' has no attribute 'task_worker'`.
@@ -1633,7 +1636,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 47 passed.
@@ -1641,7 +1644,7 @@ Expected: 47 passed.
 - [ ] **Step 5: Run the full suite one more time to confirm nothing earlier regressed**
 
 ```bash
-cd "/c/Tools/sentinel-bridge" && /e/ProgramData/miniforge3/python -m pytest test_bridge.py -v
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 Expected: 47 passed, 0 failed.
