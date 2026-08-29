@@ -333,6 +333,50 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
     return response
 
 
+class SentinelBusyError(RuntimeError):
+    def __init__(self, agent_status):
+        self.agent_status = agent_status
+        super().__init__(f"Sentinel busy: {agent_status}")
+
+
+class SentinelUnavailableError(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def acquire_agent_for_delegation():
+    if not AGENT_LOCK.acquire(blocking=False):
+        raise SentinelBusyError("locked")
+
+    try:
+        try:
+            agent_status, status_result = get_agent_status()
+        except Exception as e:
+            # get_agent_status() only returns (None, ...) for herdr/JSON
+            # failures it can see coming — a hung herdr process still
+            # raises subprocess.TimeoutExpired out of run_herdr(). Catch
+            # that (and anything else unexpected) here so callers only
+            # ever see SentinelBusyError/SentinelUnavailableError, never
+            # a raw exception escaping this contextmanager.
+            raise SentinelUnavailableError(
+                f"unable to query Sentinel status: {e}"
+            )
+
+        if agent_status is None:
+            raise SentinelUnavailableError(
+                status_result.get(
+                    "error", "unable to query Sentinel status"
+                )
+            )
+
+        if agent_status not in AVAILABLE_STATES:
+            raise SentinelBusyError(agent_status)
+
+        yield
+    finally:
+        AGENT_LOCK.release()
+
+
 def run_herdr(*args, timeout=None):
     result = subprocess.run(
         [HERDR, *args],

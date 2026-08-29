@@ -305,3 +305,70 @@ def test_execute_sentinel_task_raises_marker_missing_when_recovery_prompt_fails(
     # Verify that we got exactly 2 prompt calls (initial + recovery) and 1 read call (no second read after failed recovery)
     assert state["prompt_calls"] == 2
     assert state["read_calls"] == 1
+
+
+def test_acquire_agent_for_delegation_succeeds_when_idle(monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    entered = False
+    with bridge.acquire_agent_for_delegation():
+        entered = True
+
+    assert entered is True
+    assert bridge.AGENT_LOCK.locked() is False
+
+
+def test_acquire_agent_for_delegation_raises_when_busy(monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+
+    with pytest.raises(bridge.SentinelBusyError):
+        with bridge.acquire_agent_for_delegation():
+            pass
+
+    assert bridge.AGENT_LOCK.locked() is False
+
+
+def test_acquire_agent_for_delegation_raises_when_locked_by_another_caller(monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    bridge.AGENT_LOCK.acquire()
+    try:
+        with pytest.raises(bridge.SentinelBusyError):
+            with bridge.acquire_agent_for_delegation():
+                pass
+    finally:
+        bridge.AGENT_LOCK.release()
+
+
+def test_acquire_agent_for_delegation_raises_when_unreachable(monkeypatch):
+    monkeypatch.setattr(
+        bridge, "get_agent_status",
+        lambda: (None, {"ok": False, "error": "no route"}),
+    )
+
+    with pytest.raises(bridge.SentinelUnavailableError):
+        with bridge.acquire_agent_for_delegation():
+            pass
+
+    assert bridge.AGENT_LOCK.locked() is False
+
+
+def test_acquire_agent_for_delegation_releases_lock_when_body_raises(monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    with pytest.raises(ValueError):
+        with bridge.acquire_agent_for_delegation():
+            raise ValueError("boom from caller body")
+
+
+def test_acquire_agent_for_delegation_converts_status_query_exception(monkeypatch):
+    def boom():
+        raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=10)
+
+    monkeypatch.setattr(bridge, "get_agent_status", boom)
+
+    with pytest.raises(bridge.SentinelUnavailableError):
+        with bridge.acquire_agent_for_delegation():
+            pass
+
+    assert bridge.AGENT_LOCK.locked() is False
