@@ -325,8 +325,7 @@ def init_db():
                 finished_at = ?,
                 error_text = COALESCE(
                     error_text,
-                    'Bridge restarted while this task was running. '
-                    'Sentinel may have partially or fully executed it.'
+                    'Bridge restarted while this task was running. Sentinel may have partially or fully executed it.'
                 )
             WHERE status = 'running'
         """, (now_iso(),))
