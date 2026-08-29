@@ -204,6 +204,135 @@ def get_agent_status():
         }
 
 
+class SentinelPromptError(RuntimeError):
+    pass
+
+
+class SentinelReadError(RuntimeError):
+    pass
+
+
+class SentinelMarkerMissingError(RuntimeError):
+    pass
+
+
+def build_recovery_prompt(task_id):
+    token = task_id.replace("-", "")
+
+    return f"""
+你刚才已经完成了来自 Windows Codex 的任务。
+
+不要重新执行任务。
+不要再次运行命令。
+不要修改文件。
+
+请仅根据你刚才已经完成的工作：
+1. 简洁总结最终结果；
+2. 列出重要操作；
+3. 如有 Slurm job，给出 job ID；
+4. 如有修改文件，列出路径；
+5. 如被阻塞，说明原因。
+
+Task token:
+{token}
+
+最后一行必须由字面前缀 SENTINEL_DONE_
+紧接 Task token 组成，中间不得有空格。
+
+最后一行后不要输出其他内容。
+""".strip()
+
+
+def _run_herdr_prompt(delegated_prompt, timeout_ms):
+    try:
+        result = run_herdr(
+            "agent",
+            "prompt",
+            SENTINEL,
+            delegated_prompt,
+            "--wait",
+            "--timeout",
+            str(timeout_ms),
+            timeout=(timeout_ms / 1000) + 15,
+        )
+
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(
+            "Bridge stopped waiting for Sentinel. "
+            "Sentinel may still be executing the task."
+        )
+
+    if not result["ok"]:
+        raise SentinelPromptError(
+            "Herdr prompt command failed: " + result.get("stderr", "")
+        )
+
+    return result
+
+
+def run_prompt_only(task_id, task, timeout_ms):
+    delegated_prompt = build_delegation_prompt(task, task_id)
+    return _run_herdr_prompt(delegated_prompt, timeout_ms)
+
+
+def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
+    delegated_prompt = build_delegation_prompt(task, task_id)
+
+    _run_herdr_prompt(delegated_prompt, timeout_ms)
+
+    read_result = run_herdr(
+        "agent",
+        "read",
+        SENTINEL,
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        str(read_lines),
+    )
+
+    if not read_result["ok"]:
+        raise SentinelReadError(
+            "Unable to read Sentinel output: " + read_result.get("stderr", "")
+        )
+
+    response = extract_task_response(read_result["stdout"], task_id)
+
+    if response is None:
+        recovery_prompt = build_recovery_prompt(task_id)
+
+        recovery_result = run_herdr(
+            "agent",
+            "prompt",
+            SENTINEL,
+            recovery_prompt,
+            "--wait",
+            "--timeout",
+            "120000",
+            timeout=135,
+        )
+
+        if recovery_result["ok"]:
+            read_result = run_herdr(
+                "agent",
+                "read",
+                SENTINEL,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                str(read_lines),
+            )
+
+            response = extract_task_response(read_result["stdout"], task_id)
+
+    if response is None:
+        raise SentinelMarkerMissingError(
+            "Sentinel finished but no completion marker was found, "
+            "including after recovery."
+        )
+
+    return response
+
+
 def run_herdr(*args, timeout=None):
     result = subprocess.run(
         [HERDR, *args],

@@ -185,3 +185,94 @@ def test_get_agent_status_bad_json_returns_none(monkeypatch):
 
 def test_available_states_contains_idle_and_done():
     assert bridge.AVAILABLE_STATES == {"idle", "done"}
+
+
+import subprocess as subprocess_module
+
+import pytest
+
+
+def test_execute_sentinel_task_happy_path(monkeypatch):
+    task_id = "11111111-1111-1111-1111-111111111111"
+    token = task_id.replace("-", "")
+    marker_output = f"● 一切正常\nSENTINEL_DONE_{token}"
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": marker_output, "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    result = bridge.execute_sentinel_task(task_id, "do a thing", 60000)
+
+    assert result == "一切正常"
+
+
+def test_execute_sentinel_task_prompt_failure_raises(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "stdout": "", "stderr": "herdr not found",
+    })
+
+    with pytest.raises(bridge.SentinelPromptError):
+        bridge.execute_sentinel_task("id", "task", 60000)
+
+
+def test_execute_sentinel_task_read_failure_raises(monkeypatch):
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": False, "stdout": "", "stderr": "read broke"}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(bridge.SentinelReadError):
+        bridge.execute_sentinel_task("id", "task", 60000)
+
+
+def test_execute_sentinel_task_timeout_raises(monkeypatch):
+    def fake_run_herdr(*args, **kwargs):
+        raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=1)
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(TimeoutError):
+        bridge.execute_sentinel_task("id", "task", 60000)
+
+
+def test_execute_sentinel_task_recovers_missing_marker(monkeypatch):
+    task_id = "22222222-2222-2222-2222-222222222222"
+    token = task_id.replace("-", "")
+    state = {"reads": 0}
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            return {"ok": True, "stdout": "", "stderr": ""}
+
+        state["reads"] += 1
+
+        if state["reads"] == 1:
+            return {"ok": True, "stdout": "没有 marker 的输出", "stderr": ""}
+
+        return {
+            "ok": True,
+            "stdout": f"● 补发总结\nSENTINEL_DONE_{token}",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    result = bridge.execute_sentinel_task(task_id, "task", 60000)
+
+    assert result == "补发总结"
+
+
+def test_execute_sentinel_task_marker_missing_after_recovery_raises(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "始终没有 marker", "stderr": "",
+    })
+
+    with pytest.raises(bridge.SentinelMarkerMissingError):
+        bridge.execute_sentinel_task(
+            "33333333-3333-3333-3333-333333333333", "task", 60000
+        )
