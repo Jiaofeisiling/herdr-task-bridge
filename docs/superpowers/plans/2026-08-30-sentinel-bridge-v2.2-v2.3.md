@@ -650,6 +650,36 @@ def test_execute_sentinel_task_marker_missing_after_recovery_raises(monkeypatch)
         bridge.execute_sentinel_task(
             "33333333-3333-3333-3333-333333333333", "task", 60000
         )
+
+
+def test_execute_sentinel_task_raises_marker_missing_when_recovery_prompt_fails(monkeypatch):
+    task_id = "44444444-4444-4444-4444-444444444444"
+    state = {"prompt_calls": 0, "read_calls": 0}
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            state["prompt_calls"] += 1
+            if state["prompt_calls"] == 1:
+                # First prompt (delegation) succeeds
+                return {"ok": True, "stdout": "", "stderr": ""}
+            else:
+                # Second prompt (recovery) fails
+                return {"ok": False, "stdout": "", "stderr": "recovery failed"}
+
+        if args[1] == "read":
+            state["read_calls"] += 1
+            # All reads return no marker
+            return {"ok": True, "stdout": "没有 marker 的输出", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(bridge.SentinelMarkerMissingError):
+        bridge.execute_sentinel_task(task_id, "task", 60000)
+
+    # Exactly 2 prompt calls (initial + recovery) and 1 read call
+    # (no second read after the recovery prompt itself failed).
+    assert state["prompt_calls"] == 2
+    assert state["read_calls"] == 1
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -658,7 +688,7 @@ def test_execute_sentinel_task_marker_missing_after_recovery_raises(monkeypatch)
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: the 6 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'execute_sentinel_task'`.
+Expected: the 7 new tests FAIL with `AttributeError: module 'bridge' has no attribute 'execute_sentinel_task'`.
 
 - [ ] **Step 3: Implement**
 
@@ -800,7 +830,7 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 23 passed.
+Expected: 24 passed.
 
 ---
 
@@ -949,7 +979,7 @@ def acquire_agent_for_delegation():
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 29 passed.
+Expected: 30 passed.
 
 ---
 
@@ -1186,7 +1216,7 @@ Note two intentional small fixes versus the original: `/read` is now matched wit
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 37 passed.
+Expected: 38 passed.
 
 ---
 
@@ -1493,7 +1523,7 @@ Replace the entire `do_POST` method with:
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 46 passed.
+Expected: 47 passed.
 
 ---
 
@@ -1660,7 +1690,7 @@ if __name__ == "__main__":
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 48 passed.
+Expected: 49 passed.
 
 - [ ] **Step 5: Run the full suite one more time to confirm nothing earlier regressed**
 
@@ -1668,7 +1698,7 @@ Expected: 48 passed.
 cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Expected: 48 passed, 0 failed.
+Expected: 49 passed, 0 failed.
 
 ---
 
