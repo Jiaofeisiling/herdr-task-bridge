@@ -902,6 +902,8 @@ def test_acquire_agent_for_delegation_releases_lock_when_body_raises(monkeypatch
         with bridge.acquire_agent_for_delegation():
             raise ValueError("boom from caller body")
 
+    assert bridge.AGENT_LOCK.locked() is False
+
 
 def test_acquire_agent_for_delegation_converts_status_query_exception(monkeypatch):
     def boom():
