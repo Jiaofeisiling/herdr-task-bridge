@@ -42,13 +42,19 @@ function Invoke-SentinelApi {
         [string]$Body = $null
     )
 
+    $headers = @{}
+
+    if ($env:SENTINEL_BRIDGE_TOKEN) {
+        $headers["X-Sentinel-Token"] = $env:SENTINEL_BRIDGE_TOKEN
+    }
+
     try {
         if ($Body) {
             return Invoke-RestMethod -Uri $Uri -Method $Method `
-                -ContentType "application/json; charset=utf-8" -Body $Body
+                -ContentType "application/json; charset=utf-8" -Body $Body -Headers $headers
         }
 
-        return Invoke-RestMethod -Uri $Uri -Method $Method
+        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers
     }
     catch [System.Net.WebException] {
         $errResponse = $_.Exception.Response

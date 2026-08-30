@@ -860,3 +860,87 @@ def test_task_worker_orphans_on_recovery_timeout(tmp_path, monkeypatch):
     finally:
         stop_event.set()
         worker_thread.join(timeout=2)
+
+
+def test_check_auth_allows_everything_when_no_token_configured(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {}
+
+    assert handler.check_auth() is True
+
+
+def test_check_auth_rejects_missing_header_when_token_configured(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {}
+
+    assert handler.check_auth() is False
+
+
+def test_check_auth_rejects_wrong_token(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {"X-Sentinel-Token": "wrong"}
+
+    assert handler.check_auth() is False
+
+
+def test_check_auth_accepts_correct_token(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {"X-Sentinel-Token": "s3cret"}
+
+    assert handler.check_auth() is True
+
+
+def test_health_does_not_require_auth(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    status, body = _get(live_server, "/health")
+
+    assert status == 200
+    assert body["ok"] is True
+
+
+def test_ready_requires_auth_when_token_configured(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    status, body = _get(live_server, "/ready")
+
+    assert status == 401
+    assert body["ok"] is False
+
+
+def test_delegate_requires_auth_when_token_configured(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    status, body = _post(live_server, "/delegate", {"task": "should be rejected"})
+
+    assert status == 401
+    assert body["ok"] is False
+
+
+def test_delegate_succeeds_with_correct_token(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    payload = json_module.dumps({"task": "authorized request"}).encode("utf-8")
+    conn.request(
+        "POST", "/delegate", body=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Sentinel-Token": "s3cret",
+        },
+    )
+    resp = conn.getresponse()
+    status = resp.status
+    body = json_module.loads(resp.read().decode("utf-8"))
+    conn.close()
+
+    assert status == 202
+    assert body["ok"] is True

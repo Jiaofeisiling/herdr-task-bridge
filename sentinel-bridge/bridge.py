@@ -1,4 +1,5 @@
 import contextlib
+import hmac
 import json
 import os
 import re
@@ -18,6 +19,8 @@ PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 SENTINEL = os.environ.get("SENTINEL_AGENT", "sentinel")
+
+AUTH_TOKEN = os.environ.get("SENTINEL_BRIDGE_TOKEN", "")
 
 DB_PATH = os.environ.get(
     "SENTINEL_DB",
@@ -576,6 +579,13 @@ class Handler(BaseHTTPRequestHandler):
 
         return json.loads(raw.decode("utf-8"))
 
+    def check_auth(self):
+        if not AUTH_TOKEN:
+            return True
+
+        provided = self.headers.get("X-Sentinel-Token", "")
+        return hmac.compare_digest(provided, AUTH_TOKEN)
+
     def do_GET(self):
         try:
             self._do_GET()
@@ -587,6 +597,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_GET(self):
         path = urlparse(self.path).path
+
+        if path != "/health" and not self.check_auth():
+            self.send_json({"ok": False, "error": "unauthorized"}, 401)
+            return
 
         if path == "/health":
             self.send_json({
@@ -691,6 +705,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_POST(self):
         path = urlparse(self.path).path
+
+        if path != "/health" and not self.check_auth():
+            self.send_json({"ok": False, "error": "unauthorized"}, 401)
+            return
 
         if path == "/delegate":
             try:
@@ -861,6 +879,15 @@ if __name__ == "__main__":
     print(f"Agent: {SENTINEL}")
     print(f"Database: {DB_PATH}")
     print(f"Listening: http://{HOST}:{PORT}")
+
+    if not AUTH_TOKEN:
+        print(
+            "WARNING: SENTINEL_BRIDGE_TOKEN is not set. This bridge is "
+            "running with NO AUTHENTICATION -- anyone who can reach "
+            f"http://{HOST}:{PORT} can execute arbitrary commands via "
+            "Sentinel. Set SENTINEL_BRIDGE_TOKEN to a random secret and "
+            "restart to require it."
+        )
 
     server = ThreadingHTTPServer(
         (HOST, PORT),
