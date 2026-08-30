@@ -1,6 +1,16 @@
 param(
     [Parameter(Mandatory=$true, Position=0)]
-    [ValidateSet("ask", "prompt", "status", "read", "health")]
+    [ValidateSet(
+        "ask",
+        "prompt",
+        "delegate",
+        "task",
+        "tasks",
+        "status",
+        "ready",
+        "read",
+        "health"
+    )]
     [string]$Command,
 
     [Parameter(Position=1, ValueFromRemainingArguments=$true)]
@@ -118,6 +128,48 @@ switch ($Command) {
         } | ConvertTo-Json -Compress
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+    }
+
+    "delegate" {
+        $task = Join-TaskText
+
+        if (-not $task) {
+            Write-Error "Task cannot be empty."
+            exit 1
+        }
+
+        $payload = @{ task = $task }
+
+        if ($PSBoundParameters.ContainsKey("TimeoutMs")) {
+            $payload["timeout_ms"] = $TimeoutMs
+        }
+
+        $body = $payload | ConvertTo-Json -Compress
+
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/delegate" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+    }
+
+    "ready" {
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/ready"
+        $result | ConvertTo-Json -Depth 10
+    }
+
+    "tasks" {
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks"
+        $result | ConvertTo-Json -Depth 20
+    }
+
+    "task" {
+        $taskId = Join-TaskText
+
+        if (-not $taskId) {
+            Write-Error "Task id cannot be empty."
+            exit 1
+        }
+
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$taskId"
         $result | ConvertTo-Json -Depth 20
     }
 }
