@@ -1869,6 +1869,18 @@ function Invoke-SentinelApi {
             throw
         }
 
+        # In Windows PowerShell 5.1, Invoke-RestMethod has already
+        # consumed the response stream by the time control reaches this
+        # catch block -- re-reading $errResponse.GetResponseStream() here
+        # reliably returns an empty string (confirmed against a live 409:
+        # the whole function returned nothing, silently). PowerShell
+        # already captured the body for us in $_.ErrorDetails.Message,
+        # so use that instead of re-reading the (already-drained) stream.
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            return $_.ErrorDetails.Message | ConvertFrom-Json
+        }
+
+        # Fallback for the rare case ErrorDetails wasn't populated.
         $stream = $errResponse.GetResponseStream()
         $reader = New-Object System.IO.StreamReader($stream)
         $rawBody = $reader.ReadToEnd()
