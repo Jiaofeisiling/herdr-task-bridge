@@ -1578,7 +1578,7 @@ Expected: 50 passed.
 
 **Interfaces:**
 - Consumes: `acquire_agent_for_delegation`, `SentinelBusyError`, `SentinelUnavailableError` (Task 5), `peek_next_task`, `claim_task`, `execute_sentinel_task`, `complete_task`, `fail_task`, `orphan_task` (all existing).
-- Produces: `WORKER_POLL_SECONDS` (module-level float, default `2`), `task_worker()` (infinite loop, intended to run in a daemon thread), rewritten `if __name__ == "__main__":` block that starts it.
+- Produces: `WORKER_POLL_SECONDS` (module-level float, default `2`), `task_worker(stop_event=None)` (loops until `stop_event.is_set()`, or forever if `stop_event` is `None` — the parameter exists purely so tests can cleanly stop the background thread they start; production `__main__` calls it with no argument, so its behavior there is unchanged), rewritten `if __name__ == "__main__":` block that starts it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1601,18 +1601,29 @@ def test_task_worker_picks_up_and_completes_queued_task(tmp_path, monkeypatch):
 
     task_id = bridge.create_task("后台任务", 5000)
 
-    worker_thread = threading_module.Thread(target=bridge.task_worker, daemon=True)
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
     worker_thread.start()
 
-    deadline = time_module.time() + 5
-    task = bridge.get_task(task_id)
-
-    while task["status"] not in ("done", "error", "orphaned") and time_module.time() < deadline:
-        time_module.sleep(0.05)
+    try:
+        deadline = time_module.time() + 5
         task = bridge.get_task(task_id)
 
-    assert task["status"] == "done"
-    assert task["result_text"] == "worker 完成"
+        while task["status"] not in ("done", "error", "orphaned") and time_module.time() < deadline:
+            time_module.sleep(0.05)
+            task = bridge.get_task(task_id)
+
+        assert task["status"] == "done"
+        assert task["result_text"] == "worker 完成"
+    finally:
+        # Stop the worker before this test's monkeypatches unwind — the
+        # thread reads module globals (DB_PATH, run_herdr, ...) on every
+        # loop iteration, so a leaked thread would keep polling with the
+        # real defaults after teardown, including a real subprocess call.
+        stop_event.set()
+        worker_thread.join(timeout=2)
 
 
 def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
@@ -1623,13 +1634,20 @@ def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
 
     task_id = bridge.create_task("后台任务", 5000)
 
-    worker_thread = threading_module.Thread(target=bridge.task_worker, daemon=True)
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
     worker_thread.start()
 
-    time_module.sleep(0.3)
+    try:
+        time_module.sleep(0.3)
 
-    task = bridge.get_task(task_id)
-    assert task["status"] == "queued"
+        task = bridge.get_task(task_id)
+        assert task["status"] == "queued"
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1648,10 +1666,10 @@ Add after `acquire_agent_for_delegation`:
 WORKER_POLL_SECONDS = 2
 
 
-def task_worker():
+def task_worker(stop_event=None):
     print("Task worker started.")
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         task_row = peek_next_task()
 
         if task_row is None:
