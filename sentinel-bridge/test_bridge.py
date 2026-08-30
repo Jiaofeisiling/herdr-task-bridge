@@ -395,6 +395,7 @@ def live_server(tmp_path, monkeypatch):
     yield port
 
     server.shutdown()
+    server.server_close()
     thread.join(timeout=5)
 
 

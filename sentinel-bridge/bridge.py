@@ -48,7 +48,7 @@ def db_session():
 
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
     with db_session() as conn:
         conn.execute("""
