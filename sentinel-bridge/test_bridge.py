@@ -590,3 +590,44 @@ def test_ask_rejects_empty_task(live_server):
     status, body = _post(live_server, "/ask", {"task": "   "})
 
     assert status == 400
+
+
+def test_ask_returns_504_on_timeout(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    def fake_run_herdr(*args, **kwargs):
+        raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=1)
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 504
+    assert body["ok"] is False
+    assert "task_id" in body
+
+
+def test_ask_returns_502_when_marker_missing(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "始终没有 marker", "stderr": "",
+    })
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 502
+    assert body["ok"] is False
+    assert "task_id" in body
+
+
+def test_ask_returns_500_on_prompt_failure(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "stdout": "", "stderr": "herdr exploded",
+    })
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 500
+    assert body["ok"] is False
+    assert "task_id" in body
