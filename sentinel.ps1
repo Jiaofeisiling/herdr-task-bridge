@@ -11,6 +11,12 @@ param(
     [int]$TimeoutMs = 120000
 )
 
+$Utf8 = New-Object System.Text.UTF8Encoding($false)
+
+[Console]::InputEncoding  = $Utf8
+[Console]::OutputEncoding = $Utf8
+$OutputEncoding           = $Utf8
+
 $BaseUrl = "http://127.0.0.1:8765"
 
 
