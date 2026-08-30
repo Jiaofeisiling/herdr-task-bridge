@@ -381,58 +381,51 @@ def acquire_agent_for_delegation():
 WORKER_POLL_SECONDS = 2
 
 
-def task_worker():
+def task_worker(stop_event=None):
     print("Task worker started.")
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
+        task_row = peek_next_task()
+
+        if task_row is None:
+            time.sleep(WORKER_POLL_SECONDS)
+            continue
+
+        # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
+        # 避免维护两份重复的加锁逻辑。
         try:
-            task_row = peek_next_task()
+            with acquire_agent_for_delegation():
+                task_id = task_row["task_id"]
 
-            if task_row is None:
-                time.sleep(WORKER_POLL_SECONDS)
-                continue
+                if not claim_task(task_id):
+                    # 任务已被别的地方 claim（正常情况下不会发生，
+                    # 因为只有这一个 worker），直接进入下一轮。
+                    continue
 
-            # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
-            # 避免维护两份重复的加锁逻辑。
-            try:
-                with acquire_agent_for_delegation():
-                    task_id = task_row["task_id"]
+                print(f"[task {task_id}] running")
 
-                    if not claim_task(task_id):
-                        # 任务已被别的地方 claim（正常情况下不会发生，
-                        # 因为只有这一个 worker），直接进入下一轮。
-                        continue
+                try:
+                    result = execute_sentinel_task(
+                        task_id=task_id,
+                        task=task_row["task"],
+                        timeout_ms=task_row["timeout_ms"],
+                    )
 
-                    print(f"[task {task_id}] running")
+                    complete_task(task_id, result)
+                    print(f"[task {task_id}] done")
 
-                    try:
-                        result = execute_sentinel_task(
-                            task_id=task_id,
-                            task=task_row["task"],
-                            timeout_ms=task_row["timeout_ms"],
-                        )
+                except TimeoutError as e:
+                    # Claude 有可能还在继续工作，
+                    # 所以不能简单标 error。
+                    orphan_task(task_id, str(e))
+                    print(f"[task {task_id}] orphaned")
 
-                        complete_task(task_id, result)
-                        print(f"[task {task_id}] done")
+                except Exception as e:
+                    fail_task(task_id, str(e))
+                    print(f"[task {task_id}] error: {e}")
 
-                    except TimeoutError as e:
-                        # Claude 有可能还在继续工作，
-                        # 所以不能简单标 error。
-                        orphan_task(task_id, str(e))
-                        print(f"[task {task_id}] orphaned")
-
-                    except Exception as e:
-                        fail_task(task_id, str(e))
-                        print(f"[task {task_id}] error: {e}")
-
-            except (SentinelBusyError, SentinelUnavailableError):
-                # Sentinel 正忙或查不到状态，这一轮先不碰它，稍后再试。
-                time.sleep(WORKER_POLL_SECONDS)
-                continue
-
-        except Exception as e:
-            # Database or other transient error; just sleep and retry.
-            # (Avoids unhandled exceptions in daemon thread.)
+        except (SentinelBusyError, SentinelUnavailableError):
+            # Sentinel 正忙或查不到状态，这一轮先不碰它，稍后再试。
             time.sleep(WORKER_POLL_SECONDS)
             continue
 

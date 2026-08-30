@@ -649,18 +649,25 @@ def test_task_worker_picks_up_and_completes_queued_task(tmp_path, monkeypatch):
 
     task_id = bridge.create_task("后台任务", 5000)
 
-    worker_thread = threading_module.Thread(target=bridge.task_worker, daemon=True)
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
     worker_thread.start()
 
-    deadline = time_module.time() + 5
-    task = bridge.get_task(task_id)
-
-    while task["status"] not in ("done", "error", "orphaned") and time_module.time() < deadline:
-        time_module.sleep(0.05)
+    try:
+        deadline = time_module.time() + 5
         task = bridge.get_task(task_id)
 
-    assert task["status"] == "done"
-    assert task["result_text"] == "worker 完成"
+        while task["status"] not in ("done", "error", "orphaned") and time_module.time() < deadline:
+            time_module.sleep(0.05)
+            task = bridge.get_task(task_id)
+
+        assert task["status"] == "done"
+        assert task["result_text"] == "worker 完成"
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
 
 
 def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
@@ -671,10 +678,17 @@ def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
 
     task_id = bridge.create_task("后台任务", 5000)
 
-    worker_thread = threading_module.Thread(target=bridge.task_worker, daemon=True)
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
     worker_thread.start()
 
-    time_module.sleep(0.3)
+    try:
+        time_module.sleep(0.3)
 
-    task = bridge.get_task(task_id)
-    assert task["status"] == "queued"
+        task = bridge.get_task(task_id)
+        assert task["status"] == "queued"
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
