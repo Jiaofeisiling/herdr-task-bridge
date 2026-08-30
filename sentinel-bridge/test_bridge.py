@@ -373,3 +373,107 @@ def test_acquire_agent_for_delegation_converts_status_query_exception(monkeypatc
             pass
 
     assert bridge.AGENT_LOCK.locked() is False
+
+
+import http.client
+import threading as threading_module
+import time as time_module
+
+
+@pytest.fixture
+def live_server(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+
+    server = bridge.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    port = server.server_address[1]
+
+    thread = threading_module.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    yield port
+
+    server.shutdown()
+    thread.join(timeout=5)
+
+
+def _get(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = json_module.loads(resp.read().decode("utf-8"))
+    conn.close()
+    return resp.status, body
+
+
+def test_health_endpoint_does_not_touch_sentinel(live_server, monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("run_herdr must not be called by /health")
+
+    monkeypatch.setattr(bridge, "run_herdr", boom)
+
+    status, body = _get(live_server, "/health")
+
+    assert status == 200
+    assert body["ok"] is True
+
+
+def test_ready_endpoint_reports_idle(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    status, body = _get(live_server, "/ready")
+
+    assert status == 200
+    assert body["ready"] is True
+    assert body["agent_status"] == "idle"
+
+
+def test_ready_endpoint_reports_busy(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+
+    status, body = _get(live_server, "/ready")
+
+    assert status == 200
+    assert body["ready"] is False
+    assert body["agent_status"] == "working"
+
+
+def test_ready_endpoint_reports_unreachable(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: (None, {"ok": False}))
+
+    status, body = _get(live_server, "/ready")
+
+    assert status == 503
+    assert body["ready"] is False
+
+
+def test_tasks_list_empty(live_server):
+    status, body = _get(live_server, "/tasks")
+
+    assert status == 200
+    assert body["tasks"] == []
+
+
+def test_tasks_list_returns_created_tasks(live_server):
+    task_id = bridge.create_task("check disk", 1000)
+
+    status, body = _get(live_server, "/tasks")
+
+    assert status == 200
+    assert body["tasks"][0]["task_id"] == task_id
+
+
+def test_task_get_not_found(live_server):
+    status, body = _get(live_server, "/tasks/does-not-exist")
+
+    assert status == 404
+    assert body["ok"] is False
+
+
+def test_task_get_found(live_server):
+    task_id = bridge.create_task("check disk", 1000)
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    assert status == 200
+    assert body["task"]["task_id"] == task_id

@@ -10,6 +10,7 @@ import uuid
 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 
 HOST = "127.0.0.1"
@@ -489,17 +490,18 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def do_GET(self):
+        path = urlparse(self.path).path
 
-        if self.path == "/health":
+        if path == "/health":
             self.send_json({
                 "ok": True,
                 "service": "nesi-sentinel-bridge",
-                "version": 2,
+                "version": 3,
                 "agent": SENTINEL,
             })
             return
 
-        if self.path == "/status":
+        if path == "/status":
             result = run_herdr(
                 "agent",
                 "get",
@@ -512,7 +514,28 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        if self.path.startswith("/read"):
+        if path == "/ready":
+            agent_status, status_result = get_agent_status()
+
+            if agent_status is None:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "ready": False,
+                        "reason": "sentinel_unreachable",
+                    },
+                    503,
+                )
+                return
+
+            self.send_json({
+                "ok": True,
+                "ready": agent_status in AVAILABLE_STATES,
+                "agent_status": agent_status,
+            })
+            return
+
+        if path == "/read":
             result = run_herdr(
                 "agent",
                 "read",
@@ -527,6 +550,30 @@ class Handler(BaseHTTPRequestHandler):
                 result,
                 200 if result["ok"] else 500,
             )
+            return
+
+        if path == "/tasks":
+            self.send_json({
+                "ok": True,
+                "tasks": list_tasks(),
+            })
+            return
+
+        if path.startswith("/tasks/"):
+            task_id = path[len("/tasks/"):]
+            task = get_task(task_id)
+
+            if task is None:
+                self.send_json(
+                    {"ok": False, "error": "task not found"},
+                    404,
+                )
+                return
+
+            self.send_json({
+                "ok": True,
+                "task": task,
+            })
             return
 
         self.send_json(
