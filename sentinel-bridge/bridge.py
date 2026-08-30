@@ -582,11 +582,47 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        path = urlparse(self.path).path
 
-        if self.path not in (
-            "/prompt",
-            "/ask",
-        ):
+        if path == "/delegate":
+            try:
+                body = self.read_json()
+
+                task = body["task"].strip()
+
+                timeout_ms = int(
+                    body.get(
+                        "timeout_ms",
+                        21600000,  # 6 hours
+                    )
+                )
+
+                if not task:
+                    raise ValueError("task cannot be empty")
+
+            except Exception as e:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": f"invalid request: {e}",
+                    },
+                    400,
+                )
+                return
+
+            task_id = create_task(task, timeout_ms)
+
+            self.send_json(
+                {
+                    "ok": True,
+                    "task_id": task_id,
+                    "status": "queued",
+                },
+                202,
+            )
+            return
+
+        if path not in ("/prompt", "/ask"):
             self.send_json(
                 {"error": "not found"},
                 404,
@@ -599,23 +635,15 @@ class Handler(BaseHTTPRequestHandler):
             task = body["task"].strip()
 
             timeout_ms = int(
-                body.get(
-                    "timeout_ms",
-                    120000,
-                )
+                body.get("timeout_ms", 120000)
             )
 
             read_lines = int(
-                body.get(
-                    "lines",
-                    500,
-                )
+                body.get("lines", 500)
             )
 
             if not task:
-                raise ValueError(
-                    "task cannot be empty"
-                )
+                raise ValueError("task cannot be empty")
 
         except Exception as e:
             self.send_json(
@@ -629,106 +657,84 @@ class Handler(BaseHTTPRequestHandler):
 
         task_id = str(uuid.uuid4())
 
-        delegated_prompt = build_delegation_prompt(
-            task,
-            task_id,
-        )
-
         try:
-            prompt_result = run_herdr(
-                "agent",
-                "prompt",
-                SENTINEL,
-                delegated_prompt,
-                "--wait",
-                "--timeout",
-                str(timeout_ms),
-                timeout=(timeout_ms / 1000) + 15,
-            )
+            with acquire_agent_for_delegation():
+                if path == "/prompt":
+                    prompt_result = run_prompt_only(task_id, task, timeout_ms)
 
-        except subprocess.TimeoutExpired:
+                    self.send_json({
+                        "ok": True,
+                        "task_id": task_id,
+                        "prompt": prompt_result,
+                    })
+                    return
+
+                result_text = execute_sentinel_task(
+                    task_id, task, timeout_ms, read_lines
+                )
+
+                self.send_json({
+                    "ok": True,
+                    "task_id": task_id,
+                    "result": {"text": result_text},
+                })
+                return
+
+        except SentinelBusyError as e:
+            self.send_json(
+                {
+                    "ok": False,
+                    "status": "busy",
+                    "agent_status": e.agent_status,
+                },
+                409,
+            )
+            return
+
+        except SentinelUnavailableError as e:
+            self.send_json(
+                {
+                    "ok": False,
+                    "status": "unavailable",
+                    "reason": "unable_to_query_sentinel",
+                    "detail": str(e),
+                },
+                503,
+            )
+            return
+
+        except TimeoutError as e:
             self.send_json(
                 {
                     "ok": False,
                     "task_id": task_id,
-                    "error":
-                        "bridge timeout while waiting for Sentinel",
+                    "error": str(e),
                 },
                 504,
             )
             return
 
-        if not prompt_result["ok"]:
+        except SentinelMarkerMissingError as e:
             self.send_json(
                 {
                     "ok": False,
                     "task_id": task_id,
-                    "error":
-                        "Herdr prompt command failed",
-                    "prompt": prompt_result,
-                },
-                500,
-            )
-            return
-
-        if self.path == "/prompt":
-            self.send_json({
-                "ok": True,
-                "task_id": task_id,
-                "prompt": prompt_result,
-            })
-            return
-
-        read_result = run_herdr(
-            "agent",
-            "read",
-            SENTINEL,
-            "--source",
-            "recent-unwrapped",
-            "--lines",
-            str(read_lines),
-        )
-
-        if not read_result["ok"]:
-            self.send_json(
-                {
-                    "ok": False,
-                    "task_id": task_id,
-                    "error":
-                        "Unable to read Sentinel output",
-                    "read": read_result,
-                },
-                500,
-            )
-            return
-
-        sentinel_response = extract_task_response(
-            read_result["stdout"],
-            task_id,
-        )
-
-        if sentinel_response is None:
-            self.send_json(
-                {
-                    "ok": False,
-                    "task_id": task_id,
-                    "error":
-                        "Sentinel completed but did not emit "
-                        "the completion marker.",
-                    "raw_output":
-                        read_result["stdout"],
+                    "error": str(e),
                 },
                 502,
             )
             return
 
-        self.send_json({
-            "ok": True,
-            "task_id": task_id,
-            "result": {
-                "text": sentinel_response
-            },
-        })
+        except (SentinelPromptError, SentinelReadError) as e:
+            self.send_json(
+                {
+                    "ok": False,
+                    "task_id": task_id,
+                    "error": str(e),
+                },
+                500,
+            )
+            return
 
 
 if __name__ == "__main__":

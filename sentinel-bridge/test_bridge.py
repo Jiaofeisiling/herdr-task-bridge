@@ -477,3 +477,116 @@ def test_task_get_found(live_server):
 
     assert status == 200
     assert body["task"]["task_id"] == task_id
+
+
+def _post(port, path, payload):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    body = json_module.dumps(payload).encode("utf-8")
+    conn.request(
+        "POST", path, body=body,
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    data = json_module.loads(resp.read().decode("utf-8"))
+    conn.close()
+    return resp.status, data
+
+
+def test_delegate_returns_202_and_queues_task(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "check disk"})
+
+    assert status == 202
+    assert body["ok"] is True
+    assert body["status"] == "queued"
+
+    task = bridge.get_task(body["task_id"])
+    assert task["status"] == "queued"
+    assert task["task"] == "check disk"
+
+
+def test_delegate_rejects_empty_task(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "  "})
+
+    assert status == 400
+    assert body["ok"] is False
+
+
+def test_delegate_defaults_timeout_to_six_hours(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "check disk"})
+
+    task = bridge.get_task(body["task_id"])
+    assert task["timeout_ms"] == 21600000
+
+
+def test_delegate_does_not_check_busy_state(live_server, monkeypatch):
+    def boom():
+        raise AssertionError("/delegate must not query Sentinel status")
+
+    monkeypatch.setattr(bridge, "get_agent_status", boom)
+
+    status, body = _post(live_server, "/delegate", {"task": "check disk"})
+
+    assert status == 202
+
+
+def test_ask_returns_409_when_busy(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 409
+    assert body["status"] == "busy"
+    assert body["agent_status"] == "working"
+
+
+def test_ask_returns_503_when_sentinel_unreachable(live_server, monkeypatch):
+    monkeypatch.setattr(
+        bridge, "get_agent_status",
+        lambda: (None, {"ok": False, "error": "no route"}),
+    )
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 503
+    assert body["status"] == "unavailable"
+
+
+def test_ask_happy_path(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "raw", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "总结完成")
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 200
+    assert body["result"]["text"] == "总结完成"
+
+
+def test_prompt_returns_prompt_result_without_reading(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    calls = []
+
+    def fake_run_herdr(*args, **kwargs):
+        calls.append(args[1])
+        return {"ok": True, "stdout": "prompt output", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    status, body = _post(live_server, "/prompt", {"task": "do something"})
+
+    assert status == 200
+    assert body["prompt"]["stdout"] == "prompt output"
+    assert calls == ["prompt"]  # /prompt never calls "read"
+
+
+def test_ask_rejects_empty_task(live_server):
+    status, body = _post(live_server, "/ask", {"task": "   "})
+
+    assert status == 400
