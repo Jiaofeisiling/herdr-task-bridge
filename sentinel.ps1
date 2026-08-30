@@ -6,6 +6,7 @@ param(
         "delegate",
         "task",
         "tasks",
+        "wait",
         "status",
         "ready",
         "read",
@@ -201,5 +202,68 @@ switch ($Command) {
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$taskId"
         $result | ConvertTo-Json -Depth 20
+    }
+
+    "wait" {
+        $taskId = Join-TaskText
+
+        if (-not $taskId) {
+            Write-Error "Task ID cannot be empty."
+            exit 1
+        }
+
+        while ($true) {
+            try {
+                $response = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$taskId"
+            }
+            catch {
+                Write-Error $_
+                exit 1
+            }
+
+            if (-not $response.ok) {
+                Write-Error ($response | ConvertTo-Json -Depth 20)
+                exit 1
+            }
+
+            $task = $response.task
+
+            switch ($task.status) {
+
+                "queued" {
+                    Start-Sleep -Seconds 3
+                }
+
+                "running" {
+                    Start-Sleep -Seconds 3
+                }
+
+                "done" {
+                    Write-Output $task.result_text
+                    exit 0
+                }
+
+                "error" {
+                    Write-Error $task.error_text
+                    exit 1
+                }
+
+                "orphaned" {
+                    Write-Warning "Task state is orphaned."
+                    Write-Warning $task.error_text
+
+                    if ($task.result_text) {
+                        Write-Output $task.result_text
+                    }
+
+                    exit 2
+                }
+
+                default {
+                    Write-Error "Unknown task status: $($task.status)"
+                    exit 1
+                }
+            }
+        }
     }
 }
