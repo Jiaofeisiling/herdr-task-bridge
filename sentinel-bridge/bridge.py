@@ -380,54 +380,70 @@ def acquire_agent_for_delegation():
 
 WORKER_POLL_SECONDS = 2
 
+_worker_thread = None
+
 
 def task_worker(stop_event=None):
     print("Task worker started.")
 
     while stop_event is None or not stop_event.is_set():
-        task_row = peek_next_task()
-
-        if task_row is None:
-            time.sleep(WORKER_POLL_SECONDS)
-            continue
-
-        # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
-        # 避免维护两份重复的加锁逻辑。
         try:
-            with acquire_agent_for_delegation():
-                task_id = task_row["task_id"]
+            task_row = peek_next_task()
 
-                if not claim_task(task_id):
-                    # 任务已被别的地方 claim（正常情况下不会发生，
-                    # 因为只有这一个 worker），直接进入下一轮。
-                    continue
+            if task_row is None:
+                time.sleep(WORKER_POLL_SECONDS)
+                continue
 
-                print(f"[task {task_id}] running")
+            # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
+            # 避免维护两份重复的加锁逻辑。
+            try:
+                with acquire_agent_for_delegation():
+                    task_id = task_row["task_id"]
 
-                try:
-                    result = execute_sentinel_task(
-                        task_id=task_id,
-                        task=task_row["task"],
-                        timeout_ms=task_row["timeout_ms"],
-                    )
+                    if not claim_task(task_id):
+                        # 任务已被别的地方 claim（正常情况下不会发生，
+                        # 因为只有这一个 worker），直接进入下一轮。
+                        continue
 
-                    complete_task(task_id, result)
-                    print(f"[task {task_id}] done")
+                    print(f"[task {task_id}] running")
 
-                except TimeoutError as e:
-                    # Claude 有可能还在继续工作，
-                    # 所以不能简单标 error。
-                    orphan_task(task_id, str(e))
-                    print(f"[task {task_id}] orphaned")
+                    try:
+                        result = execute_sentinel_task(
+                            task_id=task_id,
+                            task=task_row["task"],
+                            timeout_ms=task_row["timeout_ms"],
+                        )
 
-                except Exception as e:
-                    fail_task(task_id, str(e))
-                    print(f"[task {task_id}] error: {e}")
+                    except TimeoutError as e:
+                        # Claude 有可能还在继续工作，
+                        # 所以不能简单标 error。
+                        orphan_task(task_id, str(e))
+                        print(f"[task {task_id}] orphaned")
 
-        except (SentinelBusyError, SentinelUnavailableError):
-            # Sentinel 正忙或查不到状态，这一轮先不碰它，稍后再试。
+                    except Exception as e:
+                        fail_task(task_id, str(e))
+                        print(f"[task {task_id}] error: {e}")
+
+                    else:
+                        # 只有 execute_sentinel_task 真正成功才走到这里；
+                        # 如果 complete_task 自己失败，不应该被上面那段
+                        # "except Exception" 错误地标成任务失败。
+                        complete_task(task_id, result)
+                        print(f"[task {task_id}] done")
+
+            except (SentinelBusyError, SentinelUnavailableError):
+                # Sentinel 正忙或查不到状态，这一轮先不碰它，稍后再试。
+                time.sleep(WORKER_POLL_SECONDS)
+                continue
+
+        except Exception as e:
+            # Anything else -- a DB hiccup in peek_next_task/claim_task,
+            # or even orphan_task/fail_task/complete_task itself failing --
+            # must not kill this thread. A dead worker is invisible: /health
+            # keeps reporting healthy and /delegate keeps accepting work
+            # that will now never run. Log it loudly and keep polling.
+            print(f"[worker] unexpected error, will retry: {e}")
             time.sleep(WORKER_POLL_SECONDS)
-            continue
 
 
 def run_herdr(*args, timeout=None):
@@ -542,6 +558,15 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception as e:
+            self.send_json(
+                {"ok": False, "error": f"internal error: {e}"},
+                500,
+            )
+
+    def _do_GET(self):
         path = urlparse(self.path).path
 
         if path == "/health":
@@ -550,6 +575,9 @@ class Handler(BaseHTTPRequestHandler):
                 "service": "nesi-sentinel-bridge",
                 "version": 3,
                 "agent": SENTINEL,
+                "worker_alive": (
+                    _worker_thread.is_alive() if _worker_thread else None
+                ),
             })
             return
 
@@ -634,6 +662,15 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        try:
+            self._do_POST()
+        except Exception as e:
+            self.send_json(
+                {"ok": False, "error": f"internal error: {e}"},
+                500,
+            )
+
+    def _do_POST(self):
         path = urlparse(self.path).path
 
         if path == "/delegate":
@@ -798,6 +835,7 @@ if __name__ == "__main__":
         name="sentinel-task-worker",
     )
     worker.start()
+    _worker_thread = worker
 
     print("Sentinel Bridge v3")
     print(f"Agent: {SENTINEL}")

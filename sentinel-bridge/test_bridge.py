@@ -1,5 +1,6 @@
 import sys
 import os
+import sqlite3
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -692,3 +693,90 @@ def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
     finally:
         stop_event.set()
         worker_thread.join(timeout=2)
+
+
+def test_task_worker_survives_peek_next_task_exception(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+
+    calls = {"count": 0}
+
+    def flaky_peek():
+        calls["count"] += 1
+        if calls["count"] <= 3:
+            raise sqlite3.OperationalError("simulated DB hiccup")
+        return None
+
+    monkeypatch.setattr(bridge, "peek_next_task", flaky_peek)
+
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
+    worker_thread.start()
+
+    try:
+        deadline = time_module.time() + 2
+        while calls["count"] < 4 and time_module.time() < deadline:
+            time_module.sleep(0.02)
+
+        assert calls["count"] >= 4  # the worker kept calling peek_next_task
+        assert worker_thread.is_alive()  # and the thread never died
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
+
+
+def test_do_get_returns_500_instead_of_crashing_on_unexpected_error(live_server, monkeypatch):
+    def boom():
+        raise RuntimeError("simulated unexpected failure")
+
+    monkeypatch.setattr(bridge, "get_agent_status", boom)
+
+    status, body = _get(live_server, "/ready")
+
+    assert status == 500
+    assert body["ok"] is False
+
+
+def test_do_post_returns_500_instead_of_crashing_on_unexpected_error(live_server, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated unexpected failure")
+
+    monkeypatch.setattr(bridge, "create_task", boom)
+
+    status, body = _post(live_server, "/delegate", {"task": "trigger the boom"})
+
+    assert status == 500
+    assert body["ok"] is False
+
+
+def test_health_reports_worker_alive_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+
+    server = bridge.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    port = server.server_address[1]
+    server_thread = threading_module.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    stop_event = threading_module.Event()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
+    worker_thread.start()
+    bridge._worker_thread = worker_thread
+
+    try:
+        status, body = _get(port, "/health")
+        assert status == 200
+        assert body["worker_alive"] is True
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
+        bridge._worker_thread = None
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
