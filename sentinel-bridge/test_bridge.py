@@ -898,6 +898,15 @@ def test_check_auth_accepts_correct_token(monkeypatch):
     assert handler.check_auth() is True
 
 
+def test_check_auth_returns_false_instead_of_raising_on_non_ascii_token(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "sécret")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {"X-Sentinel-Token": "sécret"}
+
+    assert handler.check_auth() is False
+
+
 def test_health_does_not_require_auth(live_server, monkeypatch):
     monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
 
@@ -935,6 +944,27 @@ def test_delegate_succeeds_with_correct_token(live_server, monkeypatch):
         headers={
             "Content-Type": "application/json",
             "X-Sentinel-Token": "s3cret",
+        },
+    )
+    resp = conn.getresponse()
+    status = resp.status
+    body = json_module.loads(resp.read().decode("utf-8"))
+    conn.close()
+
+    assert status == 202
+    assert body["ok"] is True
+
+
+def test_delegate_accepts_lowercase_token_header(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    payload = json_module.dumps({"task": "lowercase header test"}).encode("utf-8")
+    conn.request(
+        "POST", "/delegate", body=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-sentinel-token": "s3cret",
         },
     )
     resp = conn.getresponse()

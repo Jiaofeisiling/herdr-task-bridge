@@ -584,7 +584,13 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         provided = self.headers.get("X-Sentinel-Token", "")
-        return hmac.compare_digest(provided, AUTH_TOKEN)
+
+        try:
+            return hmac.compare_digest(provided, AUTH_TOKEN)
+        except TypeError:
+            # e.g. a non-ASCII token/header value -- treat as a failed
+            # comparison (401), not an internal error (500).
+            return False
 
     def do_GET(self):
         try:
@@ -598,7 +604,7 @@ class Handler(BaseHTTPRequestHandler):
     def _do_GET(self):
         path = urlparse(self.path).path
 
-        if path != "/health" and not self.check_auth():
+        if not (self.command == "GET" and path == "/health") and not self.check_auth():
             self.send_json({"ok": False, "error": "unauthorized"}, 401)
             return
 
@@ -706,7 +712,7 @@ class Handler(BaseHTTPRequestHandler):
     def _do_POST(self):
         path = urlparse(self.path).path
 
-        if path != "/health" and not self.check_auth():
+        if not (self.command == "GET" and path == "/health") and not self.check_auth():
             self.send_json({"ok": False, "error": "unauthorized"}, 401)
             return
 
