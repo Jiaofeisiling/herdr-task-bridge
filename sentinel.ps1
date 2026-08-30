@@ -123,6 +123,10 @@ switch ($Command) {
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body
         $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
     }
 
     "ask" {
@@ -141,6 +145,10 @@ switch ($Command) {
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
         $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
     }
 
     "delegate" {
@@ -161,6 +169,10 @@ switch ($Command) {
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/delegate" -Method Post -Body $body
         $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
     }
 
     "ready" {
