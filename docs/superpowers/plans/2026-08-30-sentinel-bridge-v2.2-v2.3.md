@@ -2206,3 +2206,888 @@ powershell -NoProfile -Command "C:\Tools\sentinel.ps1 ready"
 ```
 
 Expected while busy: `{"ok": true, "ready": false, "agent_status": "working"}`. After the task finishes: `{"ok": true, "ready": true, "agent_status": "idle"}`.
+
+---
+
+## Addendum: fixes from the final whole-branch review
+
+Tasks 1-13 are complete, individually reviewed, and live-verified. A final whole-branch review (`.superpowers/sdd/review-976ab5c..30209b7.diff`) then found a cluster of Important issues sharing one root cause — unexpected exceptions in paths outside the already-covered `acquire_agent_for_delegation()` chokepoint escape uncaught, producing either a silently-dead worker thread (with `/health` still reporting healthy) or a raw connection reset on the client (which `Invoke-SentinelApi` cannot recover a body from, since `Response` is `null` for a connection-level failure, not an HTTP-level one). Tasks 14-16 close that gap. Tasks 17-18 are two additional fixes the user explicitly approved after the review: non-zero exit codes on API failure, and a shared-secret auth header (the latter is a new, small security feature, out of the original v2.2/v2.3 scope, requested because `/delegate`'s fire-and-forget shape makes the pre-existing lack of auth easier to exploit than `/ask` was).
+
+### Task 14: Worker thread resilience, `/health` worker visibility, and handler-level catch-alls
+
+**Files:**
+- Modify: `C:\Tools\sentinel-bridge\bridge.py`
+- Modify: `C:\Tools\sentinel-bridge\test_bridge.py`
+
+**Interfaces:**
+- Consumes: `task_worker`, `Handler.do_GET`, `Handler.do_POST` (all existing, being modified in place).
+- Produces: module-level `_worker_thread` (starts `None`, set in `__main__`); `do_GET`/`do_POST` renamed to `_do_GET`/`_do_POST` with new thin `do_GET`/`do_POST` wrappers around them.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `test_bridge.py`:
+
+```python
+def test_task_worker_survives_peek_next_task_exception(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+
+    calls = {"count": 0}
+
+    def flaky_peek():
+        calls["count"] += 1
+        if calls["count"] <= 3:
+            raise sqlite3.OperationalError("simulated DB hiccup")
+        return None
+
+    monkeypatch.setattr(bridge, "peek_next_task", flaky_peek)
+
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
+    worker_thread.start()
+
+    try:
+        deadline = time_module.time() + 2
+        while calls["count"] < 4 and time_module.time() < deadline:
+            time_module.sleep(0.02)
+
+        assert calls["count"] >= 4  # the worker kept calling peek_next_task
+        assert worker_thread.is_alive()  # and the thread never died
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
+
+
+def test_do_get_returns_500_instead_of_crashing_on_unexpected_error(live_server, monkeypatch):
+    def boom():
+        raise RuntimeError("simulated unexpected failure")
+
+    monkeypatch.setattr(bridge, "get_agent_status", boom)
+
+    status, body = _get(live_server, "/ready")
+
+    assert status == 500
+    assert body["ok"] is False
+
+
+def test_do_post_returns_500_instead_of_crashing_on_unexpected_error(live_server, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated unexpected failure")
+
+    monkeypatch.setattr(bridge, "create_task", boom)
+
+    status, body = _post(live_server, "/delegate", {"task": "trigger the boom"})
+
+    assert status == 500
+    assert body["ok"] is False
+
+
+def test_health_reports_worker_alive_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+
+    server = bridge.ThreadingHTTPServer(("127.0.0.1", 0), bridge.Handler)
+    port = server.server_address[1]
+    server_thread = threading_module.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    stop_event = threading_module.Event()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
+    worker_thread.start()
+    bridge._worker_thread = worker_thread
+
+    try:
+        status, body = _get(port, "/health")
+        assert status == 200
+        assert body["worker_alive"] is True
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
+        bridge._worker_thread = None
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+```
+
+Add `import sqlite3` to the top of `test_bridge.py` if it isn't already imported directly (it currently isn't — only `bridge.sqlite3` is used indirectly; add a plain `import sqlite3` near the other stdlib imports at the top of the file).
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
+```
+
+Expected: `test_task_worker_survives_peek_next_task_exception` FAILS (the current worker dies on the first `peek_next_task()` exception, so `calls["count"]` never reaches 4 and/or the thread is not alive). The two 500-handling tests FAIL with 404 or an unhandled exception propagating through the test client. `test_health_reports_worker_alive_flag` FAILS with a `KeyError`/`AssertionError` since `/health` doesn't have a `worker_alive` field yet.
+
+- [ ] **Step 3: Implement**
+
+Replace `task_worker` entirely:
+
+```python
+def task_worker(stop_event=None):
+    print("Task worker started.")
+
+    while stop_event is None or not stop_event.is_set():
+        try:
+            task_row = peek_next_task()
+
+            if task_row is None:
+                time.sleep(WORKER_POLL_SECONDS)
+                continue
+
+            # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
+            # 避免维护两份重复的加锁逻辑。
+            try:
+                with acquire_agent_for_delegation():
+                    task_id = task_row["task_id"]
+
+                    if not claim_task(task_id):
+                        # 任务已被别的地方 claim（正常情况下不会发生，
+                        # 因为只有这一个 worker），直接进入下一轮。
+                        continue
+
+                    print(f"[task {task_id}] running")
+
+                    try:
+                        result = execute_sentinel_task(
+                            task_id=task_id,
+                            task=task_row["task"],
+                            timeout_ms=task_row["timeout_ms"],
+                        )
+
+                    except TimeoutError as e:
+                        # Claude 有可能还在继续工作，
+                        # 所以不能简单标 error。
+                        orphan_task(task_id, str(e))
+                        print(f"[task {task_id}] orphaned")
+
+                    except Exception as e:
+                        fail_task(task_id, str(e))
+                        print(f"[task {task_id}] error: {e}")
+
+                    else:
+                        # 只有 execute_sentinel_task 真正成功才走到这里；
+                        # 如果 complete_task 自己失败，不应该被上面那段
+                        # "except Exception" 错误地标成任务失败。
+                        complete_task(task_id, result)
+                        print(f"[task {task_id}] done")
+
+            except (SentinelBusyError, SentinelUnavailableError):
+                # Sentinel 正忙或查不到状态，这一轮先不碰它，稍后再试。
+                time.sleep(WORKER_POLL_SECONDS)
+                continue
+
+        except Exception as e:
+            # Anything else -- a DB hiccup in peek_next_task/claim_task,
+            # or even orphan_task/fail_task/complete_task itself failing --
+            # must not kill this thread. A dead worker is invisible: /health
+            # keeps reporting healthy and /delegate keeps accepting work
+            # that will now never run. Log it loudly and keep polling.
+            print(f"[worker] unexpected error, will retry: {e}")
+            time.sleep(WORKER_POLL_SECONDS)
+```
+
+Rename the existing `do_GET` method to `_do_GET` (keep its entire body exactly as-is, just the `def` line changes), and add this thin wrapper in its place:
+
+```python
+    def do_GET(self):
+        try:
+            self._do_GET()
+        except Exception as e:
+            self.send_json(
+                {"ok": False, "error": f"internal error: {e}"},
+                500,
+            )
+```
+
+Do the same for `do_POST` → `_do_POST`, with this wrapper:
+
+```python
+    def do_POST(self):
+        try:
+            self._do_POST()
+        except Exception as e:
+            self.send_json(
+                {"ok": False, "error": f"internal error: {e}"},
+                500,
+            )
+```
+
+(Every branch inside `_do_GET`/`_do_POST` already calls `send_json` followed immediately by `return`, so there is no existing path where a response is partially sent and then an exception is raised afterward in the same request — the wrapper's own `send_json` call is safe to assume it's the first and only one for any request that reaches it.)
+
+Add the `/health` worker-visibility field. First, add a module-level variable right after `WORKER_POLL_SECONDS = 2`:
+
+```python
+_worker_thread = None
+```
+
+Then update `/health`'s response inside `_do_GET`:
+
+```python
+        if path == "/health":
+            self.send_json({
+                "ok": True,
+                "service": "nesi-sentinel-bridge",
+                "version": 3,
+                "agent": SENTINEL,
+                "worker_alive": (
+                    _worker_thread.is_alive() if _worker_thread else None
+                ),
+            })
+            return
+```
+
+Finally, update `if __name__ == "__main__":` to record the worker thread in that module-level variable:
+
+```python
+if __name__ == "__main__":
+    init_db()
+
+    worker = threading.Thread(
+        target=task_worker,
+        daemon=True,
+        name="sentinel-task-worker",
+    )
+    worker.start()
+    _worker_thread = worker
+
+    print("Sentinel Bridge v3")
+    print(f"Agent: {SENTINEL}")
+    print(f"Database: {DB_PATH}")
+    print(f"Listening: http://{HOST}:{PORT}")
+
+    server = ThreadingHTTPServer(
+        (HOST, PORT),
+        Handler,
+    )
+
+    try:
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+        print("\nStopping.")
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
+```
+
+Expected: 56 passed (52 + 4 new).
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /c/Tools && git add sentinel-bridge/bridge.py sentinel-bridge/test_bridge.py && git commit -m "Task 14: worker thread resilience, /health worker visibility, handler catch-alls"
+```
+
+---
+
+### Task 15: `execute_sentinel_task` hardening — recovery timeout classification, read timeouts, restored diagnostics
+
+**Files:**
+- Modify: `C:\Tools\sentinel-bridge\bridge.py`
+- Modify: `C:\Tools\sentinel-bridge\test_bridge.py`
+
+**Interfaces:**
+- Consumes: `execute_sentinel_task`, `SentinelMarkerMissingError`, `run_herdr`, `orphan_task` (all existing).
+- Produces: `SentinelMarkerMissingError` gains a `.raw_output` attribute (constructor signature becomes `SentinelMarkerMissingError(message, raw_output="")`); `execute_sentinel_task`'s two `run_herdr("agent", "read", ...)` calls gain `timeout=60`; the recovery prompt call gains its own `subprocess.TimeoutExpired` handling.
+
+**Design note (deviation from the review's literal suggestion):** the final review suggested routing the recovery prompt through `_run_herdr_prompt` to get its `TimeoutExpired → TimeoutError` conversion "for free." That function also raises `SentinelPromptError` when `result["ok"]` is `False` — but the recovery path's existing, already-tested contract (`test_execute_sentinel_task_raises_marker_missing_when_recovery_prompt_fails`, Task 4) is that a *failed* recovery attempt (as opposed to a *timed-out* one) is swallowed and falls through to `SentinelMarkerMissingError`, not raised as `SentinelPromptError`. Routing through `_run_herdr_prompt` unmodified would silently break that established behavior. This task fixes only the specific defect named in the review (an uncaught `subprocess.TimeoutExpired` during recovery) by adding a scoped `try/except subprocess.TimeoutExpired` around just the recovery call, leaving its `ok: False` handling untouched.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `test_bridge.py`:
+
+```python
+def test_execute_sentinel_task_recovery_timeout_raises_timeout_error(monkeypatch):
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            if "120000" in args:
+                # this is the recovery prompt call
+                raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=135)
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "没有 marker 的输出", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(TimeoutError):
+        bridge.execute_sentinel_task(
+            "55555555-5555-5555-5555-555555555555", "task", 60000
+        )
+
+
+def test_execute_sentinel_task_marker_missing_includes_raw_output(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "这是终端里最后的原始输出", "stderr": "",
+    })
+
+    with pytest.raises(bridge.SentinelMarkerMissingError) as exc_info:
+        bridge.execute_sentinel_task(
+            "66666666-6666-6666-6666-666666666666", "task", 60000
+        )
+
+    assert "这是终端里最后的原始输出" in exc_info.value.raw_output
+
+
+def test_orphan_task_sets_status(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("t", 1000)
+    bridge.claim_task(task_id)
+    bridge.orphan_task(task_id, "bridge timeout")
+
+    task = bridge.get_task(task_id)
+    assert task["status"] == "orphaned"
+    assert task["error_text"] == "bridge timeout"
+
+
+def test_task_worker_orphans_on_recovery_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            if "120000" in args:
+                raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=135)
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "没有 marker", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    task_id = bridge.create_task("会在恢复阶段超时的任务", 5000)
+
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
+    worker_thread.start()
+
+    try:
+        deadline = time_module.time() + 5
+        task = bridge.get_task(task_id)
+
+        while task["status"] not in ("done", "error", "orphaned") and time_module.time() < deadline:
+            time_module.sleep(0.05)
+            task = bridge.get_task(task_id)
+
+        assert task["status"] == "orphaned"
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
+```
+
+Expected: all 4 new tests FAIL — the recovery timeout currently propagates as a raw `subprocess.TimeoutExpired` (not `TimeoutError`, so `pytest.raises(TimeoutError)` doesn't match it and the worker test never reaches `orphaned`), and `SentinelMarkerMissingError` has no `raw_output` attribute yet.
+
+- [ ] **Step 3: Implement**
+
+Replace the `SentinelMarkerMissingError` class definition with:
+
+```python
+class SentinelMarkerMissingError(RuntimeError):
+    def __init__(self, message, raw_output=""):
+        self.raw_output = raw_output
+        super().__init__(message)
+```
+
+Replace the body of `execute_sentinel_task` from the first `read_result = run_herdr(...)` call onward with:
+
+```python
+    read_result = run_herdr(
+        "agent",
+        "read",
+        SENTINEL,
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        str(read_lines),
+        timeout=60,
+    )
+
+    if not read_result["ok"]:
+        raise SentinelReadError(
+            "Unable to read Sentinel output: " + read_result.get("stderr", "")
+        )
+
+    response = extract_task_response(read_result["stdout"], task_id)
+
+    if response is None:
+        recovery_prompt = build_recovery_prompt(task_id)
+
+        try:
+            recovery_result = run_herdr(
+                "agent",
+                "prompt",
+                SENTINEL,
+                recovery_prompt,
+                "--wait",
+                "--timeout",
+                "120000",
+                timeout=135,
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(
+                "Bridge stopped waiting for Sentinel during recovery. "
+                "Sentinel may still be executing the task."
+            )
+
+        if recovery_result["ok"]:
+            read_result = run_herdr(
+                "agent",
+                "read",
+                SENTINEL,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                str(read_lines),
+                timeout=60,
+            )
+
+            response = extract_task_response(read_result["stdout"], task_id)
+
+    if response is None:
+        raise SentinelMarkerMissingError(
+            "Sentinel finished but no completion marker was found, "
+            "including after recovery.",
+            raw_output=read_result["stdout"][-4000:],
+        )
+
+    return response
+```
+
+Update `do_POST`'s `except SentinelMarkerMissingError` branch to surface the diagnostic:
+
+```python
+        except SentinelMarkerMissingError as e:
+            self.send_json(
+                {
+                    "ok": False,
+                    "task_id": task_id,
+                    "error": str(e),
+                    "raw_output": e.raw_output,
+                },
+                502,
+            )
+            return
+```
+
+Update `task_worker`'s `except Exception as e:` block (inside the inner `try` around `execute_sentinel_task`) to also surface `.raw_output` when present, so the diagnostic isn't lost for tasks that fail through the async path too. Find:
+
+```python
+                    except Exception as e:
+                        fail_task(task_id, str(e))
+                        print(f"[task {task_id}] error: {e}")
+```
+
+Replace with:
+
+```python
+                    except Exception as e:
+                        detail = str(e)
+
+                        if isinstance(e, SentinelMarkerMissingError) and e.raw_output:
+                            detail += (
+                                "\n\nRaw Sentinel output (last 4000 chars):\n"
+                                + e.raw_output
+                            )
+
+                        fail_task(task_id, detail)
+                        print(f"[task {task_id}] error: {e}")
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
+```
+
+Expected: 60 passed (56 + 4 new).
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /c/Tools && git add sentinel-bridge/bridge.py sentinel-bridge/test_bridge.py && git commit -m "Task 15: fix recovery timeout misclassification, add read timeouts, restore raw_output diagnostics"
+```
+
+---
+
+### Task 16: Minor fixes — socket leak, DB_PATH edge case
+
+**Files:**
+- Modify: `C:\Tools\sentinel-bridge\bridge.py`
+- Modify: `C:\Tools\sentinel-bridge\test_bridge.py`
+
+**Interfaces:** none new — purely internal robustness fixes.
+
+- [ ] **Step 1: Fix the `live_server` fixture's socket leak**
+
+In `test_bridge.py`, find the `live_server` fixture's teardown:
+
+```python
+    server.shutdown()
+    thread.join(timeout=5)
+```
+
+Replace with:
+
+```python
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+```
+
+- [ ] **Step 2: Fix `init_db`'s bare-filename `DB_PATH` edge case**
+
+In `bridge.py`, find in `init_db()`:
+
+```python
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+```
+
+Replace with:
+
+```python
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+```
+
+- [ ] **Step 3: Run the full suite to confirm nothing regressed**
+
+```bash
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
+```
+
+Expected: 60 passed, 0 failed (same count as after Task 15 — this task changes no test count, only fixes internal robustness).
+
+- [ ] **Step 4: Commit**
+
+```bash
+cd /c/Tools && git add sentinel-bridge/bridge.py sentinel-bridge/test_bridge.py && git commit -m "Task 16: close live_server test sockets, handle bare-filename DB_PATH"
+```
+
+---
+
+### Task 17: `sentinel.ps1` — exit non-zero on API failure for `ask`/`prompt`/`delegate`
+
+**Files:**
+- Modify: `C:\Tools\sentinel.ps1`
+
+**User decision (recorded 2026-08-30):** the final review flagged that `ask`/`prompt`/`delegate` always exit 0 even when the API reports `"ok": false`, which was a deliberate Task 11 decision ("don't swallow the error JSON behind `Write-Error`") but has the side effect that no automation can use `$LASTEXITCODE` to detect failure. The user chose to keep printing the full JSON body *and* exit 1 on failure — both, not a tradeoff.
+
+- [ ] **Step 1: Add the exit check to `ask`**
+
+Find:
+
+```powershell
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+```
+
+Replace with:
+
+```powershell
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
+```
+
+- [ ] **Step 2: Add the exit check to `prompt`**
+
+Find:
+
+```powershell
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+```
+
+Replace with:
+
+```powershell
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
+```
+
+- [ ] **Step 3: Add the exit check to `delegate`**
+
+Find:
+
+```powershell
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/delegate" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+```
+
+Replace with:
+
+```powershell
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/delegate" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
+```
+
+- [ ] **Step 4: Verify manually against the live remote bridge**
+
+```bash
+powershell -NoProfile -Command "C:\Tools\sentinel.ps1 delegate '   ' ; Write-Output \"EXIT:$LASTEXITCODE\""
+```
+
+Expected: the `Write-Error \"Task cannot be empty.\"; exit 1` path fires first (empty task text is rejected client-side before any HTTP call), so `EXIT:1`.
+
+```bash
+powershell -NoProfile -Command "C:\Tools\sentinel.ps1 task does-not-exist-12345 ; Write-Output \"EXIT:$LASTEXITCODE\""
+```
+
+Note: `task` itself isn't in scope for this change (only `ask`/`prompt`/`delegate` per the user's decision) — expect `EXIT:0` here since `task`'s branch has no exit-code logic added. Use this only to confirm you *didn't* accidentally touch the `task` branch.
+
+```bash
+powershell -NoProfile -Command "C:\Tools\sentinel.ps1 delegate 'quick real check' ; Write-Output \"EXIT:$LASTEXITCODE\""
+```
+
+Expected: `"ok": true` in the printed JSON, and `EXIT:0`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /c/Tools && git add sentinel.ps1 && git commit -m "Task 17: exit 1 on ok:false for ask/prompt/delegate, per user decision"
+```
+
+---
+
+### Task 18: Shared-secret authentication (`SENTINEL_BRIDGE_TOKEN`)
+
+**Files:**
+- Modify: `C:\Tools\sentinel-bridge\bridge.py`
+- Modify: `C:\Tools\sentinel-bridge\test_bridge.py`
+- Modify: `C:\Tools\sentinel.ps1`
+
+**User decision (recorded 2026-08-30):** the final review flagged that `/delegate` (and the pre-existing `/ask`) have no authentication or origin check at all — any local process, or a malicious webpage issuing a `no-cors` POST from a browser on the same machine, can submit tasks that execute arbitrary commands on the HPC-connected host, and `/delegate`'s fire-and-forget response makes this easier to exploit unnoticed than `/ask` (no need to read the response). This was out of the original v2.2/v2.3 scope; the user asked for a simple shared-secret header now rather than deferring it.
+
+**Design:** a `SENTINEL_BRIDGE_TOKEN` environment variable, read by both sides. If unset on the server, the bridge runs with a loud startup warning and *no* enforcement (so an already-deployed bridge doesn't silently start rejecting requests the moment this code ships — the operator has to opt in by setting the variable and restarting). If set, every request except `GET /health` must carry a matching `X-Sentinel-Token` header, checked with a constant-time comparison; a missing or wrong token gets `401`. `sentinel.ps1` reads the same variable from its own environment and attaches the header automatically when set.
+
+**Interfaces:**
+- Consumes: `Handler` (existing).
+- Produces: `AUTH_TOKEN` (module-level str, from `os.environ.get("SENTINEL_BRIDGE_TOKEN", "")`), `Handler.check_auth() -> bool`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `test_bridge.py`:
+
+```python
+def test_check_auth_allows_everything_when_no_token_configured(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {}
+
+    assert handler.check_auth() is True
+
+
+def test_check_auth_rejects_missing_header_when_token_configured(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {}
+
+    assert handler.check_auth() is False
+
+
+def test_check_auth_rejects_wrong_token(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {"X-Sentinel-Token": "wrong"}
+
+    assert handler.check_auth() is False
+
+
+def test_check_auth_accepts_correct_token(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    handler = bridge.Handler.__new__(bridge.Handler)
+    handler.headers = {"X-Sentinel-Token": "s3cret"}
+
+    assert handler.check_auth() is True
+
+
+def test_health_does_not_require_auth(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    status, body = _get(live_server, "/health")
+
+    assert status == 200
+    assert body["ok"] is True
+
+
+def test_ready_requires_auth_when_token_configured(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    status, body = _get(live_server, "/ready")
+
+    assert status == 401
+    assert body["ok"] is False
+
+
+def test_delegate_requires_auth_when_token_configured(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    status, body = _post(live_server, "/delegate", {"task": "should be rejected"})
+
+    assert status == 401
+    assert body["ok"] is False
+
+
+def test_delegate_succeeds_with_correct_token(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    payload = json_module.dumps({"task": "authorized request"}).encode("utf-8")
+    conn.request(
+        "POST", "/delegate", body=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Sentinel-Token": "s3cret",
+        },
+    )
+    resp = conn.getresponse()
+    status = resp.status
+    body = json_module.loads(resp.read().decode("utf-8"))
+    conn.close()
+
+    assert status == 202
+    assert body["ok"] is True
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
+```
+
+Expected: the 4 `check_auth` tests FAIL with `AttributeError: module 'bridge' has no attribute 'AUTH_TOKEN'`; the 4 live-server auth tests FAIL because every route currently succeeds regardless of headers.
+
+- [ ] **Step 3: Implement the Python side**
+
+Add near the top of `bridge.py`, after the `SENTINEL = ...` line:
+
+```python
+AUTH_TOKEN = os.environ.get("SENTINEL_BRIDGE_TOKEN", "")
+```
+
+Add `import hmac` to the top imports.
+
+Add a `check_auth` method to `Handler`, right after `read_json`:
+
+```python
+    def check_auth(self):
+        if not AUTH_TOKEN:
+            return True
+
+        provided = self.headers.get("X-Sentinel-Token", "")
+        return hmac.compare_digest(provided, AUTH_TOKEN)
+```
+
+Add the enforcement at the top of `_do_GET` and `_do_POST`, right after computing `path`:
+
+```python
+        if path != "/health" and not self.check_auth():
+            self.send_json({"ok": False, "error": "unauthorized"}, 401)
+            return
+```
+
+(`_do_POST` has no `/health` route at all, so this same line works unchanged there too — it just never matches the `path != "/health"` exemption for any POST path, which is correct since no POST route should be exempt.)
+
+Add a startup warning in `if __name__ == "__main__":`, right after the existing `print(f"Listening: ...")` line:
+
+```python
+    if not AUTH_TOKEN:
+        print(
+            "WARNING: SENTINEL_BRIDGE_TOKEN is not set. This bridge is "
+            "running with NO AUTHENTICATION -- anyone who can reach "
+            f"http://{HOST}:{PORT} can execute arbitrary commands via "
+            "Sentinel. Set SENTINEL_BRIDGE_TOKEN to a random secret and "
+            "restart to require it."
+        )
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+cd "/c/Tools/sentinel-bridge" && /c/Tools/sentinel-bridge/.venv/Scripts/python.exe -m pytest test_bridge.py -v
+```
+
+Expected: 68 passed (60 + 8 new).
+
+- [ ] **Step 5: Implement the PowerShell side**
+
+In `C:\Tools\sentinel.ps1`, replace `Invoke-SentinelApi`'s body to attach the token header when present. Find:
+
+```powershell
+    try {
+        if ($Body) {
+            return Invoke-RestMethod -Uri $Uri -Method $Method `
+                -ContentType "application/json; charset=utf-8" -Body $Body
+        }
+
+        return Invoke-RestMethod -Uri $Uri -Method $Method
+    }
+```
+
+Replace with:
+
+```powershell
+    $headers = @{}
+
+    if ($env:SENTINEL_BRIDGE_TOKEN) {
+        $headers["X-Sentinel-Token"] = $env:SENTINEL_BRIDGE_TOKEN
+    }
+
+    try {
+        if ($Body) {
+            return Invoke-RestMethod -Uri $Uri -Method $Method `
+                -ContentType "application/json; charset=utf-8" -Body $Body -Headers $headers
+        }
+
+        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers
+    }
+```
+
+- [ ] **Step 6: Verify manually — confirm the deployed bridge is unaffected until the operator opts in**
+
+The remote bridge process is currently running without `SENTINEL_BRIDGE_TOKEN` set, so after this code deploys, it must keep working exactly as before with no token configured on either side:
+
+```bash
+powershell -NoProfile -Command "C:\Tools\sentinel.ps1 health"
+```
+
+Expected: unchanged, `"ok": true`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd /c/Tools && git add sentinel-bridge/bridge.py sentinel-bridge/test_bridge.py sentinel.ps1 && git commit -m "Task 18: add optional SENTINEL_BRIDGE_TOKEN shared-secret auth"
+```
+
+**Note for the user, not a task step:** this ships opt-in — the currently-running remote bridge process has no token and will keep accepting unauthenticated requests until you (1) set `SENTINEL_BRIDGE_TOKEN` to a random secret in the environment the remote `bridge.py` process runs under, (2) restart that process, and (3) set the same value for `$env:SENTINEL_BRIDGE_TOKEN` in whatever Windows environment/session runs `sentinel.ps1`. Nothing in this plan does that for you, since it requires a secret value only you should generate and hold.
