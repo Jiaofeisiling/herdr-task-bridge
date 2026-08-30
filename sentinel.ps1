@@ -25,15 +25,47 @@ function Join-TaskText {
 }
 
 
+function Invoke-SentinelApi {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [string]$Method = "Get",
+        [string]$Body = $null
+    )
+
+    try {
+        if ($Body) {
+            return Invoke-RestMethod -Uri $Uri -Method $Method `
+                -ContentType "application/json; charset=utf-8" -Body $Body
+        }
+
+        return Invoke-RestMethod -Uri $Uri -Method $Method
+    }
+    catch [System.Net.WebException] {
+        $errResponse = $_.Exception.Response
+
+        if ($null -eq $errResponse) {
+            throw
+        }
+
+        $stream = $errResponse.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($stream)
+        $rawBody = $reader.ReadToEnd()
+        $reader.Close()
+
+        return $rawBody | ConvertFrom-Json
+    }
+}
+
+
 switch ($Command) {
 
     "health" {
-        $result = Invoke-RestMethod "$BaseUrl/health"
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/health"
         $result | ConvertTo-Json -Depth 10
     }
 
     "status" {
-        $result = Invoke-RestMethod "$BaseUrl/status"
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/status"
 
         if (-not $result.ok) {
             Write-Error $result.stderr
@@ -44,7 +76,7 @@ switch ($Command) {
     }
 
     "read" {
-        $result = Invoke-RestMethod "$BaseUrl/read"
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/read"
 
         if (-not $result.ok) {
             Write-Error $result.stderr
@@ -67,18 +99,8 @@ switch ($Command) {
             timeout_ms = $TimeoutMs
         } | ConvertTo-Json -Compress
 
-        $result = Invoke-RestMethod `
-            -Uri "$BaseUrl/prompt" `
-            -Method Post `
-            -ContentType "application/json; charset=utf-8" `
-            -Body $body
-
-        if (-not $result.ok) {
-            Write-Error $result.stderr
-            exit 1
-        }
-
-        $result.stdout
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body
+        $result | ConvertTo-Json -Depth 20
     }
 
     "ask" {
@@ -95,18 +117,7 @@ switch ($Command) {
             lines      = 500
         } | ConvertTo-Json -Compress
 
-        $result = Invoke-RestMethod `
-            -Uri "$BaseUrl/ask" `
-            -Method Post `
-            -ContentType "application/json; charset=utf-8" `
-            -Body $body
-
-        if (-not $result.ok) {
-            Write-Error "Sentinel task failed."
-            $result | ConvertTo-Json -Depth 10
-            exit 1
-        }
-
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
         $result | ConvertTo-Json -Depth 20
     }
 }
