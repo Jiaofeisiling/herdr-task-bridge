@@ -631,3 +631,50 @@ def test_ask_returns_500_on_prompt_failure(live_server, monkeypatch):
     assert status == 500
     assert body["ok"] is False
     assert "task_id" in body
+
+
+def test_task_worker_picks_up_and_completes_queued_task(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "raw", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "worker 完成")
+
+    task_id = bridge.create_task("后台任务", 5000)
+
+    worker_thread = threading_module.Thread(target=bridge.task_worker, daemon=True)
+    worker_thread.start()
+
+    deadline = time_module.time() + 5
+    task = bridge.get_task(task_id)
+
+    while task["status"] not in ("done", "error", "orphaned") and time_module.time() < deadline:
+        time_module.sleep(0.05)
+        task = bridge.get_task(task_id)
+
+    assert task["status"] == "done"
+    assert task["result_text"] == "worker 完成"
+
+
+def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+
+    task_id = bridge.create_task("后台任务", 5000)
+
+    worker_thread = threading_module.Thread(target=bridge.task_worker, daemon=True)
+    worker_thread.start()
+
+    time_module.sleep(0.3)
+
+    task = bridge.get_task(task_id)
+    assert task["status"] == "queued"
