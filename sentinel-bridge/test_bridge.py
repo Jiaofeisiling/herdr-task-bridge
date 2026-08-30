@@ -780,3 +780,82 @@ def test_health_reports_worker_alive_flag(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
+
+
+def test_execute_sentinel_task_recovery_timeout_raises_timeout_error(monkeypatch):
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            if "120000" in args:
+                # this is the recovery prompt call
+                raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=135)
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "没有 marker 的输出", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(TimeoutError):
+        bridge.execute_sentinel_task(
+            "55555555-5555-5555-5555-555555555555", "task", 60000
+        )
+
+
+def test_execute_sentinel_task_marker_missing_includes_raw_output(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "这是终端里最后的原始输出", "stderr": "",
+    })
+
+    with pytest.raises(bridge.SentinelMarkerMissingError) as exc_info:
+        bridge.execute_sentinel_task(
+            "66666666-6666-6666-6666-666666666666", "task", 60000
+        )
+
+    assert "这是终端里最后的原始输出" in exc_info.value.raw_output
+
+
+def test_orphan_task_sets_status(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("t", 1000)
+    bridge.claim_task(task_id)
+    bridge.orphan_task(task_id, "bridge timeout")
+
+    task = bridge.get_task(task_id)
+    assert task["status"] == "orphaned"
+    assert task["error_text"] == "bridge timeout"
+
+
+def test_task_worker_orphans_on_recovery_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            if "120000" in args:
+                raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=135)
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "没有 marker", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    task_id = bridge.create_task("会在恢复阶段超时的任务", 5000)
+
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
+    worker_thread.start()
+
+    try:
+        deadline = time_module.time() + 5
+        task = bridge.get_task(task_id)
+
+        while task["status"] not in ("done", "error", "orphaned") and time_module.time() < deadline:
+            time_module.sleep(0.05)
+            task = bridge.get_task(task_id)
+
+        assert task["status"] == "orphaned"
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)

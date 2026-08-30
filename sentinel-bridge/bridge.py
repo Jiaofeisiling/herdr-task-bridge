@@ -214,7 +214,9 @@ class SentinelReadError(RuntimeError):
 
 
 class SentinelMarkerMissingError(RuntimeError):
-    pass
+    def __init__(self, message, raw_output=""):
+        self.raw_output = raw_output
+        super().__init__(message)
 
 
 def build_recovery_prompt(task_id):
@@ -289,6 +291,7 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
         "recent-unwrapped",
         "--lines",
         str(read_lines),
+        timeout=60,
     )
 
     if not read_result["ok"]:
@@ -301,16 +304,22 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
     if response is None:
         recovery_prompt = build_recovery_prompt(task_id)
 
-        recovery_result = run_herdr(
-            "agent",
-            "prompt",
-            SENTINEL,
-            recovery_prompt,
-            "--wait",
-            "--timeout",
-            "120000",
-            timeout=135,
-        )
+        try:
+            recovery_result = run_herdr(
+                "agent",
+                "prompt",
+                SENTINEL,
+                recovery_prompt,
+                "--wait",
+                "--timeout",
+                "120000",
+                timeout=135,
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(
+                "Bridge stopped waiting for Sentinel during recovery. "
+                "Sentinel may still be executing the task."
+            )
 
         if recovery_result["ok"]:
             read_result = run_herdr(
@@ -321,6 +330,7 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
                 "recent-unwrapped",
                 "--lines",
                 str(read_lines),
+                timeout=60,
             )
 
             response = extract_task_response(read_result["stdout"], task_id)
@@ -328,7 +338,8 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
     if response is None:
         raise SentinelMarkerMissingError(
             "Sentinel finished but no completion marker was found, "
-            "including after recovery."
+            "including after recovery.",
+            raw_output=read_result["stdout"][-4000:],
         )
 
     return response
@@ -421,7 +432,15 @@ def task_worker(stop_event=None):
                         print(f"[task {task_id}] orphaned")
 
                     except Exception as e:
-                        fail_task(task_id, str(e))
+                        detail = str(e)
+
+                        if isinstance(e, SentinelMarkerMissingError) and e.raw_output:
+                            detail += (
+                                "\n\nRaw Sentinel output (last 4000 chars):\n"
+                                + e.raw_output
+                            )
+
+                        fail_task(task_id, detail)
                         print(f"[task {task_id}] error: {e}")
 
                     else:
@@ -809,6 +828,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "task_id": task_id,
                     "error": str(e),
+                    "raw_output": e.raw_output,
                 },
                 502,
             )
