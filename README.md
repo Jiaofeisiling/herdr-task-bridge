@@ -1,4 +1,8 @@
-# NeSI Sentinel Bridge
+<div align="center">
+  <img src="assets/logo.webp" alt="herdr-task-bridge logo" width="180">
+</div>
+
+# NeSI Sentinel Bridge (herdr-task-bridge)
 
 Windows ↔ NeSI Herdr Sentinel 桥接服务。让 Windows 上的 Codex/Claude 会话可以把任务委派给 NeSI 上一个持久运行的 Claude Code 会话（"Sentinel"），并发保护、异步任务队列、自动恢复都已内建。
 
