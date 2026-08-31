@@ -1,5 +1,31 @@
+# Python
 __pycache__/
 *.pyc
 .pytest_cache/
-sentinel-bridge/tasks.db
+
+# Project-local virtualenv (the system conda install refuses `pip install`
+# for non-admin users, see README.md -- every task/test uses this instead)
 sentinel-bridge/.venv/
+
+# Runtime state -- generated locally or on the deployed remote host,
+# never something to version
+sentinel-bridge/tasks.db
+
+# Local secrets / environment overrides. SENTINEL_BRIDGE_TOKEN, NESI_SSH_HOST,
+# and any other deployment-specific values belong in environment variables or
+# an untracked local file, never in a committed one. If you create a local
+# env file for convenience, name it so this pattern catches it.
+.env
+.env.*
+*.local
+*secrets*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# superpowers subagent-driven-development workspace (task briefs, review
+# packages, progress ledger) is already self-ignored via its own
+# .superpowers/sdd/.gitignore -- listed here only so its absence from
+# tracked files doesn't look accidental.
+.superpowers/
