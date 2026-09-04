@@ -15,7 +15,7 @@ them with placeholders first — see [CONTRIBUTING.md](../../CONTRIBUTING.md#sen
 
 ## Environment
 
-- Component: `bridge.py` (remote) / `sentinel.ps1` (Windows) / `sentinel_bridge.py`
+- Component: `bridge.py` (remote) / `sentinel.ps1` (Windows)
 - `/health` response `version` field (if applicable):
 - OS / PowerShell version (for `sentinel.ps1` issues):
 

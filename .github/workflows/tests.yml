@@ -23,3 +23,16 @@ jobs:
         run: |
           cd sentinel-bridge
           python -m pytest test_bridge.py -v
+
+  pester:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: powershell
+        run: Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run sentinel.ps1 test suite
+        shell: powershell
+        run: Invoke-Pester -Path ./sentinel.Tests.ps1 -Output Detailed -CI

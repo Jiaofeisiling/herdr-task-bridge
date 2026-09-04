@@ -4,6 +4,9 @@
 
 # NeSI Sentinel Bridge (herdr-task-bridge)
 
+[![tests](https://github.com/Jiaofeisiling/herdr-task-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/Jiaofeisiling/herdr-task-bridge/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Windows ↔ NeSI Herdr Sentinel 桥接服务。让 Windows 上的 Codex/Claude 会话可以把任务委派给 NeSI 上一个持久运行的 Claude Code 会话（"Sentinel"），并发保护、异步任务队列、自动恢复都已内建。
 
 ## 架构
@@ -33,7 +36,6 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 ```
 .
 ├── sentinel.ps1                    Windows 端 CLI 入口
-├── sentinel_bridge.py               旧版 CLI 工具（未使用，通过 SSH 直连，非本项目当前实现）
 ├── sentinel-bridge\
 │   ├── bridge.py                    本地工作副本，与远程部署的版本保持同步
 │   ├── test_bridge.py               pytest 套件（70 个用例，全部 mock 掉 herdr）
@@ -99,7 +101,7 @@ queued → running → done
    $env:SENTINEL_BRIDGE_TOKEN = "同一个随机字符串"
    ```
 
-未设置时 bridge 启动会打印一条明显的警告提示当前无鉴权。`/health` 永远不需要鉴权（用于纯存活探测）。
+未设置时 bridge 启动会打印一条明显的警告提示当前无鉴权；密钥含非 ASCII 字符时也会在启动时打印警告（`hmac.compare_digest` 不支持非 ASCII 字符串比较，那种密钥下的每个请求都会 fail-closed 返回 401）。`/health` 永远不需要鉴权（用于纯存活探测）。
 
 ## 环境变量（bridge.py，远程侧）
 
@@ -110,6 +112,9 @@ queued → running → done
 | `SENTINEL_AGENT` | `sentinel` | Herdr 里的 agent 名字 |
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | 任务队列数据库路径 |
 | `SENTINEL_BRIDGE_TOKEN` | 空 | 鉴权密钥，留空即不启用鉴权 |
+| `SENTINEL_MAX_QUEUE_DEPTH` | `50` | `/delegate` 队列里同时允许多少个 `queued` 任务，超过返回 `429` |
+
+`timeout_ms`（`/ask`、`/prompt`、`/delegate` 均适用）必须落在 `[1000, 21600000]`（1 秒 ~ 6 小时）区间内，否则返回 `400`。
 
 ## 部署（更新远程 bridge.py）
 
@@ -130,11 +135,16 @@ cd sentinel-bridge
 .venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-70 个用例，全部通过 monkeypatch 模拟 `run_herdr`/`get_agent_status`，不需要真实 herdr 或网络。PowerShell 端目前没有自动化测试，只能手动对着真实部署的 bridge 验证（这也是历史上唯一一次抓到 `Invoke-SentinelApi` 在 PowerShell 5.1 下读错误响应体失效的方式——单元测试测不出这类运行时特有的问题）。
+79 个用例，全部通过 monkeypatch 模拟 `run_herdr`/`get_agent_status`，不需要真实 herdr 或网络。
 
-## 已知限制
+```powershell
+Invoke-Pester -Path .\sentinel.Tests.ps1 -Output Detailed
+```
 
-- `sentinel.ps1` 没有自动化测试覆盖，改动后需要手动对真实部署验证。
-- 鉴权密钥若含非 ASCII 字符会导致该密钥下所有请求返回 401（fail-closed，但没有启动时校验提示）。
-- `/delegate` 的队列没有深度上限，`timeout_ms` 也没有范围校验。
-- 完整设计文档（含每一步的具体代码、测试和历次代码审查记录）见 [docs/superpowers/plans/2026-08-30-sentinel-bridge-v2.2-v2.3.md](docs/superpowers/plans/2026-08-30-sentinel-bridge-v2.2-v2.3.md)。
+9 个用例，把 `sentinel.ps1` 当子进程启动、指向一个用 `System.Net.HttpListener` 搭的本地假 bridge（通过 `SENTINEL_BRIDGE_URL` 环境变量指定地址，默认仍是 `http://127.0.0.1:8765`）。之所以不直接 dot-source 脚本做进程内测试，是因为 `sentinel.ps1` 好几个分支会调用 `exit`——dot-source 进测试进程会直接把整个测试进程杀掉；子进程 + 真实 HTTP 往返和 `test_bridge.py` 的 `live_server` fixture 是同一个思路。需要本机装了 Pester（`Install-Module -Name Pester -Scope CurrentUser`）。
+
+CI（`.github/workflows/tests.yml`）在每次 push/PR 到 `master` 时自动跑这两套测试。
+
+## 设计文档
+
+完整设计文档（含每一步的具体代码、测试和历次代码审查记录）见 [docs/superpowers/plans/2026-08-30-sentinel-bridge-v2.2-v2.3.md](docs/superpowers/plans/2026-08-30-sentinel-bridge-v2.2-v2.3.md)。

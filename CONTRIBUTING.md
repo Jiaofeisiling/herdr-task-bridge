@@ -63,10 +63,19 @@ cd sentinel-bridge
 All tests mock `run_herdr`/`get_agent_status` — none of them need a real
 `herdr` binary or network access.
 
-`sentinel.ps1` (the Windows client) has no automated tests yet; changes to
-it need manual verification against a real deployed bridge before merging.
-Say so explicitly in your PR description if you couldn't test against a live
-bridge.
+`sentinel.ps1` (the Windows client) has a Pester suite (`sentinel.Tests.ps1`)
+that runs it as a real child process against a local `HttpListener` stub, so
+it doesn't need a deployed bridge:
+
+```powershell
+Install-Module -Name Pester -Scope CurrentUser   # first time only
+Invoke-Pester -Path .\sentinel.Tests.ps1 -Output Detailed
+```
+
+It still doesn't cover everything a live bridge would (real PowerShell 5.1
+HTTP error-body quirks, actual Sentinel/herdr behavior) — say so explicitly
+in your PR description if a change needs manual verification against a live
+bridge and you couldn't do that.
 
 ## Code style
 

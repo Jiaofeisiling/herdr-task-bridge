@@ -27,6 +27,51 @@ DB_PATH = os.environ.get(
     os.path.expanduser("~/sentinel-bridge/tasks.db"),
 )
 
+# Bounds for the client-supplied timeout_ms on /ask, /prompt, /delegate.
+# Below the min there's no realistic chance Sentinel responds in time;
+# above the max a client typo (extra zero, seconds passed as ms) could
+# otherwise tie up the queue/lock far longer than any real task needs.
+TIMEOUT_MS_MIN = 1000  # 1 second
+TIMEOUT_MS_MAX = 21_600_000  # 6 hours -- matches /delegate's own default
+
+# Cap on how many tasks may sit in 'queued' state at once. Without this,
+# a burst of /delegate calls (or a buggy client retry loop) could grow
+# tasks.db and the backlog without bound, with no way for a caller to
+# tell "queued, will run eventually" apart from "the queue is effectively
+# stuck". Override via env var for deployments that need a different limit.
+MAX_QUEUE_DEPTH = int(os.environ.get("SENTINEL_MAX_QUEUE_DEPTH", "50"))
+
+
+def validate_timeout_ms(timeout_ms):
+    if not (TIMEOUT_MS_MIN <= timeout_ms <= TIMEOUT_MS_MAX):
+        raise ValueError(
+            f"timeout_ms must be between {TIMEOUT_MS_MIN} and "
+            f"{TIMEOUT_MS_MAX}, got {timeout_ms}"
+        )
+
+    return timeout_ms
+
+
+def auth_token_warning():
+    if not AUTH_TOKEN:
+        return (
+            "WARNING: SENTINEL_BRIDGE_TOKEN is not set. This bridge is "
+            "running with NO AUTHENTICATION -- anyone who can reach "
+            f"http://{HOST}:{PORT} can execute arbitrary commands via "
+            "Sentinel. Set SENTINEL_BRIDGE_TOKEN to a random secret and "
+            "restart to require it."
+        )
+
+    if not AUTH_TOKEN.isascii():
+        return (
+            "WARNING: SENTINEL_BRIDGE_TOKEN contains non-ASCII characters. "
+            "hmac.compare_digest() cannot compare non-ASCII strings, so "
+            "check_auth() fails closed and EVERY authenticated request "
+            "will get 401 until this is fixed. Use an ASCII-only token."
+        )
+
+    return None
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -118,6 +163,15 @@ def list_tasks(limit=20):
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def count_queued_tasks():
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE status = 'queued'"
+        ).fetchone()
+
+    return row["n"]
 
 
 def peek_next_task():
@@ -722,12 +776,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 task = body["task"].strip()
 
-                timeout_ms = int(
+                timeout_ms = validate_timeout_ms(int(
                     body.get(
                         "timeout_ms",
                         21600000,  # 6 hours
                     )
-                )
+                ))
 
                 if not task:
                     raise ValueError("task cannot be empty")
@@ -739,6 +793,21 @@ class Handler(BaseHTTPRequestHandler):
                         "error": f"invalid request: {e}",
                     },
                     400,
+                )
+                return
+
+            queued = count_queued_tasks()
+
+            if queued >= MAX_QUEUE_DEPTH:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"queue full: {queued}/{MAX_QUEUE_DEPTH} "
+                            "tasks already queued"
+                        ),
+                    },
+                    429,
                 )
                 return
 
@@ -766,9 +835,9 @@ class Handler(BaseHTTPRequestHandler):
 
             task = body["task"].strip()
 
-            timeout_ms = int(
+            timeout_ms = validate_timeout_ms(int(
                 body.get("timeout_ms", 120000)
-            )
+            ))
 
             read_lines = int(
                 body.get("lines", 500)
@@ -886,14 +955,9 @@ if __name__ == "__main__":
     print(f"Database: {DB_PATH}")
     print(f"Listening: http://{HOST}:{PORT}")
 
-    if not AUTH_TOKEN:
-        print(
-            "WARNING: SENTINEL_BRIDGE_TOKEN is not set. This bridge is "
-            "running with NO AUTHENTICATION -- anyone who can reach "
-            f"http://{HOST}:{PORT} can execute arbitrary commands via "
-            "Sentinel. Set SENTINEL_BRIDGE_TOKEN to a random secret and "
-            "restart to require it."
-        )
+    startup_warning = auth_token_warning()
+    if startup_warning:
+        print(startup_warning)
 
     server = ThreadingHTTPServer(
         (HOST, PORT),

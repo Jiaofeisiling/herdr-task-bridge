@@ -28,7 +28,7 @@ $Utf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $Utf8
 $OutputEncoding           = $Utf8
 
-$BaseUrl = "http://127.0.0.1:8765"
+$BaseUrl = if ($env:SENTINEL_BRIDGE_URL) { $env:SENTINEL_BRIDGE_URL } else { "http://127.0.0.1:8765" }
 
 
 function Join-TaskText {

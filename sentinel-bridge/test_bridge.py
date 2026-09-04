@@ -974,3 +974,116 @@ def test_delegate_accepts_lowercase_token_header(live_server, monkeypatch):
 
     assert status == 202
     assert body["ok"] is True
+
+
+# -- timeout_ms range validation -------------------------------------------
+
+def test_delegate_rejects_timeout_ms_below_minimum(live_server):
+    status, body = _post(
+        live_server, "/delegate", {"task": "check disk", "timeout_ms": 500}
+    )
+
+    assert status == 400
+    assert body["ok"] is False
+
+
+def test_delegate_rejects_timeout_ms_above_maximum(live_server):
+    status, body = _post(
+        live_server,
+        "/delegate",
+        {"task": "check disk", "timeout_ms": 99_999_999_999},
+    )
+
+    assert status == 400
+    assert body["ok"] is False
+
+
+def test_delegate_accepts_timeout_ms_at_boundaries(live_server):
+    status, body = _post(
+        live_server,
+        "/delegate",
+        {"task": "check disk", "timeout_ms": bridge.TIMEOUT_MS_MIN},
+    )
+    assert status == 202
+
+    status, body = _post(
+        live_server,
+        "/delegate",
+        {"task": "check disk", "timeout_ms": bridge.TIMEOUT_MS_MAX},
+    )
+    assert status == 202
+
+
+def test_ask_rejects_timeout_ms_out_of_range_without_touching_sentinel(
+    live_server, monkeypatch
+):
+    def boom(*args, **kwargs):
+        raise AssertionError(
+            "run_herdr must not be called when timeout_ms fails validation"
+        )
+
+    monkeypatch.setattr(bridge, "run_herdr", boom)
+
+    status, body = _post(
+        live_server, "/ask", {"task": "check disk", "timeout_ms": 0}
+    )
+
+    assert status == 400
+    assert body["ok"] is False
+
+
+# -- /delegate queue depth limit --------------------------------------------
+
+def test_delegate_rejects_when_queue_is_full(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_QUEUE_DEPTH", 2)
+
+    first = _post(live_server, "/delegate", {"task": "task 1"})
+    second = _post(live_server, "/delegate", {"task": "task 2"})
+    assert first[0] == 202
+    assert second[0] == 202
+
+    status, body = _post(live_server, "/delegate", {"task": "task 3"})
+
+    assert status == 429
+    assert body["ok"] is False
+
+
+def test_delegate_succeeds_again_once_queue_has_room(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_QUEUE_DEPTH", 1)
+
+    first = _post(live_server, "/delegate", {"task": "task 1"})
+    assert first[0] == 202
+
+    blocked = _post(live_server, "/delegate", {"task": "task 2"})
+    assert blocked[0] == 429
+
+    bridge.complete_task(first[1]["task_id"], "done")
+
+    status, body = _post(live_server, "/delegate", {"task": "task 3"})
+    assert status == 202
+
+
+# -- non-ASCII SENTINEL_BRIDGE_TOKEN startup warning ------------------------
+
+def test_auth_token_warning_when_not_configured(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "")
+
+    warning = bridge.auth_token_warning()
+
+    assert warning is not None
+    assert "NO AUTHENTICATION" in warning
+
+
+def test_auth_token_warning_when_non_ascii(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "sécret")
+
+    warning = bridge.auth_token_warning()
+
+    assert warning is not None
+    assert "non-ASCII" in warning
+
+
+def test_auth_token_warning_when_valid_ascii_token(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+
+    assert bridge.auth_token_warning() is None
