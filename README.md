@@ -44,7 +44,7 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
     └── 2026-08-30-sentinel-bridge-v2.2-v2.3.md   完整实施计划（18 个任务的详细设计与代码）
 ```
 
-远程主机上的实际运行位置是 `~/sentinel-bridge/bridge.py`（当前是 `~/sentinel-bridge` 目录，数据库在 `~/sentinel-bridge/tasks.db`）。
+远程主机上代码实际跑在 `~/herdr-task-bridge/sentinel-bridge/bridge.py`（本仓库的 git clone，见下方"部署"）；数据库仍在 `~/sentinel-bridge/tasks.db`——这是 `SENTINEL_DB` 固定基于 `$HOME` 的默认值，跟代码部署在哪个目录无关，历史上先有这个数据库目录，代码搬到 git 管理的位置后就没再动它。
 
 ## 快速开始
 
@@ -94,7 +94,7 @@ queued → running → done
 1. 远程：设置环境变量后重启 `bridge.py`
    ```bash
    export SENTINEL_BRIDGE_TOKEN="一个随机字符串（仅 ASCII，非 ASCII 会导致鉴权异常）"
-   python3 ~/sentinel-bridge/bridge.py
+   cd ~/herdr-task-bridge/sentinel-bridge && python3 bridge.py
    ```
 2. Windows：在跑 `sentinel.ps1` 的会话里设置同样的值
    ```powershell
@@ -118,15 +118,30 @@ queued → running → done
 
 ## 部署（更新远程 bridge.py）
 
-本地没有到远程主机的 SSH 通道，每次改动都需要手动同步：
+远程主机上是本仓库的一个真正的 git clone（`~/herdr-task-bridge`），更新代码就是 `git pull`；重启进程是单独一步，**必须在 NeSI 那边能直接操作的终端里手动做**，不要通过 `sentinel.ps1`/`/ask`/`/delegate` 让 Sentinel 去执行"重启 bridge 自己"这种自引用操作——bridge.py 杀掉自己进程的那一刻，正在处理这条指令的 HTTP 连接会跟着断掉（触发这条指令的后台命令本身不受影响，但调用方这一侧会看到连接被重置或超时，容易被误判成部署失败；这是实测踩过的坑，不是猜测）。
 
-1. 把仓库里 `sentinel-bridge/bridge.py` 的内容复制到远程 `~/sentinel-bridge/bridge.py`（VS Code Remote-SSH 文件浏览器 / 集成终端 / `scp` 均可）。
-2. 停掉旧进程，重新执行 `python3 ~/sentinel-bridge/bridge.py`。
-3. 从 Windows 验证：
+1. **同步代码**（不涉及重启，随便在哪个终端做都安全）：
+   ```bash
+   cd ~/herdr-task-bridge && git pull
+   ```
+
+2. **重启 bridge.py**（在 NeSI 那边的终端里手动执行）：
+   ```bash
+   pgrep -af bridge.py                  # 找到当前跑着的 PID
+   kill <PID>                           # SIGTERM 即可；DB 写入逐笔提交，不存在半截事务
+   cd ~/herdr-task-bridge/sentinel-bridge
+   SENTINEL_AGENT=sentinel-opencode python3 bridge.py > /dev/null 2>&1 &
+   ```
+   新进程会自然成为 PID 1 的孤儿进程（这台 NeSI 登录节点 `KillUserProcesses=false`，已验证单次 SSH 会话断开不会连带杀掉它）。但**本机连不连得上跟这个无关**——完全取决于 VS Code Remote-SSH 有没有开着、有没有把 `127.0.0.1:8765` 转发过来；bridge.py 再健壮，VS Code 一断，本机照样连不上。
+
+3. **验证**（从 Windows）：
    ```bash
    curl -sS http://127.0.0.1:8765/health
+   curl -sS http://127.0.0.1:8765/ready
    ```
-   核对 `"version"` 字段确认跑的是新代码（每次改动 `/health` 的响应结构时记得手动同步这个数字）。
+   `/health` 核对 `"version"` 字段确认跑的是新代码（每次改动 `/health` 的响应结构时记得手动同步这个数字）；`/ready` 确认 Sentinel 没被卡在 `working`。
+
+数据库路径不受代码搬家影响——`SENTINEL_DB` 默认值是固定基于 `$HOME` 的 `~/sentinel-bridge/tasks.db`，跟 `bridge.py` 自己部署在哪个目录无关，所以切到 git 管理的新目录时不需要迁移任何数据。旧的裸文件部署目录（`~/sentinel-bridge/bridge.py`）已删除，那个目录现在只保留 `tasks.db`。
 
 ## 测试
 
