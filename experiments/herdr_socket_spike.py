@@ -6,13 +6,29 @@ NOT production code. Doesn't import or modify anything in sentinel-bridge/.
 Deliberately a throwaway script -- see docs/superpowers/plans/ once (if)
 this graduates into an actual bridge.py rewrite.
 
+Connection model: one fresh Unix-domain-socket connection per call, closed
+right after the matching response line arrives. First version of this
+script tried to reuse a single long-lived connection for several sequential
+calls and got `[Errno 32] Broken pipe` on the second call -- herdr's socket
+server appears to close the connection after answering one request, at
+least for plain request/response calls (as opposed to a subscription
+stream). Confirmed live against the real remote herdr instance, not a
+guess.
+
+One consequence: `events.subscribe` below only proves the subscribe
+request itself is acknowledged. It closes the connection right after, so
+it can NOT demonstrate that events actually arrive -- doing that would need
+a persistent connection kept open and read from concurrently with issuing
+the prompt on a separate connection (a second iteration, if this pass looks
+promising enough to bother).
+
 What it checks, in order, printing one clearly-tagged line per step so the
 result is easy to pull out of a noisy terminal capture:
 
-  1. connect + ping                          -- socket reachable at all?
-  2. agent.list / session.snapshot            -- how do we find our pane_id?
+  1. ping                                     -- socket reachable at all?
+  2. agent.list                               -- how do we find our pane_id?
   3. agent.get(pane_id)                       -- structured status, no CLI parsing
-  4. events.subscribe(pane.agent_status_changed) -- push instead of poll?
+  4. events.subscribe(pane.agent_status_changed) -- does the ack come back clean?
   5. agent.prompt(..., wait={...})            -- structured completion,
                                                   no SENTINEL_DONE_<token>
                                                   marker-scraping needed?
@@ -46,42 +62,35 @@ TEST_PROMPT = (
 )
 
 
-class HerdrSocket:
+class HerdrClient:
     def __init__(self, path):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(30)
-        self.sock.connect(path)
-        self.buf = b""
+        self.path = path
         self._next_id = 0
 
-    def _read_line(self):
-        while b"\n" not in self.buf:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("herdr socket closed unexpectedly")
-            self.buf += chunk
-
-        line, _, self.buf = self.buf.partition(b"\n")
-        return json.loads(line.decode("utf-8"))
-
-    def call(self, method, params=None, timeout=None):
+    def call(self, method, params=None, timeout=30):
         self._next_id += 1
         req_id = f"spike{self._next_id}"
-
         req = {"id": req_id, "method": method, "params": params or {}}
-        self.sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
 
-        if timeout is not None:
-            self.sock.settimeout(timeout)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(self.path)
+            sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
 
-        # Events for other subscriptions can interleave on the same
-        # connection -- skip any message that isn't our response id.
-        events = []
-        while True:
-            msg = self._read_line()
-            if msg.get("id") == req_id:
-                return msg, events
-            events.append(msg)
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError(
+                        "socket closed before a full response line arrived"
+                    )
+                buf += chunk
+
+            line, _, _ = buf.partition(b"\n")
+            return json.loads(line.decode("utf-8"))
+        finally:
+            sock.close()
 
 
 def tag(label, payload):
@@ -90,30 +99,23 @@ def tag(label, payload):
 
 def main():
     summary = {"agent_name": AGENT_NAME, "steps": {}}
-
-    try:
-        client = HerdrSocket(SOCKET_PATH)
-    except Exception as e:
-        tag("connect", {"ok": False, "error": str(e)})
-        summary["steps"]["connect"] = "fail"
-        tag("SUMMARY", summary)
-        return
-
-    summary["steps"]["connect"] = "ok"
+    client = HerdrClient(SOCKET_PATH)
 
     # 1. ping
     try:
-        resp, _ = client.call("ping")
+        resp = client.call("ping")
         tag("ping", resp)
         summary["steps"]["ping"] = "ok" if "result" in resp else "fail"
     except Exception as e:
         tag("ping", {"ok": False, "error": str(e)})
         summary["steps"]["ping"] = "fail"
+        tag("SUMMARY", summary)
+        return
 
     # 2. find our pane_id
     pane_id = None
     try:
-        resp, _ = client.call("agent.list")
+        resp = client.call("agent.list")
         tag("agent.list", resp)
         agents = resp.get("result", {}).get("agents", [])
         for a in agents:
@@ -139,34 +141,33 @@ def main():
 
     # 3. structured status, no CLI/JSON-in-stdout parsing needed
     try:
-        resp, _ = client.call("agent.get", {"pane_id": pane_id})
+        resp = client.call("agent.get", {"pane_id": pane_id})
         tag("agent.get", resp)
         summary["steps"]["agent.get"] = "ok" if "result" in resp else "fail"
     except Exception as e:
         tag("agent.get", {"ok": False, "error": str(e)})
         summary["steps"]["agent.get"] = "fail"
 
-    # 4. subscribe to status-change events for this pane
-    sub_ok = False
+    # 4. subscribe ack only -- see module docstring for why this can't
+    #    prove event delivery under the one-connection-per-call model.
     try:
-        resp, _ = client.call("events.subscribe", {
+        resp = client.call("events.subscribe", {
             "subscriptions": [
                 {"type": "pane.agent_status_changed", "pane_id": pane_id}
             ]
         })
         tag("events.subscribe", resp)
-        sub_ok = "result" in resp
-        summary["steps"]["events.subscribe"] = "ok" if sub_ok else "fail"
+        summary["steps"]["events.subscribe"] = "ok" if "result" in resp else "fail"
     except Exception as e:
         tag("events.subscribe", {"ok": False, "error": str(e)})
         summary["steps"]["events.subscribe"] = "fail"
 
-    # 5. the real test: agent.prompt with a built-in wait, and see whether
-    #    the status-change event(s) show up interleaved on the same
-    #    connection while we wait for the response.
+    # 5. the real test: does agent.prompt's built-in `wait` give a clean
+    #    structured completion signal, replacing SENTINEL_DONE_<token>
+    #    marker-scraping?
     start = time.time()
     try:
-        resp, events = client.call(
+        resp = client.call(
             "agent.prompt",
             {
                 "pane_id": pane_id,
@@ -177,12 +178,8 @@ def main():
         )
         elapsed = time.time() - start
         tag("agent.prompt", resp)
-        for ev in events:
-            tag("interleaved_event", ev)
-
         summary["steps"]["agent.prompt"] = "ok" if "result" in resp else "fail"
         summary["agent.prompt_elapsed_s"] = round(elapsed, 1)
-        summary["interleaved_event_count"] = len(events)
     except Exception as e:
         tag("agent.prompt", {"ok": False, "error": str(e)})
         summary["steps"]["agent.prompt"] = "fail"
@@ -191,7 +188,7 @@ def main():
     #    result payload (does the socket API already give us clean text,
     #    or do we still need extract_task_response-style scraping?)
     try:
-        resp, _ = client.call("pane.read", {
+        resp = client.call("pane.read", {
             "pane_id": pane_id, "source": "recent", "lines": 30,
         })
         tag("pane.read", resp)
