@@ -39,7 +39,8 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 ├── sentinel.profile.ps1            让 sentinel.ps1 可以在任意目录下当 `sentinel` 用（见"部署"）
 ├── sentinel.Tests.ps1              Pester 套件（9 个用例）
 ├── remote\
-│   └── bridge-aliases.sh           远程重启/部署流程的别名（见"部署"）
+│   ├── bridge-aliases.sh           远程重启/部署流程的别名（见"部署"）
+│   └── bridge-supervisor.sh        崩溃自动重启循环，screen 里跑这个而不是裸 bridge.py
 ├── sentinel-bridge\
 │   ├── bridge.py                    本地工作副本，与远程部署的版本保持同步
 │   ├── test_bridge.py               pytest 套件（79 个用例，全部 mock 掉 herdr）
@@ -124,7 +125,12 @@ queued → running → done
 
 远程主机上是本仓库的一个真正的 git clone（`~/herdr-task-bridge`），更新代码就是 `git pull`；重启是单独一步。
 
-**bridge.py 必须跑在一个具名的 `screen` 会话里，不要裸 `&` 后台**。第一版重启方式是找个终端敲 `python3 bridge.py &`，结果这个进程从来没挂在任何一个 VS Code 终端标签上，等 VS Code 窗口关掉/换了终端标签，人就找不到它了——`/health` 照样能连上（进程本身没死，NeSI 登录节点 `KillUserProcesses=false`，已验证单次 SSH 会话断开不会连带杀掉它），但没有任何地方能看它的输出、按 Ctrl+C、或者确认它到底是不是新代码在跑。`screen` 解决的正是这个问题：会话有名字（`bridge`），随时能从任意终端 `screen -ls` 找到、`screen -r bridge` 接上去。
+**bridge.py 由 [remote/bridge-supervisor.sh](remote/bridge-supervisor.sh) 这个重启循环拉起，跑在具名的 `screen` 会话里，不要直接把 `python3 bridge.py` 扔进 screen。** 这是两次真实事故换来的：
+
+1. 一开始是裸 `&` 后台，进程从来没挂在任何 VS Code 终端标签上，等标签一关就找不到它了——`/health` 还能连上（进程没死，NeSI 登录节点 `KillUserProcesses=false`，单次 SSH 会话断开不会连带杀掉它），但没地方看输出、按 Ctrl+C。
+2. 改成 `screen -dmS bridge bash -c '... python3 bridge.py'` 之后，某次 bridge.py 自己崩了——screen 默认行为是**直接子进程一退出，窗口就跟着关掉**，`screen -r bridge` 直接报 "screen is terminating"，会话彻底消失，而且当时没有日志文件，连它为什么崩的都查不出来。
+
+`bridge-supervisor.sh` 用一个 `while true` 循环把 `python3 bridge.py` 包起来，每次它退出（不管崩溃还是被 kill）都记一行时间戳到 `sentinel-bridge/bridge.log`，等 5 秒后自动重新拉起。screen 的直接子进程变成这个循环本身，不再是 bridge.py，所以 bridge.py 崩多少次窗口都还在、都有记录。
 
 ### 命令别名（推荐）
 
@@ -142,8 +148,9 @@ source ~/.bashrc
 | `bridge-deploy` | `git pull` + 重启（日常改完代码后最常用的一条） |
 | `bridge-pull` | 只同步代码，不重启 |
 | `bridge-restart` | 只重启（kill 旧进程 + 起新的 screen 会话），不拉代码 |
-| `bridge-status` | 看 screen 会话、进程、`/health` 是否正常 |
-| `bridge-attach` | `screen -r bridge`，接上去看实时输出/Ctrl+C |
+| `bridge-status` | 看 screen 会话、进程、`/health`、最近 20 行日志是否正常 |
+| `bridge-attach` | `screen -r bridge`，接上去看重启循环的实时输出/Ctrl+C |
+| `bridge-logs` | `tail -f` 日志（`sentinel-bridge/bridge.log`），单独看不用接进 screen |
 
 `remote/bridge-aliases.sh` 是这套重启流程唯一的权威定义，改动流程时改这个文件，不要只改下面的文字说明。
 
@@ -165,15 +172,16 @@ sentinel ask "check disk usage"
    cd ~/herdr-task-bridge && git pull
    ```
 
-2. **重启 bridge.py**：
+2. **重启 bridge.py**（`bridge-restart` 做的就是这些）：
    ```bash
-   pgrep -af bridge.py                  # 找到当前跑着的 PID
-   kill <PID>                           # SIGTERM 即可；DB 写入逐笔提交，不存在半截事务
-   screen -dmS bridge bash -c 'cd ~/herdr-task-bridge/sentinel-bridge && SENTINEL_AGENT=sentinel-opencode python3 bridge.py'
+   screen -S bridge -X quit             # 干掉整个旧会话（重启循环 + 它当前拉起的 bridge.py）
+   pkill -f 'bridge-supervisor.sh'      # 防御性清理，怕有漏网的
+   pkill -f 'python3 bridge.py'
+   screen -dmS bridge bash ~/herdr-task-bridge/remote/bridge-supervisor.sh
    screen -ls                           # 确认出现 "xxxx.bridge (Detached)"
    ```
-   可以在 NeSI 的终端里手动敲，也可以通过 `sentinel.ps1 ask`/`delegate` 让 Sentinel 代劳——但如果是让 Sentinel 执行 `kill <当前 bridge 的 PID>`，**触发这条指令的那次 HTTP 请求本身会因为连接被腰斩而报错**（bridge.py 杀掉自己进程的那一刻，正在处理这条指令的连接跟着断；kill/screen 命令本身不受影响，照样会执行完），这是实测会发生的正常现象，不代表部署失败，用下一步单独验证就行，不要看到这个报错就以为要回滚。
-   之后需要看日志/交互，从任意终端 `screen -r bridge` 接上去；`Ctrl+A D` 分离，不会杀掉进程。
+   可以在 NeSI 的终端里手动敲，也可以通过 `sentinel.ps1 ask`/`delegate` 让 Sentinel 代劳——但如果是让 Sentinel 执行"杀掉当前 bridge"这步，**触发这条指令的那次 HTTP 请求本身会因为连接被腰斩而报错**（bridge.py 杀掉自己进程的那一刻，正在处理这条指令的连接跟着断；后续命令不受影响，照样会执行完），这是实测会发生的正常现象，不代表部署失败，用下一步单独验证就行，不要看到这个报错就以为要回滚。
+   之后需要看实时输出/交互，从任意终端 `screen -r bridge` 接上去（看到的是重启循环，不是 bridge.py 本身）；`Ctrl+A D` 分离，不会杀掉进程。只想看日志不想接进 screen 就用 `bridge-logs` / `tail -f sentinel-bridge/bridge.log`。
 
 3. **验证**（从 Windows）：
    ```bash

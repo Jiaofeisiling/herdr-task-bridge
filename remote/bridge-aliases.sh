@@ -8,11 +8,12 @@
 # only place the actual restart sequence should be defined; the README
 # should describe it, not duplicate it verbatim.
 
-_BRIDGE_DIR="$HOME/herdr-task-bridge/sentinel-bridge"
-_BRIDGE_AGENT="sentinel-opencode"
+_BRIDGE_ROOT="$HOME/herdr-task-bridge"
+_BRIDGE_DIR="$_BRIDGE_ROOT/sentinel-bridge"
+_BRIDGE_LOG="$_BRIDGE_DIR/bridge.log"
 
 bridge-pull() {
-    ( cd "$HOME/herdr-task-bridge" && git pull )
+    ( cd "$_BRIDGE_ROOT" && git pull )
 }
 
 bridge-status() {
@@ -22,26 +23,30 @@ bridge-status() {
     pgrep -af bridge.py || echo "(not running)"
     echo "--- health ---"
     curl -sS -m 5 http://127.0.0.1:8765/health && echo
+    echo "--- last 20 log lines ---"
+    tail -n 20 "$_BRIDGE_LOG" 2>/dev/null || echo "(no log file yet: $_BRIDGE_LOG)"
 }
 
 bridge-attach() {
     screen -r bridge
 }
 
-# Stops whatever bridge.py is currently running and starts a fresh one
-# from $_BRIDGE_DIR inside a named `screen` session (see README: a bare
-# `&` background leaves the process impossible to find/attach to later).
+bridge-logs() {
+    tail -n 50 -f "$_BRIDGE_LOG"
+}
+
+# Tears down any existing `bridge` screen session (supervisor loop +
+# whatever bridge.py it's currently running) plus any orphaned bare
+# bridge.py from before the supervisor loop existed, then starts a fresh
+# supervised instance. See remote/bridge-supervisor.sh for why bridge.py
+# is never launched directly in screen.
 bridge-restart() {
-    local pid
-    pid=$(pgrep -f 'python3 bridge.py')
+    screen -S bridge -X quit >/dev/null 2>&1
+    pkill -f 'bridge-supervisor.sh' 2>/dev/null
+    pkill -f 'python3 bridge.py' 2>/dev/null
+    sleep 2
 
-    if [ -n "$pid" ]; then
-        echo "Stopping bridge.py (PID $pid)..."
-        kill "$pid"
-        sleep 2
-    fi
-
-    screen -dmS bridge bash -c "cd '$_BRIDGE_DIR' && SENTINEL_AGENT=$_BRIDGE_AGENT python3 bridge.py"
+    screen -dmS bridge bash "$_BRIDGE_ROOT/remote/bridge-supervisor.sh"
     sleep 2
 
     bridge-status

@@ -10,6 +10,7 @@ sentinel-bridge/.venv/
 # Runtime state -- generated locally or on the deployed remote host,
 # never something to version
 sentinel-bridge/tasks.db
+sentinel-bridge/bridge.log
 
 # Local secrets / environment overrides. SENTINEL_BRIDGE_TOKEN, NESI_SSH_HOST,
 # and any other deployment-specific values belong in environment variables or
