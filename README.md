@@ -36,9 +36,13 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 ```
 .
 ├── sentinel.ps1                    Windows 端 CLI 入口
+├── sentinel.profile.ps1            让 sentinel.ps1 可以在任意目录下当 `sentinel` 用（见"部署"）
+├── sentinel.Tests.ps1              Pester 套件（9 个用例）
+├── remote\
+│   └── bridge-aliases.sh           远程重启/部署流程的别名（见"部署"）
 ├── sentinel-bridge\
 │   ├── bridge.py                    本地工作副本，与远程部署的版本保持同步
-│   ├── test_bridge.py               pytest 套件（70 个用例，全部 mock 掉 herdr）
+│   ├── test_bridge.py               pytest 套件（79 个用例，全部 mock 掉 herdr）
 │   └── .venv\                       项目专用虚拟环境（miniforge3 的 conda 环境对非管理员只读，装不了包）
 └── docs\superpowers\plans\
     └── 2026-08-30-sentinel-bridge-v2.2-v2.3.md   完整实施计划（18 个任务的详细设计与代码）
@@ -121,6 +125,40 @@ queued → running → done
 远程主机上是本仓库的一个真正的 git clone（`~/herdr-task-bridge`），更新代码就是 `git pull`；重启是单独一步。
 
 **bridge.py 必须跑在一个具名的 `screen` 会话里，不要裸 `&` 后台**。第一版重启方式是找个终端敲 `python3 bridge.py &`，结果这个进程从来没挂在任何一个 VS Code 终端标签上，等 VS Code 窗口关掉/换了终端标签，人就找不到它了——`/health` 照样能连上（进程本身没死，NeSI 登录节点 `KillUserProcesses=false`，已验证单次 SSH 会话断开不会连带杀掉它），但没有任何地方能看它的输出、按 Ctrl+C、或者确认它到底是不是新代码在跑。`screen` 解决的正是这个问题：会话有名字（`bridge`），随时能从任意终端 `screen -ls` 找到、`screen -r bridge` 接上去。
+
+### 命令别名（推荐）
+
+命令太长记不住，[remote/bridge-aliases.sh](remote/bridge-aliases.sh) 把下面这套流程包成了几个函数。装一次：
+
+```bash
+echo 'source ~/herdr-task-bridge/remote/bridge-aliases.sh' >> ~/.bashrc
+source ~/.bashrc
+```
+
+之后：
+
+| 命令 | 作用 |
+|---|---|
+| `bridge-deploy` | `git pull` + 重启（日常改完代码后最常用的一条） |
+| `bridge-pull` | 只同步代码，不重启 |
+| `bridge-restart` | 只重启（kill 旧进程 + 起新的 screen 会话），不拉代码 |
+| `bridge-status` | 看 screen 会话、进程、`/health` 是否正常 |
+| `bridge-attach` | `screen -r bridge`，接上去看实时输出/Ctrl+C |
+
+`remote/bridge-aliases.sh` 是这套重启流程唯一的权威定义，改动流程时改这个文件，不要只改下面的文字说明。
+
+Windows 端同理，[sentinel.profile.ps1](sentinel.profile.ps1) 让 `sentinel.ps1` 可以在任何目录下直接当 `sentinel` 用：
+
+```powershell
+# 加进你的 $PROFILE（notepad $PROFILE 打开）：
+. "E:\herdr-task-bridge\sentinel.profile.ps1"
+
+# 之后：
+sentinel health
+sentinel ask "check disk usage"
+```
+
+### 手动步骤（`bridge-deploy` 内部做的事）
 
 1. **同步代码**（不涉及重启，随便在哪个终端做都安全）：
    ```bash
