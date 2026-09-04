@@ -31,7 +31,7 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 ## 文件结构
 
 ```
-C:\Tools\
+.
 ├── sentinel.ps1                    Windows 端 CLI 入口
 ├── sentinel_bridge.py               旧版 CLI 工具（未使用，通过 SSH 直连，非本项目当前实现）
 ├── sentinel-bridge\
@@ -46,12 +46,14 @@ C:\Tools\
 
 ## 快速开始
 
-```powershell
-C:\Tools\sentinel.ps1 health
-C:\Tools\sentinel.ps1 ready
+在仓库根目录下执行：
 
-$id = (C:\Tools\sentinel.ps1 delegate "检查当前 NeSI 项目的 Git 状态，不要修改任何文件" | ConvertFrom-Json).task_id
-C:\Tools\sentinel.ps1 wait $id
+```powershell
+.\sentinel.ps1 health
+.\sentinel.ps1 ready
+
+$id = (.\sentinel.ps1 delegate "检查当前 NeSI 项目的 Git 状态，不要修改任何文件" | ConvertFrom-Json).task_id
+.\sentinel.ps1 wait $id
 ```
 
 ## 命令参考
@@ -113,7 +115,7 @@ queued → running → done
 
 本地没有到远程主机的 SSH 通道，每次改动都需要手动同步：
 
-1. 把 `C:\Tools\sentinel-bridge\bridge.py` 的内容复制到远程 `~/sentinel-bridge/bridge.py`（VS Code Remote-SSH 文件浏览器 / 集成终端 / `scp` 均可）。
+1. 把仓库里 `sentinel-bridge/bridge.py` 的内容复制到远程 `~/sentinel-bridge/bridge.py`（VS Code Remote-SSH 文件浏览器 / 集成终端 / `scp` 均可）。
 2. 停掉旧进程，重新执行 `python3 ~/sentinel-bridge/bridge.py`。
 3. 从 Windows 验证：
    ```bash
@@ -124,8 +126,8 @@ queued → running → done
 ## 测试
 
 ```bash
-cd C:\Tools\sentinel-bridge
-C:\Tools\sentinel-bridge\.venv\Scripts\python.exe -m pytest test_bridge.py -v
+cd sentinel-bridge
+.venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
 70 个用例，全部通过 monkeypatch 模拟 `run_herdr`/`get_agent_status`，不需要真实 herdr 或网络。PowerShell 端目前没有自动化测试，只能手动对着真实部署的 bridge 验证（这也是历史上唯一一次抓到 `Invoke-SentinelApi` 在 PowerShell 5.1 下读错误响应体失效的方式——单元测试测不出这类运行时特有的问题）。
