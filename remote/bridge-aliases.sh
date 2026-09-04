@@ -20,7 +20,7 @@ bridge-status() {
     echo "--- screen ---"
     screen -ls 2>&1 | grep -i bridge || echo "(no 'bridge' screen session)"
     echo "--- process ---"
-    pgrep -af bridge.py || echo "(not running)"
+    pgrep -af '^python3 bridge\.py$' || echo "(not running)"
     echo "--- health ---"
     curl -sS -m 5 http://127.0.0.1:8765/health && echo
     echo "--- last 20 log lines ---"
@@ -40,10 +40,18 @@ bridge-logs() {
 # bridge.py from before the supervisor loop existed, then starts a fresh
 # supervised instance. See remote/bridge-supervisor.sh for why bridge.py
 # is never launched directly in screen.
+#
+# The pkill pattern is anchored (^...$) on purpose: these functions get
+# invoked remotely as `bash -c "bridge-restart"` (or a longer chained
+# command), and that wrapping bash -c's own argv contains this whole
+# script's text -- including the literal string "python3 bridge.py" --
+# so an unanchored `pkill -f 'python3 bridge.py'` matches and kills that
+# wrapping shell too, silently truncating whatever ran after it. Hit this
+# for real. Anchoring works because the wrapper's cmdline always starts
+# with "bash", never "python3".
 bridge-restart() {
     screen -S bridge -X quit >/dev/null 2>&1
-    pkill -f 'bridge-supervisor.sh' 2>/dev/null
-    pkill -f 'python3 bridge.py' 2>/dev/null
+    pkill -f '^python3 bridge\.py$' 2>/dev/null
     sleep 2
 
     screen -dmS bridge bash "$_BRIDGE_ROOT/remote/bridge-supervisor.sh"

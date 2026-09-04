@@ -175,11 +175,12 @@ sentinel ask "check disk usage"
 2. **重启 bridge.py**（`bridge-restart` 做的就是这些）：
    ```bash
    screen -S bridge -X quit             # 干掉整个旧会话（重启循环 + 它当前拉起的 bridge.py）
-   pkill -f 'bridge-supervisor.sh'      # 防御性清理，怕有漏网的
-   pkill -f 'python3 bridge.py'
+   pkill -f '^python3 bridge\.py$'      # 防御性清理，怕有漏网的旧 bridge.py 不在 screen 里
    screen -dmS bridge bash ~/herdr-task-bridge/remote/bridge-supervisor.sh
    screen -ls                           # 确认出现 "xxxx.bridge (Detached)"
    ```
+   `pkill -f` 的 pattern **必须**像这样加 `^...$` 锚点，不能只写 `pkill -f 'python3 bridge.py'`——这几条命令如果是被打包成 `bash -c "一长串命令"` 远程执行的（比如通过 Sentinel 代劳时就是这样），那个包装用的 `bash -c` 进程自己的命令行里就含有 `python3 bridge.py` 这几个字（因为 pkill 那条命令本身的文本就在里面），不加锚点会把执行这条指令的 shell 自己也匹配杀掉，后面的命令全部执行不到。这是实测踩过的坑，不是理论风险。加锚点后目标进程的命令行确实是精确的 `python3 bridge.py`，而包装用的 shell 命令行是 `bash -c ...`，锚点能把两者分开。
+
    可以在 NeSI 的终端里手动敲，也可以通过 `sentinel.ps1 ask`/`delegate` 让 Sentinel 代劳——但如果是让 Sentinel 执行"杀掉当前 bridge"这步，**触发这条指令的那次 HTTP 请求本身会因为连接被腰斩而报错**（bridge.py 杀掉自己进程的那一刻，正在处理这条指令的连接跟着断；后续命令不受影响，照样会执行完），这是实测会发生的正常现象，不代表部署失败，用下一步单独验证就行，不要看到这个报错就以为要回滚。
    之后需要看实时输出/交互，从任意终端 `screen -r bridge` 接上去（看到的是重启循环，不是 bridge.py 本身）；`Ctrl+A D` 分离，不会杀掉进程。只想看日志不想接进 screen 就用 `bridge-logs` / `tail -f sentinel-bridge/bridge.log`。
 
