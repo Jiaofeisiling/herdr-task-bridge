@@ -7,9 +7,159 @@
 [![tests](https://github.com/Jiaofeisiling/herdr-task-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/Jiaofeisiling/herdr-task-bridge/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Windows ↔ NeSI Herdr Sentinel 桥接服务。让 Windows 上的 Codex/Claude 会话可以把任务委派给 NeSI 上任意一个持久运行的 Herdr agent 会话（不止一个"Sentinel"——同一台主机上可以有多个，用 `agent` 参数挑），并发保护、异步任务队列、自动恢复都已内建。
+`herdr-task-bridge` 是面向远程科研计算的执行网关。它让用户只需操作 Windows 上的 ChatGPT、Claude、Cursor 或其他智能开发工具，就能把需要 Linux/NeSI 环境的命令、验证和 Slurm 工作交给持久运行的 Herdr agent，不必亲自登录服务器处理日常操作。
 
-## 架构
+当前 v4 已提供 Windows CLI、SSH 隧道后的 HTTP bridge、SQLite 异步任务队列、多 Herdr agent 路由、互斥保护与保守恢复。下面的“目标架构”还包括尚待实现的 Windows Gateway、事件流、主动通知和专用监控 worker；文档会明确区分现状与规划。
+
+## 项目定位
+
+本项目不是“远程 shell 的薄包装”，也不是让两个 AI 随意对话。它连接的是两个职责不同、能力互补的角色：
+
+- **Windows 主模型（Primary Coding Model）**：用户选定的主要智能模型；当前典型实例是 Windows 上的 ChatGPT。它理解科研目标，负责架构、算法、绝大部分代码、跨文件重构、代码审查与 PR。
+- **Linux Herdr Agent（Remote Execution Engineer）**：远程执行工程师。它在真实 Linux/NeSI 环境中运行命令、诊断环境问题、做测试与最小修复、按授权提交或监控 Slurm，并返回结构化证据；它不是默认的主要代码作者。
+- **用户（Owner / Approver）**：定义目标、预算和权限边界，选择主模型，并对昂贵、破坏性、不可逆或科学含义不明确的动作作最终决定。
+- **Bridge / Gateway（Control Plane）**：可靠传递执行合同、保存任务与事件、恢复连接、去重、路由和通知；它不替代主模型作科研决策，也不替代 Herdr agent 执行 Linux 工作。
+
+同一个 workflow 在同一时刻只设一个 Primary Coding Model。ChatGPT、Claude、Cursor 都可以作为入口或适配器，但不能在没有交接和分支隔离的情况下同时修改同一工作区。
+
+### 代码所有权边界
+
+Linux Herdr Agent 可以自主编写更适合在 Linux 环境中完成的内容，例如 Bash/Slurm 脚本、module/conda/CUDA 环境胶水、诊断脚本和为通过真实环境验证所需的最小局部修复。以下内容默认交还 Windows 主模型：核心算法、模型结构、数据划分、评估协议、公共 API、跨模块重构和大部分业务代码。
+
+每个执行合同应明确选择一种 coding policy：
+
+| 模式 | Linux Herdr Agent 的代码权限 |
+|---|---|
+| `no_code_changes` | 只读检查与执行，不修改代码 |
+| `environment_and_minimal_fix` | 默认模式；允许 Linux 专属胶水和为验证所需的最小修复 |
+| `scoped_development` | 仅在明确文件/分支/验收标准内承担一段开发工作 |
+
+无论使用哪种模式，都遵守单写者原则：Windows 主模型与 Linux Herdr Agent 不同时修改同一文件；确需并行时使用独立 Git branch/worktree，并通过 commit/PR 交接。
+
+## 目标架构
+
+```mermaid
+flowchart LR
+    U[用户<br/>目标、授权、决策] --> M[Primary Coding Model<br/>Windows ChatGPT / Claude / Cursor]
+
+    subgraph W[Windows 用户侧]
+        M <--> G[Windows Gateway<br/>会话适配、隧道、订阅、通知<br/>规划中]
+        G <--> T[SSH Tunnel]
+    end
+
+    subgraph N[NeSI / Linux 远程执行侧]
+        T <--> B[Remote Bridge<br/>HTTP、路由、队列、worker]
+        B <--> D[(Workflow / Task / Event Store<br/>events 规划中)]
+        B --> H[Herdr<br/>持久 Agent 会话管理]
+        H --> A[Linux Herdr Agent<br/>执行、诊断、有限修复]
+        A --> L[Linux Workspace<br/>Git、环境、数据、测试]
+        L --> S[NeSI Slurm<br/>队列、作业、日志、产物]
+        S --> O[Monitor Worker<br/>多层状态监控<br/>规划中]
+        O --> B
+    end
+```
+
+[打开可缩放、可切换主题和导出的交互式架构图](docs/diagrams/research-execution-architecture.html)
+
+目标架构把控制面和执行面分开：主模型生成执行合同，Gateway/Bridge 负责可靠传输与状态，Herdr agent 负责真实环境执行，Monitor Worker 独立追踪长任务。监控不应长期占用执行 agent。
+
+## 端到端科研工作流
+
+```mermaid
+flowchart TD
+    U[用户提出科研目标<br/>边界、预算、授权] --> M[Windows 主模型<br/>设计方案并编写主要代码]
+    M --> C[结构化执行合同<br/>目标、目录、commit、权限、验收]
+    C --> A[Linux Herdr Agent<br/>在真实环境检查与执行]
+
+    A --> Q{需要写代码吗？}
+    Q -->|Linux 专属或最小修复| F[在授权范围内修改并验证]
+    F --> A
+    Q -->|核心代码或超出范围| R[报告证据和建议<br/>交回主模型修改]
+    R --> M
+
+    A --> G{昂贵、破坏性、重跑<br/>或科学含义不明确？}
+    G -->|是| P[请求用户授权]
+    P --> A
+    G -->|否/已授权| S[dry-run / TEST_ONLY<br/>必要时唯一正式 Slurm 提交]
+    S --> O[独立监控 task / agent / Slurm / artifacts]
+    O --> E[结构化结果与证据<br/>状态、日志、产物、指标、限制]
+    E --> M
+    M --> Z[向用户给出结论<br/>可说 / 不可说 / 下一步]
+```
+
+[打开可缩放、可切换主题和导出的交互式工作流图](docs/diagrams/research-execution-workflow.html)
+
+建议的执行合同至少包含：
+
+```yaml
+objective: 要完成的科研或工程目标
+project: 项目标识
+workdir: Linux 上的明确工作目录
+expected_git_commit: 预期基线 commit
+allowed_actions: 允许读取、修改、安装、提交或取消的动作
+coding_policy: no_code_changes | environment_and_minimal_fix | scoped_development
+slurm_policy: 是否只 dry-run、允许 TEST_ONLY、是否允许唯一正式提交
+acceptance: 可机器检查的验收条件
+reporting: 需要返回的日志、产物、指标、限制和证据
+```
+
+## 状态与证据边界
+
+系统必须分别报告以下层级，不能用一个 `done` 混为一谈：
+
+1. Bridge 服务是否可达。
+2. Herdr agent 是 `idle`、`working`、`done` 还是异常。
+3. Bridge `task_id` 是 `queued`、`running`、`done`、`error` 还是 `orphaned`。
+4. Slurm `job_id` 是排队、运行、完成、失败还是取消。
+5. 日志、checkpoint、表格等 artifacts 是否存在且完整。
+6. 指标、样本数、配置和评估协议是否足以支持科研结论。
+
+因此：**bridge task `done` 不等于 Slurm 作业完成，Slurm `COMPLETED` 也不等于科研结果有效。** `orphaned` 只表示 bridge 已失去可靠跟踪，远端动作可能仍在继续；必须先检查实际影响，绝不能盲目重试。
+
+主动报告应采用持久事件流，而不是让 Windows 端无限轮询一整段终端文本。目标设计是远端以事务方式写入 `task_events`，Windows Gateway 使用游标长轮询或订阅；状态不变时保持安静，在 `needs_input`、`error`、`orphaned`、任务完成或出现新 artifact 时通知用户。建议的关联标识为：
+
+```text
+workflow_id → task_id → command_run_id → slurm_job_id → artifact_id
+                                      ↘ event_seq
+```
+
+## 何时可以称“主要开发已完成”
+
+目前还不能这样宣称。下面是从 v4 到主要开发完成的验收清单；只有所有“主开发阻塞项”完成，并在真实 NeSI 环境通过端到端验证后，才进入以维护和扩展为主的阶段。
+
+### 已有基础
+
+- [x] Windows PowerShell CLI 与 HTTP bridge。
+- [x] SQLite 持久任务、异步委派、重启后保守标记 `orphaned`。
+- [x] 多 Herdr agent 发现、指定路由和逐 agent 互斥。
+- [x] 同步/异步执行、队列深度限制、超时和基础 token 鉴权。
+- [x] bridge supervisor、部署别名、pytest/Pester/CI 基线。
+- [x] 角色、代码所有权、目标架构、工作流和证据边界文档。
+
+### 主开发阻塞项
+
+- [ ] **修正结果提取**：为 OpenCode 等不同 Herdr backend 提供可靠的结构化完成标记，避免把终端历史误当最终结果。
+- [ ] **Workflow 与执行合同**：增加 `workflow_id`、执行合同 schema、来源 client、权限/coding policy、幂等键与关联 ID。
+- [ ] **持久事件流**：实现事务性 `task_events`、单调 `event_seq`、cursor/long-poll API，以及重连后不漏报、不重报。
+- [ ] **Windows Gateway**：把共享客户端、SSH 隧道生命周期、重连、订阅和 ChatGPT/Claude/Cursor 适配从单次 CLI 中抽出。
+- [ ] **主动通知**：仅在完成、失败、需授权、`orphaned` 或有关键新证据时通知；支持去重、静默未变化状态和终态自动停止。
+- [ ] **独立监控 worker**：分别跟踪 bridge task、Herdr agent、Slurm job 和 artifacts，且不长期占用执行 agent。
+- [ ] **Slurm 安全门控**：内建静态检查 → dry-run → `TEST_ONLY` → 明确授权后唯一正式提交；记录 job ID，禁止不明状态下自动重投。
+- [ ] **结构化远端报告**：支持 progress、`needs_input`、artifact、metric、warning 和 final report，而不只依赖终端文本抽取。
+- [ ] **受控并发与写入隔离**：按 agent 并发执行异步任务，并对同项目写操作实施 single-writer 或 branch/worktree 隔离与显式交接。
+- [ ] **安全默认值**：生产部署 token 默认开启，增加 secret 管理、命令/目录 allowlist、任务级权限和审计记录。
+- [ ] **可复现证据包**：最终报告固定包含 commit、workdir、命令、环境、job/task ID、日志/产物路径、指标配置、样本数及“可说/不可说”。
+- [ ] **真实端到端验收**：覆盖正常执行、bridge 重启、隧道中断、重复请求、超时/`orphaned`、授权暂停、Slurm 成败和通知恢复。
+- [ ] **发布收口**：安装/升级/卸载文档、兼容性说明、迁移脚本和一个经过 NeSI 实测的稳定 release/tag。
+
+### 不阻塞主要开发完成的后续扩展
+
+- Web Dashboard、移动端通知和更多 UI。
+- Slurm 之外的调度器或云计算后端。
+- 大文件传输、artifact 在线预览和长期实验追踪平台集成。
+- 更多主模型适配器和跨主机联邦调度。
+
+## 当前 v4 实现架构
 
 ```
 Windows PowerShell (sentinel.ps1)
@@ -45,6 +195,11 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 │   ├── bridge.py                    本地工作副本，与远程部署的版本保持同步
 │   ├── test_bridge.py               pytest 套件（99 个用例，全部 mock 掉 herdr）
 │   └── .venv\                       项目专用虚拟环境（miniforge3 的 conda 环境对非管理员只读，装不了包）
+├── docs\diagrams\
+│   ├── research-execution-architecture.json   目标架构图源规范
+│   ├── research-execution-architecture.html   可交互目标架构图
+│   ├── research-execution-workflow.json       工作流图源规范
+│   └── research-execution-workflow.html       可交互端到端工作流图
 └── docs\superpowers\plans\
     └── 2026-08-30-sentinel-bridge-v2.2-v2.3.md   完整实施计划（18 个任务的详细设计与代码）
 ```

@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "herdr-task-bridge 目标架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/diagrams/research-execution-architecture.html",
+    "viewBox": [1300, 900],
+    "repository": {
+      "url": "https://github.com/Jiaofeisiling/herdr-task-bridge",
+      "revision": "233caa509578f95e644c1f5cf30ea56bc7360651"
+    },
+    "views": [
+      {
+        "id": "control_path",
+        "label": "控制路径",
+        "focus": ["user", "primary_model", "windows_gateway", "ssh_tunnel", "remote_bridge", "herdr", "linux_agent"],
+        "note": "用户只操作 Windows 主模型，任务经受控通道抵达远端执行者。"
+      },
+      {
+        "id": "execution_path",
+        "label": "执行路径",
+        "focus": ["linux_agent", "linux_workspace", "slurm", "monitor_worker"],
+        "note": "Agent 操作真实 Linux 环境；长期 Slurm 状态由独立 monitor 观察。"
+      },
+      {
+        "id": "report_path",
+        "label": "报告路径",
+        "focus": ["monitor_worker", "task_store", "remote_bridge", "ssh_tunnel", "windows_gateway", "primary_model", "user"],
+        "note": "持久事件支持断线补收，通知与执行相互分离。"
+      }
+    ]
+  },
+  "components": [
+    { "id": "user", "type": "external", "label": "用户", "sublabel": "授权与决策", "pos": [25, 340], "size": [120, 68] },
+    { "id": "primary_model", "type": "frontend", "label": "Primary Coding Model", "sublabel": "当前：Windows ChatGPT", "pos": [175, 340], "size": [170, 72], "tag": "主要研发者" },
+    { "id": "windows_gateway", "type": "messagebus", "label": "Windows Gateway", "sublabel": "接口、订阅、通知", "pos": [375, 340], "size": [160, 72], "tag": "规划" },
+    { "id": "ssh_tunnel", "type": "security", "label": "SSH Tunnel", "sublabel": "localhost:8765", "pos": [565, 340], "size": [145, 72], "tag": "当前" },
+    { "id": "remote_bridge", "type": "backend", "label": "Remote Bridge", "sublabel": "HTTP、队列、worker", "pos": [740, 340], "size": [160, 72], "tag": "当前 v4", "sources": [{ "path": "sentinel-bridge/bridge.py", "line": 590, "label": "worker loop" }, { "path": "sentinel-bridge/bridge.py", "line": 810, "label": "HTTP handlers" }] },
+    { "id": "task_store", "type": "database", "label": "Workflow / Task Store", "sublabel": "tasks + events + cursor", "pos": [735, 95], "size": [170, 72], "tag": "tasks 已有；events 规划", "sources": [{ "path": "sentinel-bridge/bridge.py", "line": 143, "label": "tasks schema" }] },
+    { "id": "herdr", "type": "messagebus", "label": "Herdr", "sublabel": "持久 Agent 会话管理", "pos": [930, 340], "size": [140, 72], "tag": "当前" },
+    { "id": "linux_agent", "type": "backend", "label": "Linux Herdr Agent", "sublabel": "执行、诊断、有限小修", "pos": [1100, 340], "size": [165, 72], "tag": "远端执行者" },
+    { "id": "linux_workspace", "type": "cloud", "label": "Linux Workspace", "sublabel": "Git、环境、数据、测试", "pos": [1100, 510], "size": [165, 72] },
+    { "id": "slurm", "type": "external", "label": "NeSI Slurm", "sublabel": "队列、作业、日志、产物", "pos": [925, 645], "size": [155, 72] },
+    { "id": "monitor_worker", "type": "backend", "label": "Monitor Worker", "sublabel": "多层状态监控", "pos": [740, 645], "size": [160, 72], "tag": "规划" }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Windows 用户侧", "wraps": ["primary_model", "windows_gateway", "ssh_tunnel"], "pad": 18 },
+    { "kind": "region", "label": "NeSI / Linux 远端执行侧", "wraps": ["remote_bridge", "task_store", "herdr", "linux_agent", "linux_workspace", "slurm", "monitor_worker"], "pad": 20 },
+    { "kind": "security-group", "label": "Bridge 控制面", "wraps": ["remote_bridge", "task_store", "monitor_worker"], "pad": 14 }
+  ],
+  "connections": [
+    { "id": "user_intent", "from": "user", "to": "primary_model", "variant": "emphasis" },
+    { "id": "model_contract", "from": "primary_model", "to": "windows_gateway", "label": "合同与事件", "variant": "emphasis", "labelDy": -28 },
+    { "id": "gateway_tunnel", "from": "windows_gateway", "to": "ssh_tunnel", "variant": "security" },
+    { "id": "tunnel_bridge", "from": "ssh_tunnel", "to": "remote_bridge", "label": "HTTP + 长轮询", "variant": "security", "route": "straight", "labelAt": [725, 426] },
+    { "id": "bridge_persist", "from": "remote_bridge", "to": "task_store", "label": "tasks + events", "variant": "dashed", "labelDx": -52 },
+    { "id": "bridge_herdr", "from": "remote_bridge", "to": "herdr", "variant": "emphasis" },
+    { "id": "herdr_agent", "from": "herdr", "to": "linux_agent", "variant": "emphasis" },
+    { "id": "agent_workspace", "from": "linux_agent", "to": "linux_workspace", "variant": "default" },
+    { "id": "workspace_slurm", "from": "linux_workspace", "to": "slurm", "label": "授权后 sbatch", "variant": "security" },
+    { "id": "slurm_monitor", "from": "slurm", "to": "monitor_worker", "variant": "dashed" },
+    { "id": "monitor_events", "from": "monitor_worker", "to": "remote_bridge", "label": "状态事件", "variant": "dashed", "fromSide": "top", "toSide": "bottom", "route": "orthogonal-v" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "角色边界",
+      "items": [
+        "Primary Coding Model 编写和审查大部分代码",
+        "Linux Agent 贴近环境执行、诊断并做有限小修",
+        "Bridge 保存任务事实，不判断科研结论"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "当前与规划",
+      "items": [
+        "v4 已有 CLI、HTTP、SQLite、worker 与多 Agent 路由",
+        "Windows Gateway、workflow、events 与 monitor 尚未实现",
+        "虚线报告链代表下一阶段主要开发"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "完成标准",
+      "items": [
+        "用户无需登录服务器即可完成常规远端执行",
+        "断线后可补收事件，状态变化只通知一次",
+        "task、Slurm job、artifact 与科研结果分别取证"
+      ]
+    }
+  ]
+}
