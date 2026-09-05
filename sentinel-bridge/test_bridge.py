@@ -745,7 +745,7 @@ def test_do_post_returns_500_instead_of_crashing_on_unexpected_error(live_server
     def boom(*args, **kwargs):
         raise RuntimeError("simulated unexpected failure")
 
-    monkeypatch.setattr(bridge, "create_task", boom)
+    monkeypatch.setattr(bridge, "create_task_if_queue_available", boom)
 
     status, body = _post(live_server, "/delegate", {"task": "trigger the boom"})
 
@@ -1266,7 +1266,115 @@ def test_health_reports_default_agent(live_server, monkeypatch):
 
     assert status == 200
     assert body["default_agent"] == "agent-a"
-    assert body["version"] == 4
+    assert body["agent"] == "agent-a"
+    assert body["version"] == bridge.BRIDGE_VERSION
+
+
+def test_delegate_rejects_invalid_agent_names(live_server):
+    for agent_name in (None, "", "   ", ["agent-a"]):
+        status, body = _post(
+            live_server,
+            "/delegate",
+            {"task": "check disk", "agent": agent_name},
+        )
+
+        assert status == 400
+        assert body["ok"] is False
+        assert "agent" in body["error"]
+
+
+def test_ask_rejects_invalid_agent_without_touching_herdr(live_server, monkeypatch):
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("invalid agent must be rejected before Herdr is queried")
+
+    monkeypatch.setattr(bridge, "run_herdr", should_not_run)
+
+    status, body = _post(
+        live_server,
+        "/ask",
+        {"task": "check disk", "agent": "   "},
+    )
+
+    assert status == 400
+    assert body["ok"] is False
+    assert "agent" in body["error"]
+
+
+def test_ready_rejects_blank_agent_query_without_touching_herdr(live_server, monkeypatch):
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("invalid agent must be rejected before Herdr is queried")
+
+    monkeypatch.setattr(bridge, "run_herdr", should_not_run)
+
+    status, body = _get(live_server, "/ready?agent=%20%20")
+
+    assert status == 400
+    assert body["ok"] is False
+    assert "agent" in body["error"]
+
+
+def test_read_accepts_lines_query(live_server, monkeypatch):
+    calls = []
+
+    def fake_run_herdr(*args, **kwargs):
+        calls.append(args)
+        return {"ok": True, "stdout": "output", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    status, body = _get(live_server, "/read?agent=agent-a&lines=37")
+
+    assert status == 200
+    assert body["ok"] is True
+    assert calls == [("agent", "read", "agent-a", "--source", "recent-unwrapped", "--lines", "37")]
+
+
+def test_read_rejects_lines_out_of_range_without_touching_herdr(live_server, monkeypatch):
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("invalid lines must be rejected before Herdr is queried")
+
+    monkeypatch.setattr(bridge, "run_herdr", should_not_run)
+
+    status, body = _get(live_server, "/read?lines=0")
+
+    assert status == 400
+    assert body["ok"] is False
+    assert "lines" in body["error"]
+
+
+def test_create_task_if_queue_available_is_atomic(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    monkeypatch.setattr(bridge, "MAX_QUEUE_DEPTH", 1)
+    bridge.init_db()
+
+    start = threading_module.Barrier(8)
+    task_ids = []
+    full_errors = []
+
+    def enqueue(index):
+        start.wait()
+        try:
+            task_ids.append(
+                bridge.create_task_if_queue_available(
+                    f"task {index}", 5000, "agent-a"
+                )
+            )
+        except bridge.QueueFullError as exc:
+            full_errors.append(exc)
+
+    threads = [
+        threading_module.Thread(target=enqueue, args=(index,))
+        for index in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(task_ids) == 1
+    assert len(full_errors) == 7
+    assert bridge.count_queued_tasks() == 1
 
 
 def test_task_worker_skips_busy_agent_to_run_a_different_idle_agents_task(

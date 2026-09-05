@@ -68,9 +68,13 @@ that runs it as a real child process against a local `HttpListener` stub, so
 it doesn't need a deployed bridge:
 
 ```powershell
-Install-Module -Name Pester -Scope CurrentUser   # first time only
+Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser   # first time only
 Invoke-Pester -Path .\sentinel.Tests.ps1 -Output Detailed
 ```
+
+CI runs the same suite once under Windows PowerShell 5.1 and once under
+PowerShell Core. Changes to HTTP error handling or parameter binding must pass
+under both editions.
 
 It still doesn't cover everything a live bridge would (real PowerShell 5.1
 HTTP error-body quirks, actual Sentinel/herdr behavior) — say so explicitly

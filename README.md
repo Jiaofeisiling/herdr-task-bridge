@@ -29,7 +29,7 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 - **同步路径**：`/ask`、`/prompt` 直接持锁执行，HTTP 连接一直开到任务完成。
 - **异步路径**：`/delegate` 立即返回 `task_id`，任务写入本地 SQLite（`tasks.db`），由一个后台 worker 线程按顺序取出、持锁执行。
 
-**每个 agent 一把独立的锁**（`get_agent_lock(agent_name)`），不是一把全局锁——对 `sentinel-opencode` 的请求不会因为 `sentinel` 正忙就被卡住，反之亦然。同一个 agent 的两条路径永远不会同时对它发起委派；worker 线程按创建时间取任务时，如果最老的任务对应的 agent 正忙，会跳过去找下一个 agent 已空闲的任务，不会被一个忙碌 agent 卡住整条队列。`/health` 是唯一不接触 Sentinel/herdr、不查数据库的接口，用来单独判断"bridge 进程是否存活"。
+**每个 agent 一把独立的锁**（`get_agent_lock(agent_name)`），不是一把全局锁——同步请求可以同时使用不同 agent，同一个 agent 的两条路径则永远不会同时向它发起委派。worker 按创建时间取异步任务时，如果最老任务的 agent 已经忙碌，会跳过去寻找另一个空闲 agent 的任务。异步队列目前仍由**一个 worker 串行执行**：一旦它开始等待某个 agent 的任务完成，在该任务结束前不会启动另一个异步任务；v4 提供的是多 agent 路由和互斥隔离，不承诺异步任务跨 agent 并行。`/health` 是唯一不接触 Sentinel/herdr、不查数据库的接口，用来单独判断"bridge 进程是否存活"。
 
 ## 文件结构
 
@@ -37,13 +37,13 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 .
 ├── sentinel.ps1                    Windows 端 CLI 入口
 ├── sentinel.profile.ps1            让 sentinel.ps1 可以在任意目录下当 `sentinel` 用（见"部署"）
-├── sentinel.Tests.ps1              Pester 套件（13 个用例）
+├── sentinel.Tests.ps1              Pester 套件（15 个用例）
 ├── remote\
 │   ├── bridge-aliases.sh           远程重启/部署流程的别名（见"部署"）
 │   └── bridge-supervisor.sh        崩溃自动重启循环，screen 里跑这个而不是裸 bridge.py
 ├── sentinel-bridge\
 │   ├── bridge.py                    本地工作副本，与远程部署的版本保持同步
-│   ├── test_bridge.py               pytest 套件（93 个用例，全部 mock 掉 herdr）
+│   ├── test_bridge.py               pytest 套件（99 个用例，全部 mock 掉 herdr）
 │   └── .venv\                       项目专用虚拟环境（miniforge3 的 conda 环境对非管理员只读，装不了包）
 └── docs\superpowers\plans\
     └── 2026-08-30-sentinel-bridge-v2.2-v2.3.md   完整实施计划（18 个任务的详细设计与代码）
@@ -86,7 +86,7 @@ $id = (.\sentinel.ps1 delegate "检查当前 NeSI 项目的 Git 状态，不要�
 | `ask <任务描述>` | POST | `/ask` | **同步**提交任务，等待完成后一次性返回结果；对应 agent 忙时返回 `409` |
 | `prompt <任务描述>` | POST | `/prompt` | 同步发送 prompt，但不读取/提取结果（比 `ask` 少一步） |
 
-通用参数：`-Agent <名字>`（挑选目标 agent，不传就用 bridge 的 `SENTINEL_AGENT` 默认值；`ask`/`prompt`/`delegate` 写进请求体，`ready`/`status`/`read` 拼成 `?agent=...`；先用 `agents` 看看这台主机上实际有哪些、谁空闲）、`-TimeoutMs <毫秒>`（`ask`/`prompt` 默认 120000，`delegate` 不传时让服务端 6 小时默认值生效）、`-Lines <行数>`（`read` 相关，默认 80）。
+通用参数：`-Agent <名字>`（挑选目标 agent，不传就用 bridge 的 `SENTINEL_AGENT` 默认值；`ask`/`prompt`/`delegate` 写进请求体，`ready`/`status`/`read` 拼成 query parameter；先用 `agents` 看看这台主机上实际有哪些、谁空闲）、`-TimeoutMs <毫秒>`（`ask`/`prompt` 默认 120000，`delegate` 不传时让服务端 6 小时默认值生效）、`-Lines <行数>`（`read` 相关，默认 80，允许 1–5000）。agent 名称必须是非空字符串，首尾空白会被去除，最长 200 个字符。
 
 ## 异步任务生命周期
 
@@ -208,15 +208,15 @@ cd sentinel-bridge
 .venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-93 个用例，全部通过 monkeypatch 模拟 `run_herdr`/`get_agent_status`，不需要真实 herdr 或网络。
+99 个用例，全部通过 monkeypatch 模拟 `run_herdr`/`get_agent_status`，不需要真实 herdr 或网络。
 
 ```powershell
 Invoke-Pester -Path .\sentinel.Tests.ps1 -Output Detailed
 ```
 
-13 个用例，把 `sentinel.ps1` 当子进程启动、指向一个用 `System.Net.HttpListener` 搭的本地假 bridge（通过 `SENTINEL_BRIDGE_URL` 环境变量指定地址，默认仍是 `http://127.0.0.1:8765`）。之所以不直接 dot-source 脚本做进程内测试，是因为 `sentinel.ps1` 好几个分支会调用 `exit`——dot-source 进测试进程会直接把整个测试进程杀掉；子进程 + 真实 HTTP 往返和 `test_bridge.py` 的 `live_server` fixture 是同一个思路。需要本机装了 Pester（`Install-Module -Name Pester -Scope CurrentUser`）。
+15 个用例，把 `sentinel.ps1` 当子进程启动、指向一个用 `System.Net.HttpListener` 搭的本地假 bridge（通过 `SENTINEL_BRIDGE_URL` 环境变量指定地址，默认仍是 `http://127.0.0.1:8765`）。之所以不直接 dot-source 脚本做进程内测试，是因为 `sentinel.ps1` 好几个分支会调用 `exit`——dot-source 进测试进程会直接把整个测试进程杀掉；子进程 + 真实 HTTP 往返和 `test_bridge.py` 的 `live_server` fixture 是同一个思路。需要本机装了 Pester 5.6.1（`Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser`）。
 
-CI（`.github/workflows/tests.yml`）在每次 push/PR 到 `master` 时自动跑这两套测试。
+CI（`.github/workflows/tests.yml`）在每次 push/PR 到 `master` 时自动跑 pytest，并分别用 Windows PowerShell 5.1（`powershell`）和 PowerShell Core（`pwsh`）跑 Pester。
 
 ## 设计文档
 

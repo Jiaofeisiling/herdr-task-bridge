@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+testResults.xml
 
 # Project-local virtualenv (the system conda install refuses `pip install`
 # for non-admin users, see README.md -- every task/test uses this instead)

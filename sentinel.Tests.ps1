@@ -168,6 +168,30 @@ Describe "health" {
     }
 }
 
+Describe "PowerShell HTTP error compatibility" {
+    It "parses a 404 JSON body and exits 1 under both Windows PowerShell and PowerShell Core" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("task", "missing-task")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 404 -Payload @{
+                ok = $false; error = "task not found"
+            }
+
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 1
+            $result.StdErr | Should -Not -Match "Invoke-RestMethod"
+            ($result.StdOut | ConvertFrom-Json).error | Should -Be "task not found"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+}
+
 Describe "auth token header" {
     It "sends X-Sentinel-Token when SENTINEL_BRIDGE_TOKEN is set" {
         $stub = Start-StubListener
@@ -402,6 +426,29 @@ Describe "-Agent parameter" {
 
             $req.Path | Should -Be "/ready"
             $req.Context.Request.Url.Query | Should -Be "?agent=sentinel-opencode"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "sends -Lines and -Agent as encoded /read query parameters" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("read", "-Lines", "37", "-Agent", "agent one")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; stdout = "output"; stderr = ""
+            }
+
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 0
+            $req.Path | Should -Be "/read"
+            $req.Context.Request.QueryString["lines"] | Should -Be "37"
+            $req.Context.Request.QueryString["agent"] | Should -Be "agent one"
         }
         finally {
             $stub.Listener.Stop()

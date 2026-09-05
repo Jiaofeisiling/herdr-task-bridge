@@ -25,14 +25,19 @@ jobs:
           python -m pytest test_bridge.py -v
 
   pester:
+    name: pester (${{ matrix.shell }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Pester
-        shell: powershell
+        shell: ${{ matrix.shell }}
         run: Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser -Force -SkipPublisherCheck
 
       - name: Run sentinel.ps1 test suite
-        shell: powershell
+        shell: ${{ matrix.shell }}
         run: Invoke-Pester -Path ./sentinel.Tests.ps1 -Output Detailed -CI

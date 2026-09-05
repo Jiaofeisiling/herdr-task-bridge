@@ -18,6 +18,7 @@ param(
     [Parameter(Position=1, ValueFromRemainingArguments=$true)]
     [string[]]$Text,
 
+    [ValidateRange(1, 5000)]
     [int]$Lines = 80,
 
     [int]$TimeoutMs = 120000,
@@ -43,6 +44,12 @@ $AgentQuery = if ($PSBoundParameters.ContainsKey("Agent")) {
 } else {
     ""
 }
+
+$ReadQueryParts = @("lines=$Lines")
+if ($PSBoundParameters.ContainsKey("Agent")) {
+    $ReadQueryParts += "agent=$([uri]::EscapeDataString($Agent))"
+}
+$ReadQuery = "?" + ($ReadQueryParts -join "&")
 
 
 function Join-TaskText {
@@ -71,31 +78,53 @@ function Invoke-SentinelApi {
 
         return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers
     }
-    catch [System.Net.WebException] {
-        $errResponse = $_.Exception.Response
+    catch {
+        # Windows PowerShell 5.1 throws WebException for non-2xx responses;
+        # PowerShell 7 throws HttpResponseException instead. Preserve one
+        # code path for both editions and prefer ErrorDetails, where
+        # Invoke-RestMethod normally stores the already-read response body.
+        $caughtError = $_
+        $errResponse = $caughtError.Exception.Response
+
+        if ($caughtError.ErrorDetails -and $caughtError.ErrorDetails.Message) {
+            try {
+                return $caughtError.ErrorDetails.Message | ConvertFrom-Json
+            }
+            catch {
+                # Fall through and try the response object. If that also
+                # fails, rethrow the original HTTP error below.
+            }
+        }
 
         if ($null -eq $errResponse) {
-            throw
+            throw $caughtError
         }
 
-        # In Windows PowerShell 5.1, Invoke-RestMethod has already
-        # consumed the response stream by the time control reaches this
-        # catch block -- re-reading $errResponse.GetResponseStream() here
-        # reliably returns an empty string (confirmed against a live 409:
-        # the whole function returned nothing, silently). PowerShell
-        # already captured the body for us in $_.ErrorDetails.Message,
-        # so use that instead of re-reading the (already-drained) stream.
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            return $_.ErrorDetails.Message | ConvertFrom-Json
+        $rawBody = $null
+
+        if ($errResponse.PSObject.Methods.Name -contains "GetResponseStream") {
+            $stream = $errResponse.GetResponseStream()
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $rawBody = $reader.ReadToEnd()
+                $reader.Close()
+            }
+        }
+        elseif ($errResponse.Content) {
+            $rawBody = $errResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         }
 
-        # Fallback for the rare case ErrorDetails wasn't populated.
-        $stream = $errResponse.GetResponseStream()
-        $reader = New-Object System.IO.StreamReader($stream)
-        $rawBody = $reader.ReadToEnd()
-        $reader.Close()
+        if ($rawBody) {
+            try {
+                return $rawBody | ConvertFrom-Json
+            }
+            catch {
+                # The server did not return JSON; preserve the original
+                # exception and its HTTP status for the caller.
+            }
+        }
 
-        return $rawBody | ConvertFrom-Json
+        throw $caughtError
     }
 }
 
@@ -105,6 +134,10 @@ switch ($Command) {
     "health" {
         $result = Invoke-SentinelApi -Uri "$BaseUrl/health"
         $result | ConvertTo-Json -Depth 10
+
+        if (-not $result -or -not $result.ok) {
+            exit 1
+        }
     }
 
     "status" {
@@ -119,7 +152,7 @@ switch ($Command) {
     }
 
     "read" {
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/read$AgentQuery"
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/read$ReadQuery"
 
         if (-not $result.ok) {
             Write-Error $result.stderr
@@ -224,11 +257,19 @@ switch ($Command) {
     "ready" {
         $result = Invoke-SentinelApi -Uri "$BaseUrl/ready$AgentQuery"
         $result | ConvertTo-Json -Depth 10
+
+        if (-not $result.ok) {
+            exit 1
+        }
     }
 
     "tasks" {
         $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks"
         $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
     }
 
     "task" {
@@ -239,8 +280,14 @@ switch ($Command) {
             exit 1
         }
 
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$taskId"
+        $encodedTaskId = [uri]::EscapeDataString($taskId)
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$encodedTaskId"
         $result | ConvertTo-Json -Depth 20
+
+
+        if (-not $result.ok) {
+            exit 1
+        }
     }
 
     "wait" {

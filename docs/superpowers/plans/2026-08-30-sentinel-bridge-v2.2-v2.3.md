@@ -1,5 +1,10 @@
 # Sentinel Bridge v2.2 + v2.3 Implementation Plan
 
+> **Historical plan:** This file records the v2.2/v2.3 implementation process.
+> The current v4 implementation uses per-agent locks, agent-selectable routes,
+> git-based deployment, and a backward-compatible `/health` schema. Treat the
+> current `README.md`, tests, and code as authoritative for present behavior.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Harden the NeSI Sentinel bridge so it never blocks on a busy Claude Sentinel session, recovers from missed completion markers, and gains an async `/delegate` task queue backed by SQLite for long-running (Slurm/benchmark) work — while keeping `/health` always instantly responsive.

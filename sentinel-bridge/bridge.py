@@ -16,6 +16,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
+BRIDGE_VERSION = 4
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -38,6 +39,10 @@ DB_PATH = os.environ.get(
 # otherwise tie up the queue/lock far longer than any real task needs.
 TIMEOUT_MS_MIN = 1000  # 1 second
 TIMEOUT_MS_MAX = 21_600_000  # 6 hours -- matches /delegate's own default
+READ_LINES_DEFAULT = 120
+READ_LINES_MIN = 1
+READ_LINES_MAX = 5000
+AGENT_NAME_MAX_LENGTH = 200
 
 # Cap on how many tasks may sit in 'queued' state at once. Without this,
 # a burst of /delegate calls (or a buggy client retry loop) could grow
@@ -55,6 +60,36 @@ def validate_timeout_ms(timeout_ms):
         )
 
     return timeout_ms
+
+
+def validate_read_lines(read_lines):
+    if not (READ_LINES_MIN <= read_lines <= READ_LINES_MAX):
+        raise ValueError(
+            f"lines must be between {READ_LINES_MIN} and "
+            f"{READ_LINES_MAX}, got {read_lines}"
+        )
+
+    return read_lines
+
+
+def validate_agent_name(agent_name):
+    if not isinstance(agent_name, str):
+        raise ValueError("agent must be a string")
+
+    agent_name = agent_name.strip()
+
+    if not agent_name:
+        raise ValueError("agent cannot be empty")
+
+    if len(agent_name) > AGENT_NAME_MAX_LENGTH:
+        raise ValueError(
+            f"agent cannot exceed {AGENT_NAME_MAX_LENGTH} characters"
+        )
+
+    if any(ord(char) < 32 or ord(char) == 127 for char in agent_name):
+        raise ValueError("agent cannot contain control characters")
+
+    return agent_name
 
 
 def auth_token_warning():
@@ -152,16 +187,53 @@ def init_db():
         """, (now_iso(),))
 
 
+class QueueFullError(RuntimeError):
+    def __init__(self, queued, maximum):
+        self.queued = queued
+        self.maximum = maximum
+        super().__init__(
+            f"queue full: {queued}/{maximum} tasks already queued"
+        )
+
+
+def _insert_task(conn, task_id, task, timeout_ms, agent_name):
+    conn.execute("""
+        INSERT INTO tasks (
+            task_id, task, agent, status, created_at, timeout_ms
+        )
+        VALUES (?, ?, ?, 'queued', ?, ?)
+    """, (task_id, task, agent_name, now_iso(), timeout_ms))
+
+
 def create_task(task, timeout_ms, agent_name):
     task_id = str(uuid.uuid4())
 
     with db_session() as conn:
-        conn.execute("""
-            INSERT INTO tasks (
-                task_id, task, agent, status, created_at, timeout_ms
-            )
-            VALUES (?, ?, ?, 'queued', ?, ?)
-        """, (task_id, task, agent_name, now_iso(), timeout_ms))
+        _insert_task(conn, task_id, task, timeout_ms, agent_name)
+
+    return task_id
+
+
+def create_task_if_queue_available(task, timeout_ms, agent_name):
+    """Atomically enforce the queue cap and enqueue one task.
+
+    ThreadingHTTPServer can process several /delegate requests concurrently.
+    BEGIN IMMEDIATE serializes the count-and-insert section so two callers
+    cannot both observe the same free queue slot and overfill the queue.
+    """
+    task_id = str(uuid.uuid4())
+
+    with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE status = 'queued'"
+        ).fetchone()
+        queued = row["n"]
+
+        if queued >= MAX_QUEUE_DEPTH:
+            raise QueueFullError(queued, MAX_QUEUE_DEPTH)
+
+        _insert_task(conn, task_id, task, timeout_ms, agent_name)
 
     return task_id
 
@@ -700,9 +772,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def query_agent_name(self):
-        query = parse_qs(urlparse(self.path).query)
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
         values = query.get("agent")
-        return values[0] if values else DEFAULT_AGENT
+        return validate_agent_name(values[0] if values else DEFAULT_AGENT)
+
+    def query_read_lines(self):
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        values = query.get("lines")
+        value = values[0] if values else READ_LINES_DEFAULT
+        return validate_read_lines(int(value))
 
     def read_json(self):
         length = int(
@@ -749,7 +827,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "ok": True,
                 "service": "nesi-sentinel-bridge",
-                "version": 4,
+                "version": BRIDGE_VERSION,
+                # Keep the v3 field for one compatibility cycle. New clients
+                # should prefer default_agent, which better describes v4.
+                "agent": DEFAULT_AGENT,
                 "default_agent": DEFAULT_AGENT,
                 "worker_alive": (
                     _worker_thread.is_alive() if _worker_thread else None
@@ -778,11 +859,24 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if path in ("/status", "/ready", "/read"):
+            try:
+                agent_name = self.query_agent_name()
+                read_lines = (
+                    self.query_read_lines() if path == "/read" else None
+                )
+            except (TypeError, ValueError) as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"},
+                    400,
+                )
+                return
+
         if path == "/status":
             result = run_herdr(
                 "agent",
                 "get",
-                self.query_agent_name(),
+                agent_name,
             )
 
             self.send_json(
@@ -793,7 +887,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/ready":
             agent_status, status_result = get_agent_status(
-                self.query_agent_name()
+                agent_name
             )
 
             if agent_status is None:
@@ -818,11 +912,11 @@ class Handler(BaseHTTPRequestHandler):
             result = run_herdr(
                 "agent",
                 "read",
-                self.query_agent_name(),
+                agent_name,
                 "--source",
                 "recent-unwrapped",
                 "--lines",
-                "120",
+                str(read_lines),
             )
 
             self.send_json(
@@ -881,7 +975,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json()
 
                 task = body["task"].strip()
-                agent_name = body.get("agent", DEFAULT_AGENT)
+                agent_name = validate_agent_name(
+                    body.get("agent", DEFAULT_AGENT)
+                )
 
                 timeout_ms = validate_timeout_ms(int(
                     body.get(
@@ -903,22 +999,19 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            queued = count_queued_tasks()
-
-            if queued >= MAX_QUEUE_DEPTH:
+            try:
+                task_id = create_task_if_queue_available(
+                    task, timeout_ms, agent_name
+                )
+            except QueueFullError as e:
                 self.send_json(
                     {
                         "ok": False,
-                        "error": (
-                            f"queue full: {queued}/{MAX_QUEUE_DEPTH} "
-                            "tasks already queued"
-                        ),
+                        "error": str(e),
                     },
                     429,
                 )
                 return
-
-            task_id = create_task(task, timeout_ms, agent_name)
 
             self.send_json(
                 {
@@ -941,15 +1034,17 @@ class Handler(BaseHTTPRequestHandler):
             body = self.read_json()
 
             task = body["task"].strip()
-            agent_name = body.get("agent", DEFAULT_AGENT)
+            agent_name = validate_agent_name(
+                body.get("agent", DEFAULT_AGENT)
+            )
 
             timeout_ms = validate_timeout_ms(int(
                 body.get("timeout_ms", 120000)
             ))
 
-            read_lines = int(
+            read_lines = validate_read_lines(int(
                 body.get("lines", 500)
-            )
+            ))
 
             if not task:
                 raise ValueError("task cannot be empty")
@@ -1062,7 +1157,7 @@ if __name__ == "__main__":
     worker.start()
     _worker_thread = worker
 
-    print("Sentinel Bridge v3")
+    print(f"Sentinel Bridge v{BRIDGE_VERSION}")
     print(f"Default agent: {DEFAULT_AGENT}")
     print(f"Database: {DB_PATH}")
     print(f"Listening: http://{HOST}:{PORT}")
