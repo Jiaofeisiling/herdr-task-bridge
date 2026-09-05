@@ -28,8 +28,8 @@ reading `herdr api schema --json` directly (`$defs/AgentTarget`,
 `$defs/AgentPromptParams`, `$defs/AgentPromptWaitOptions`,
 `$defs/AgentStatus`), not from the (looser/paraphrased) public docs page.
 
-What the default run checks, in order, printing one clearly-tagged line
-per step so the result is easy to pull out of a noisy terminal capture:
+What this checks, in order, printing one clearly-tagged line per step so
+the result is easy to pull out of a noisy terminal capture:
 
   1. ping                                     -- socket reachable at all?
   2. agent.list                               -- how do we find our target?
@@ -37,22 +37,28 @@ per step so the result is easy to pull out of a noisy terminal capture:
   4. events.subscribe(pane.agent_status_changed) -- does the ack come back clean?
   5. pane.read(target)                        -- final output text
 
-Step 5.5 (agent.prompt with `wait`) is deliberately NOT run against the
-agent named on the command line by default: doing so from inside a shell
-command that agent itself is executing is self-referential -- the agent is
-"working" (running this very script) for the whole duration, so `wait`
-can only time out. Run this script from a plain terminal, targeting an
-agent that is actually idle, to test that path meaningfully.
+agent.prompt with `wait` is deliberately NOT exercised here. Two ways
+were tried and rejected, in case someone's tempted to retry either:
 
-`--scratch-pane-test` goes one step further: it creates a brand-new pane
-(pane.split), starts a real `claude` agent in it (agent.start -- this is a
-real, billed agent instance, not a mock), sends the wait-based prompt to
-*that* fresh pane instead, reads the result, and closes the pane
-afterwards. Opt-in on purpose since it has a real cost and side effect,
-unlike everything else in this script.
+  - Running it against the agent named on the command line is
+    self-referential when this script is itself dispatched as a command
+    that agent is executing -- the agent is "working" (running this very
+    script) for the whole duration, so `wait` can only time out.
+  - An earlier revision added a `--scratch-pane-test` flag that called
+    `pane.split` to create a disposable pane to test against instead.
+    `pane.split` is NOT a hidden/headless resource -- it's a real UI
+    action that visibly splits the actual terminal layout the human is
+    looking at. Running it live did exactly that (an unwanted visible
+    split), and its cleanup (pane.close) didn't reliably fire, leaving a
+    stray pane needing manual closing. Reverted; do not reintroduce.
+
+The remaining option, if this is worth finishing: run this script from a
+plain terminal (not dispatched through the agent under test) targeting an
+agent that's already idle for some other reason -- no new pane, no new
+agent instance, no side effect.
 
 Usage:
-    python3 herdr_socket_spike.py [agent_name] [--scratch-pane-test]
+    python3 herdr_socket_spike.py [agent_name]
 
 Env:
     HERDR_SOCKET_PATH  overrides ~/.config/herdr/herdr.sock (matches herdr's
@@ -63,7 +69,6 @@ import json
 import os
 import socket
 import sys
-import time
 
 
 SOCKET_PATH = os.environ.get(
@@ -71,14 +76,7 @@ SOCKET_PATH = os.environ.get(
     os.path.expanduser("~/.config/herdr/herdr.sock"),
 )
 
-_args = [a for a in sys.argv[1:] if not a.startswith("--")]
-AGENT_NAME = _args[0] if _args else "sentinel-opencode"
-RUN_SCRATCH_PANE_TEST = "--scratch-pane-test" in sys.argv[1:]
-
-TEST_PROMPT = (
-    "这是 herdr socket API 可行性 spike 的测试请求，"
-    "不是真实任务。请仅回复 ok，不要执行任何命令、不要修改任何文件。"
-)
+AGENT_NAME = sys.argv[1] if len(sys.argv) > 1 else "sentinel-opencode"
 
 
 class HerdrClient:
@@ -116,98 +114,6 @@ def tag(label, payload):
     print(f"SPIKE::{label}:: " + json.dumps(payload, ensure_ascii=False))
 
 
-def run_scratch_pane_test(client, workspace_id):
-    """Create a disposable pane + real `claude` agent, prompt it with
-    `wait`, read the result, then close the pane. Never touches any
-    existing session/pane."""
-
-    result = {"steps": {}}
-    pane_id = None
-
-    try:
-        resp = client.call("pane.split", {
-            "direction": "right",
-            "workspace_id": workspace_id,
-            "focus": False,
-        })
-        tag("scratch.pane.split", resp)
-        pane_id = (
-            resp.get("result", {}).get("pane_id")
-            or resp.get("result", {}).get("id")
-        )
-        result["steps"]["pane.split"] = "ok" if pane_id else "fail (no pane_id in result)"
-        result["pane_id"] = pane_id
-    except Exception as e:
-        tag("scratch.pane.split", {"ok": False, "error": str(e)})
-        result["steps"]["pane.split"] = "fail"
-        return result
-
-    if pane_id is None:
-        return result
-
-    try:
-        # kind="claude" mirrors the existing w1:p9 pane on this host, which
-        # is known to start with zero extra args.
-        resp = client.call("agent.start", {
-            "name": "herdr-socket-spike-scratch",
-            "kind": "claude",
-            "pane_id": pane_id,
-            "timeout_ms": 30000,
-        }, timeout=40)
-        tag("scratch.agent.start", resp)
-        result["steps"]["agent.start"] = "ok" if "result" in resp else "fail"
-    except Exception as e:
-        tag("scratch.agent.start", {"ok": False, "error": str(e)})
-        result["steps"]["agent.start"] = "fail"
-
-    # The real test: agent.prompt's `wait` against a genuinely idle,
-    # unrelated-to-anything-else pane.
-    start = time.time()
-    try:
-        resp = client.call(
-            "agent.prompt",
-            {
-                "target": pane_id,
-                "text": TEST_PROMPT,
-                "wait": {"until": ["done", "idle"], "timeout_ms": 60000},
-            },
-            timeout=75,
-        )
-        elapsed = time.time() - start
-        tag("scratch.agent.prompt", resp)
-        result["steps"]["agent.prompt"] = "ok" if "result" in resp else "fail"
-        result["agent.prompt_elapsed_s"] = round(elapsed, 1)
-    except Exception as e:
-        tag("scratch.agent.prompt", {"ok": False, "error": str(e)})
-        result["steps"]["agent.prompt"] = "fail"
-
-    try:
-        resp = client.call("pane.read", {
-            "pane_id": pane_id, "source": "recent", "lines": 40,
-        })
-        tag("scratch.pane.read", resp)
-        result["steps"]["pane.read"] = "ok" if "result" in resp else "fail"
-    except Exception as e:
-        tag("scratch.pane.read", {"ok": False, "error": str(e)})
-        result["steps"]["pane.read"] = "fail"
-
-    try:
-        resp = client.call("pane.close", {"pane_id": pane_id})
-        tag("scratch.pane.close", resp)
-        result["steps"]["pane.close"] = "ok" if "result" in resp else "fail"
-    except Exception as e:
-        tag("scratch.pane.close", {"ok": False, "error": str(e)})
-        result["steps"]["pane.close"] = "fail"
-        tag("NOTE", {
-            "message": (
-                f"pane.close failed -- pane_id={pane_id} may need manual "
-                "cleanup"
-            )
-        })
-
-    return result
-
-
 def main():
     summary = {"agent_name": AGENT_NAME, "steps": {}}
     client = HerdrClient(SOCKET_PATH)
@@ -226,7 +132,6 @@ def main():
     # 2. find our target (agent.list's own pane_id field -- confirmed to
     #    be what agent.get/agent.prompt's "target" param expects)
     target = None
-    workspace_id = None
     try:
         resp = client.call("agent.list")
         tag("agent.list", resp)
@@ -234,7 +139,6 @@ def main():
         for a in agents:
             if a.get("name") == AGENT_NAME:
                 target = a.get("pane_id")
-                workspace_id = a.get("workspace_id")
                 break
         summary["steps"]["agent.list"] = "ok" if agents else "empty"
         summary["target"] = target
@@ -289,19 +193,14 @@ def main():
         tag("pane.read", {"ok": False, "error": str(e)})
         summary["steps"]["pane.read"] = "fail"
 
-    # 5.5. agent.prompt(wait=...) against a disposable, genuinely idle
-    #      pane -- see run_scratch_pane_test's docstring. Opt-in: real
-    #      cost, real side effect (a new pane + a real agent instance).
-    if RUN_SCRATCH_PANE_TEST:
-        summary["scratch_pane_test"] = run_scratch_pane_test(client, workspace_id)
-    else:
-        tag("NOTE", {
-            "message": (
-                "skipped agent.prompt(wait=...) validation -- rerun with "
-                "--scratch-pane-test to create a disposable pane+agent and "
-                "test it properly (real cost/side effect, opt-in)"
-            )
-        })
+    tag("NOTE", {
+        "message": (
+            "agent.prompt(wait=...) intentionally not exercised here -- "
+            "see module docstring for the two approaches already tried "
+            "and rejected (self-reference, and pane.split visibly "
+            "disrupting the real terminal layout)"
+        )
+    })
 
     tag("SUMMARY", summary)
 
