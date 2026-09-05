@@ -11,14 +11,20 @@ import uuid
 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
+BRIDGE_VERSION = 4
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
-SENTINEL = os.environ.get("SENTINEL_AGENT", "sentinel")
+
+# Fallback when a request doesn't name an agent explicitly. Not "the"
+# agent any more -- herdr can host several concurrent agent sessions on
+# one host (see /agents, and the `agent` field on /ask, /prompt,
+# /delegate), this is just what a caller gets if it doesn't pick one.
+DEFAULT_AGENT = os.environ.get("SENTINEL_AGENT", "sentinel")
 
 AUTH_TOKEN = os.environ.get("SENTINEL_BRIDGE_TOKEN", "")
 
@@ -33,6 +39,10 @@ DB_PATH = os.environ.get(
 # otherwise tie up the queue/lock far longer than any real task needs.
 TIMEOUT_MS_MIN = 1000  # 1 second
 TIMEOUT_MS_MAX = 21_600_000  # 6 hours -- matches /delegate's own default
+READ_LINES_DEFAULT = 120
+READ_LINES_MIN = 1
+READ_LINES_MAX = 5000
+AGENT_NAME_MAX_LENGTH = 200
 
 # Cap on how many tasks may sit in 'queued' state at once. Without this,
 # a burst of /delegate calls (or a buggy client retry loop) could grow
@@ -50,6 +60,36 @@ def validate_timeout_ms(timeout_ms):
         )
 
     return timeout_ms
+
+
+def validate_read_lines(read_lines):
+    if not (READ_LINES_MIN <= read_lines <= READ_LINES_MAX):
+        raise ValueError(
+            f"lines must be between {READ_LINES_MIN} and "
+            f"{READ_LINES_MAX}, got {read_lines}"
+        )
+
+    return read_lines
+
+
+def validate_agent_name(agent_name):
+    if not isinstance(agent_name, str):
+        raise ValueError("agent must be a string")
+
+    agent_name = agent_name.strip()
+
+    if not agent_name:
+        raise ValueError("agent cannot be empty")
+
+    if len(agent_name) > AGENT_NAME_MAX_LENGTH:
+        raise ValueError(
+            f"agent cannot exceed {AGENT_NAME_MAX_LENGTH} characters"
+        )
+
+    if any(ord(char) < 32 or ord(char) == 127 for char in agent_name):
+        raise ValueError("agent cannot contain control characters")
+
+    return agent_name
 
 
 def auth_token_warning():
@@ -103,6 +143,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
                 task TEXT NOT NULL,
+                agent TEXT NOT NULL,
 
                 status TEXT NOT NULL,
 
@@ -116,6 +157,20 @@ def init_db():
                 error_text TEXT
             )
         """)
+
+        # Migrate DBs from before multi-agent support -- every row that
+        # already exists was necessarily created against DEFAULT_AGENT,
+        # since there was no other choice at the time.
+        existing_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+
+        if "agent" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN agent TEXT")
+            conn.execute(
+                "UPDATE tasks SET agent = ? WHERE agent IS NULL",
+                (DEFAULT_AGENT,),
+            )
 
         # 如果 bridge 在一个任务执行期间崩溃，
         # 千万不要自动重新运行它，否则可能重复执行危险操作。
@@ -132,16 +187,53 @@ def init_db():
         """, (now_iso(),))
 
 
-def create_task(task, timeout_ms):
+class QueueFullError(RuntimeError):
+    def __init__(self, queued, maximum):
+        self.queued = queued
+        self.maximum = maximum
+        super().__init__(
+            f"queue full: {queued}/{maximum} tasks already queued"
+        )
+
+
+def _insert_task(conn, task_id, task, timeout_ms, agent_name):
+    conn.execute("""
+        INSERT INTO tasks (
+            task_id, task, agent, status, created_at, timeout_ms
+        )
+        VALUES (?, ?, ?, 'queued', ?, ?)
+    """, (task_id, task, agent_name, now_iso(), timeout_ms))
+
+
+def create_task(task, timeout_ms, agent_name):
     task_id = str(uuid.uuid4())
 
     with db_session() as conn:
-        conn.execute("""
-            INSERT INTO tasks (
-                task_id, task, status, created_at, timeout_ms
-            )
-            VALUES (?, ?, 'queued', ?, ?)
-        """, (task_id, task, now_iso(), timeout_ms))
+        _insert_task(conn, task_id, task, timeout_ms, agent_name)
+
+    return task_id
+
+
+def create_task_if_queue_available(task, timeout_ms, agent_name):
+    """Atomically enforce the queue cap and enqueue one task.
+
+    ThreadingHTTPServer can process several /delegate requests concurrently.
+    BEGIN IMMEDIATE serializes the count-and-insert section so two callers
+    cannot both observe the same free queue slot and overfill the queue.
+    """
+    task_id = str(uuid.uuid4())
+
+    with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE status = 'queued'"
+        ).fetchone()
+        queued = row["n"]
+
+        if queued >= MAX_QUEUE_DEPTH:
+            raise QueueFullError(queued, MAX_QUEUE_DEPTH)
+
+        _insert_task(conn, task_id, task, timeout_ms, agent_name)
 
     return task_id
 
@@ -174,14 +266,22 @@ def count_queued_tasks():
     return row["n"]
 
 
-def peek_next_task():
+def peek_next_task(exclude_agents=()):
+    # exclude_agents lets the worker skip past tasks whose agent it
+    # already found busy earlier in the same pass, instead of getting
+    # stuck retrying the oldest queued task while a different, already-
+    # idle agent's tasks sit behind it untouched.
+    exclude_agents = list(exclude_agents)
+    placeholders = ", ".join("?" for _ in exclude_agents)
+    where_agent = f"AND agent NOT IN ({placeholders})" if exclude_agents else ""
+
     with db_session() as conn:
-        row = conn.execute("""
+        row = conn.execute(f"""
             SELECT * FROM tasks
-            WHERE status = 'queued'
+            WHERE status = 'queued' {where_agent}
             ORDER BY created_at ASC
             LIMIT 1
-        """).fetchone()
+        """, exclude_agents).fetchone()
 
     return dict(row) if row else None
 
@@ -224,7 +324,13 @@ def orphan_task(task_id, error_text):
         """, (error_text, now_iso(), task_id))
 
 
-AGENT_LOCK = threading.Lock()
+# One lock per agent name, not one global lock -- a request against
+# "sentinel-opencode" must not block on (or be blocked by) a concurrent
+# request against a completely different agent like "sentinel". Locks are
+# created lazily and never removed; a handful of long-lived Lock objects
+# for the agents this bridge ever sees is not worth cleaning up.
+_agent_locks = {}
+_agent_locks_guard = threading.Lock()
 
 AVAILABLE_STATES = {
     "idle",
@@ -232,11 +338,20 @@ AVAILABLE_STATES = {
 }
 
 
-def get_agent_status():
+def get_agent_lock(agent_name):
+    with _agent_locks_guard:
+        lock = _agent_locks.get(agent_name)
+        if lock is None:
+            lock = threading.Lock()
+            _agent_locks[agent_name] = lock
+        return lock
+
+
+def get_agent_status(agent_name):
     result = run_herdr(
         "agent",
         "get",
-        SENTINEL,
+        agent_name,
         timeout=10,
     )
 
@@ -258,6 +373,25 @@ def get_agent_status():
         return None, {
             "ok": False,
             "error": f"Unable to parse Herdr status: {e}",
+            "raw": result["stdout"],
+        }
+
+
+def list_agents():
+    result = run_herdr("agent", "list", timeout=10)
+
+    if not result["ok"]:
+        return None, result
+
+    try:
+        payload = json.loads(result["stdout"])
+        agents = payload.get("result", {}).get("agents", [])
+        return agents, result
+
+    except Exception as e:
+        return None, {
+            "ok": False,
+            "error": f"Unable to parse Herdr agent list: {e}",
             "raw": result["stdout"],
         }
 
@@ -303,12 +437,12 @@ Task token:
 """.strip()
 
 
-def _run_herdr_prompt(delegated_prompt, timeout_ms):
+def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms):
     try:
         result = run_herdr(
             "agent",
             "prompt",
-            SENTINEL,
+            agent_name,
             delegated_prompt,
             "--wait",
             "--timeout",
@@ -330,20 +464,20 @@ def _run_herdr_prompt(delegated_prompt, timeout_ms):
     return result
 
 
-def run_prompt_only(task_id, task, timeout_ms):
+def run_prompt_only(agent_name, task_id, task, timeout_ms):
     delegated_prompt = build_delegation_prompt(task, task_id)
-    return _run_herdr_prompt(delegated_prompt, timeout_ms)
+    return _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
 
 
-def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
+def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500):
     delegated_prompt = build_delegation_prompt(task, task_id)
 
-    _run_herdr_prompt(delegated_prompt, timeout_ms)
+    _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
 
     read_result = run_herdr(
         "agent",
         "read",
-        SENTINEL,
+        agent_name,
         "--source",
         "recent-unwrapped",
         "--lines",
@@ -365,7 +499,7 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
             recovery_result = run_herdr(
                 "agent",
                 "prompt",
-                SENTINEL,
+                agent_name,
                 recovery_prompt,
                 "--wait",
                 "--timeout",
@@ -382,7 +516,7 @@ def execute_sentinel_task(task_id, task, timeout_ms, read_lines=500):
             read_result = run_herdr(
                 "agent",
                 "read",
-                SENTINEL,
+                agent_name,
                 "--source",
                 "recent-unwrapped",
                 "--lines",
@@ -413,13 +547,15 @@ class SentinelUnavailableError(RuntimeError):
 
 
 @contextlib.contextmanager
-def acquire_agent_for_delegation():
-    if not AGENT_LOCK.acquire(blocking=False):
+def acquire_agent_for_delegation(agent_name):
+    lock = get_agent_lock(agent_name)
+
+    if not lock.acquire(blocking=False):
         raise SentinelBusyError("locked")
 
     try:
         try:
-            agent_status, status_result = get_agent_status()
+            agent_status, status_result = get_agent_status(agent_name)
         except Exception as e:
             # get_agent_status() only returns (None, ...) for herdr/JSON
             # failures it can see coming — a hung herdr process still
@@ -443,7 +579,7 @@ def acquire_agent_for_delegation():
 
         yield
     finally:
-        AGENT_LOCK.release()
+        lock.release()
 
 
 WORKER_POLL_SECONDS = 2
@@ -454,18 +590,28 @@ _worker_thread = None
 def task_worker(stop_event=None):
     print("Task worker started.")
 
+    # Agents found busy earlier in the current pass over the queue --
+    # reset once the pass finds nothing left to try (empty queue, or
+    # every remaining queued task's agent is in this set already). This
+    # is what stops one busy agent's oldest task from starving a
+    # different, already-idle agent's tasks sitting behind it.
+    busy_this_pass = set()
+
     while stop_event is None or not stop_event.is_set():
         try:
-            task_row = peek_next_task()
+            task_row = peek_next_task(exclude_agents=busy_this_pass)
 
             if task_row is None:
+                busy_this_pass.clear()
                 time.sleep(WORKER_POLL_SECONDS)
                 continue
 
             # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
             # 避免维护两份重复的加锁逻辑。
+            agent_name = task_row["agent"]
+
             try:
-                with acquire_agent_for_delegation():
+                with acquire_agent_for_delegation(agent_name):
                     task_id = task_row["task_id"]
 
                     if not claim_task(task_id):
@@ -473,10 +619,11 @@ def task_worker(stop_event=None):
                         # 因为只有这一个 worker），直接进入下一轮。
                         continue
 
-                    print(f"[task {task_id}] running")
+                    print(f"[task {task_id}] running (agent={agent_name})")
 
                     try:
                         result = execute_sentinel_task(
+                            agent_name=agent_name,
                             task_id=task_id,
                             task=task_row["task"],
                             timeout_ms=task_row["timeout_ms"],
@@ -508,8 +655,11 @@ def task_worker(stop_event=None):
                         print(f"[task {task_id}] done")
 
             except (SentinelBusyError, SentinelUnavailableError):
-                # Sentinel 正忙或查不到状态，这一轮先不碰它，稍后再试。
-                time.sleep(WORKER_POLL_SECONDS)
+                # This agent's busy/unreachable -- remember that for the
+                # rest of this pass and immediately look for a task
+                # against a different agent, instead of sleeping and
+                # retrying the same oldest-but-busy task.
+                busy_this_pass.add(agent_name)
                 continue
 
         except Exception as e:
@@ -621,6 +771,17 @@ class Handler(BaseHTTPRequestHandler):
 
         self.wfile.write(data)
 
+    def query_agent_name(self):
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        values = query.get("agent")
+        return validate_agent_name(values[0] if values else DEFAULT_AGENT)
+
+    def query_read_lines(self):
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        values = query.get("lines")
+        value = values[0] if values else READ_LINES_DEFAULT
+        return validate_read_lines(int(value))
+
     def read_json(self):
         length = int(
             self.headers.get("Content-Length", "0")
@@ -666,19 +827,56 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "ok": True,
                 "service": "nesi-sentinel-bridge",
-                "version": 3,
-                "agent": SENTINEL,
+                "version": BRIDGE_VERSION,
+                # Keep the v3 field for one compatibility cycle. New clients
+                # should prefer default_agent, which better describes v4.
+                "agent": DEFAULT_AGENT,
+                "default_agent": DEFAULT_AGENT,
                 "worker_alive": (
                     _worker_thread.is_alive() if _worker_thread else None
                 ),
             })
             return
 
+        if path == "/agents":
+            agents, list_result = list_agents()
+
+            if agents is None:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": list_result.get(
+                            "error", "unable to list agents"
+                        ),
+                    },
+                    503,
+                )
+                return
+
+            self.send_json({
+                "ok": True,
+                "agents": agents,
+            })
+            return
+
+        if path in ("/status", "/ready", "/read"):
+            try:
+                agent_name = self.query_agent_name()
+                read_lines = (
+                    self.query_read_lines() if path == "/read" else None
+                )
+            except (TypeError, ValueError) as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"},
+                    400,
+                )
+                return
+
         if path == "/status":
             result = run_herdr(
                 "agent",
                 "get",
-                SENTINEL,
+                agent_name,
             )
 
             self.send_json(
@@ -688,7 +886,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/ready":
-            agent_status, status_result = get_agent_status()
+            agent_status, status_result = get_agent_status(
+                agent_name
+            )
 
             if agent_status is None:
                 self.send_json(
@@ -712,11 +912,11 @@ class Handler(BaseHTTPRequestHandler):
             result = run_herdr(
                 "agent",
                 "read",
-                SENTINEL,
+                agent_name,
                 "--source",
                 "recent-unwrapped",
                 "--lines",
-                "120",
+                str(read_lines),
             )
 
             self.send_json(
@@ -775,6 +975,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json()
 
                 task = body["task"].strip()
+                agent_name = validate_agent_name(
+                    body.get("agent", DEFAULT_AGENT)
+                )
 
                 timeout_ms = validate_timeout_ms(int(
                     body.get(
@@ -796,22 +999,19 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            queued = count_queued_tasks()
-
-            if queued >= MAX_QUEUE_DEPTH:
+            try:
+                task_id = create_task_if_queue_available(
+                    task, timeout_ms, agent_name
+                )
+            except QueueFullError as e:
                 self.send_json(
                     {
                         "ok": False,
-                        "error": (
-                            f"queue full: {queued}/{MAX_QUEUE_DEPTH} "
-                            "tasks already queued"
-                        ),
+                        "error": str(e),
                     },
                     429,
                 )
                 return
-
-            task_id = create_task(task, timeout_ms)
 
             self.send_json(
                 {
@@ -834,14 +1034,17 @@ class Handler(BaseHTTPRequestHandler):
             body = self.read_json()
 
             task = body["task"].strip()
+            agent_name = validate_agent_name(
+                body.get("agent", DEFAULT_AGENT)
+            )
 
             timeout_ms = validate_timeout_ms(int(
                 body.get("timeout_ms", 120000)
             ))
 
-            read_lines = int(
+            read_lines = validate_read_lines(int(
                 body.get("lines", 500)
-            )
+            ))
 
             if not task:
                 raise ValueError("task cannot be empty")
@@ -859,9 +1062,11 @@ class Handler(BaseHTTPRequestHandler):
         task_id = str(uuid.uuid4())
 
         try:
-            with acquire_agent_for_delegation():
+            with acquire_agent_for_delegation(agent_name):
                 if path == "/prompt":
-                    prompt_result = run_prompt_only(task_id, task, timeout_ms)
+                    prompt_result = run_prompt_only(
+                        agent_name, task_id, task, timeout_ms
+                    )
 
                     self.send_json({
                         "ok": True,
@@ -871,7 +1076,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 result_text = execute_sentinel_task(
-                    task_id, task, timeout_ms, read_lines
+                    agent_name, task_id, task, timeout_ms, read_lines
                 )
 
                 self.send_json({
@@ -886,6 +1091,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": False,
                     "status": "busy",
+                    "agent": agent_name,
                     "agent_status": e.agent_status,
                 },
                 409,
@@ -897,6 +1103,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": False,
                     "status": "unavailable",
+                    "agent": agent_name,
                     "reason": "unable_to_query_sentinel",
                     "detail": str(e),
                 },
@@ -950,8 +1157,8 @@ if __name__ == "__main__":
     worker.start()
     _worker_thread = worker
 
-    print("Sentinel Bridge v3")
-    print(f"Agent: {SENTINEL}")
+    print(f"Sentinel Bridge v{BRIDGE_VERSION}")
+    print(f"Default agent: {DEFAULT_AGENT}")
     print(f"Database: {DB_PATH}")
     print(f"Listening: http://{HOST}:{PORT}")
 

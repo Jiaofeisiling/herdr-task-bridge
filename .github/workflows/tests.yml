@@ -10,9 +10,9 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -24,10 +24,11 @@ jobs:
           cd sentinel-bridge
           python -m pytest test_bridge.py -v
 
-  pester:
+  pester-windows-powershell:
+    name: pester (powershell)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Pester
         shell: powershell
@@ -35,4 +36,18 @@ jobs:
 
       - name: Run sentinel.ps1 test suite
         shell: powershell
+        run: Invoke-Pester -Path ./sentinel.Tests.ps1 -Output Detailed -CI
+
+  pester-powershell-core:
+    name: pester (pwsh)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run sentinel.ps1 test suite
+        shell: pwsh
         run: Invoke-Pester -Path ./sentinel.Tests.ps1 -Output Detailed -CI

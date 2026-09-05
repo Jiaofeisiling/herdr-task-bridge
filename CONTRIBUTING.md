@@ -68,9 +68,13 @@ that runs it as a real child process against a local `HttpListener` stub, so
 it doesn't need a deployed bridge:
 
 ```powershell
-Install-Module -Name Pester -Scope CurrentUser   # first time only
+Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser   # first time only
 Invoke-Pester -Path .\sentinel.Tests.ps1 -Output Detailed
 ```
+
+CI runs the same suite once under Windows PowerShell 5.1 and once under
+PowerShell Core. Changes to HTTP error handling or parameter binding must pass
+under both editions.
 
 It still doesn't cover everything a live bridge would (real PowerShell 5.1
 HTTP error-body quirks, actual Sentinel/herdr behavior) — say so explicitly
@@ -86,10 +90,13 @@ bridge and you couldn't do that.
   anything else that could make it slow or fail for a reason unrelated to
   "is the bridge process itself alive" — that's the one invariant the whole
   design leans on.
-- `AGENT_LOCK` (via `acquire_agent_for_delegation()`) is the single
-  chokepoint for anything that talks to Sentinel. Don't add a second lock or
-  a code path that calls `run_herdr("agent", "prompt", ...)` without going
-  through it.
+- `acquire_agent_for_delegation(agent_name)` (via `get_agent_lock(agent_name)`)
+  is the single chokepoint for anything that talks to a given agent. Don't
+  add a second lock or a code path that calls
+  `run_herdr("agent", "prompt", ...)` without going through it. Locks are
+  per-agent on purpose — a request against one agent must never block on a
+  completely unrelated one — so don't collapse this back into one global
+  lock either.
 
 ## Where the design decisions are recorded
 

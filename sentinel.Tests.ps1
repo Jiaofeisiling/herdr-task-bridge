@@ -168,6 +168,30 @@ Describe "health" {
     }
 }
 
+Describe "PowerShell HTTP error compatibility" {
+    It "parses a 404 JSON body and exits 1 under both Windows PowerShell and PowerShell Core" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("task", "missing-task")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 404 -Payload @{
+                ok = $false; error = "task not found"
+            }
+
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 1
+            $result.StdErr | Should -Not -Match "Invoke-RestMethod"
+            ($result.StdOut | ConvertFrom-Json).error | Should -Be "task not found"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+}
+
 Describe "auth token header" {
     It "sends X-Sentinel-Token when SENTINEL_BRIDGE_TOKEN is set" {
         $stub = Start-StubListener
@@ -311,6 +335,120 @@ Describe "wait" {
             $result = Wait-SentinelExit -Process $proc
 
             $result.ExitCode | Should -Be 2
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+}
+
+Describe "agents" {
+    It "GETs /agents and prints the parsed list" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("agents")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true
+                agents = @(
+                    @{ name = "sentinel-opencode"; agent_status = "working" }
+                    @{ name = "sentinel"; agent_status = "idle" }
+                )
+            }
+
+            $result = Wait-SentinelExit -Process $proc
+
+            $req.Method | Should -Be "GET"
+            $req.Path | Should -Be "/agents"
+            $result.ExitCode | Should -Be 0
+            ($result.StdOut | ConvertFrom-Json).agents.Count | Should -Be 2
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+}
+
+Describe "-Agent parameter" {
+    It "includes agent in the /delegate request body when -Agent is passed" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("delegate", "-Agent", "sentinel-opencode", "check", "disk")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 202 -Payload @{
+                ok = $true; task_id = "t1"; status = "queued"
+            }
+
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Body.agent | Should -Be "sentinel-opencode"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "omits agent from the /delegate request body when -Agent is not passed" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("delegate", "check", "disk")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 202 -Payload @{
+                ok = $true; task_id = "t1"; status = "queued"
+            }
+
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Body.PSObject.Properties.Name | Should -Not -Contain "agent"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "appends ?agent=... to the /ready request when -Agent is passed" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("ready", "-Agent", "sentinel-opencode")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; ready = $true; agent_status = "idle"
+            }
+
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Path | Should -Be "/ready"
+            $req.Context.Request.Url.Query | Should -Be "?agent=sentinel-opencode"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "sends -Lines and -Agent as encoded /read query parameters" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("read", "-Lines", "37", "-Agent", "agent one")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; stdout = "output"; stderr = ""
+            }
+
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 0
+            $req.Path | Should -Be "/read"
+            $req.Context.Request.QueryString["lines"] | Should -Be "37"
+            $req.Context.Request.QueryString["agent"] | Should -Be "agent one"
         }
         finally {
             $stub.Listener.Stop()
