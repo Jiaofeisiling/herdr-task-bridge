@@ -55,7 +55,7 @@ def _fresh_db(tmp_path, monkeypatch):
 def test_create_and_get_task(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    task_id = bridge.create_task("check disk space", 60000)
+    task_id = bridge.create_task("check disk space", 60000, "sentinel")
     task = bridge.get_task(task_id)
 
     assert task["status"] == "queued"
@@ -74,8 +74,8 @@ def test_get_task_missing_returns_none(tmp_path, monkeypatch):
 def test_list_tasks_orders_newest_first(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    first = bridge.create_task("first", 1000)
-    second = bridge.create_task("second", 1000)
+    first = bridge.create_task("first", 1000, "sentinel")
+    second = bridge.create_task("second", 1000, "sentinel")
 
     tasks = bridge.list_tasks()
 
@@ -85,7 +85,7 @@ def test_list_tasks_orders_newest_first(tmp_path, monkeypatch):
 def test_claim_task_only_succeeds_once(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    task_id = bridge.create_task("t", 1000)
+    task_id = bridge.create_task("t", 1000, "sentinel")
 
     assert bridge.claim_task(task_id) is True
     assert bridge.claim_task(task_id) is False
@@ -95,8 +95,8 @@ def test_claim_task_only_succeeds_once(tmp_path, monkeypatch):
 def test_peek_next_task_returns_oldest_queued(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    first = bridge.create_task("first", 1000)
-    bridge.create_task("second", 1000)
+    first = bridge.create_task("first", 1000, "sentinel")
+    bridge.create_task("second", 1000, "sentinel")
 
     assert bridge.peek_next_task()["task_id"] == first
 
@@ -110,7 +110,7 @@ def test_peek_next_task_returns_none_when_empty(tmp_path, monkeypatch):
 def test_complete_task_sets_result(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    task_id = bridge.create_task("t", 1000)
+    task_id = bridge.create_task("t", 1000, "sentinel")
     bridge.claim_task(task_id)
     bridge.complete_task(task_id, "all good")
 
@@ -123,7 +123,7 @@ def test_complete_task_sets_result(tmp_path, monkeypatch):
 def test_fail_task_sets_error(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    task_id = bridge.create_task("t", 1000)
+    task_id = bridge.create_task("t", 1000, "sentinel")
     bridge.claim_task(task_id)
     bridge.fail_task(task_id, "boom")
 
@@ -135,7 +135,7 @@ def test_fail_task_sets_error(tmp_path, monkeypatch):
 def test_init_db_orphans_stale_running_rows_on_restart(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    task_id = bridge.create_task("t", 1000)
+    task_id = bridge.create_task("t", 1000, "sentinel")
     bridge.claim_task(task_id)
 
     # simulate a bridge restart against the same database file
@@ -156,7 +156,7 @@ def test_get_agent_status_idle(monkeypatch):
         "stderr": "",
     })
 
-    status, _ = bridge.get_agent_status()
+    status, _ = bridge.get_agent_status("sentinel")
 
     assert status == "idle"
 
@@ -166,7 +166,7 @@ def test_get_agent_status_herdr_failure_returns_none(monkeypatch):
         "ok": False, "stdout": "", "stderr": "connection refused",
     })
 
-    status, result = bridge.get_agent_status()
+    status, result = bridge.get_agent_status("sentinel")
 
     assert status is None
     assert result["ok"] is False
@@ -177,7 +177,7 @@ def test_get_agent_status_bad_json_returns_none(monkeypatch):
         "ok": True, "stdout": "not json", "stderr": "",
     })
 
-    status, result = bridge.get_agent_status()
+    status, result = bridge.get_agent_status("sentinel")
 
     assert status is None
     assert result["ok"] is False
@@ -205,7 +205,7 @@ def test_execute_sentinel_task_happy_path(monkeypatch):
 
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
-    result = bridge.execute_sentinel_task(task_id, "do a thing", 60000)
+    result = bridge.execute_sentinel_task("sentinel", task_id, "do a thing", 60000)
 
     assert result == "一切正常"
 
@@ -216,7 +216,7 @@ def test_execute_sentinel_task_prompt_failure_raises(monkeypatch):
     })
 
     with pytest.raises(bridge.SentinelPromptError):
-        bridge.execute_sentinel_task("id", "task", 60000)
+        bridge.execute_sentinel_task("sentinel", "id", "task", 60000)
 
 
 def test_execute_sentinel_task_read_failure_raises(monkeypatch):
@@ -228,7 +228,7 @@ def test_execute_sentinel_task_read_failure_raises(monkeypatch):
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
     with pytest.raises(bridge.SentinelReadError):
-        bridge.execute_sentinel_task("id", "task", 60000)
+        bridge.execute_sentinel_task("sentinel", "id", "task", 60000)
 
 
 def test_execute_sentinel_task_timeout_raises(monkeypatch):
@@ -238,7 +238,7 @@ def test_execute_sentinel_task_timeout_raises(monkeypatch):
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
     with pytest.raises(TimeoutError):
-        bridge.execute_sentinel_task("id", "task", 60000)
+        bridge.execute_sentinel_task("sentinel", "id", "task", 60000)
 
 
 def test_execute_sentinel_task_recovers_missing_marker(monkeypatch):
@@ -263,7 +263,7 @@ def test_execute_sentinel_task_recovers_missing_marker(monkeypatch):
 
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
-    result = bridge.execute_sentinel_task(task_id, "task", 60000)
+    result = bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
 
     assert result == "补发总结"
 
@@ -275,7 +275,7 @@ def test_execute_sentinel_task_marker_missing_after_recovery_raises(monkeypatch)
 
     with pytest.raises(bridge.SentinelMarkerMissingError):
         bridge.execute_sentinel_task(
-            "33333333-3333-3333-3333-333333333333", "task", 60000
+            "sentinel", "33333333-3333-3333-3333-333333333333", "task", 60000
         )
 
 
@@ -301,7 +301,7 @@ def test_execute_sentinel_task_raises_marker_missing_when_recovery_prompt_fails(
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
     with pytest.raises(bridge.SentinelMarkerMissingError):
-        bridge.execute_sentinel_task(task_id, "task", 60000)
+        bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
 
     # Verify that we got exactly 2 prompt calls (initial + recovery) and 1 read call (no second read after failed recovery)
     assert state["prompt_calls"] == 2
@@ -309,71 +309,71 @@ def test_execute_sentinel_task_raises_marker_missing_when_recovery_prompt_fails(
 
 
 def test_acquire_agent_for_delegation_succeeds_when_idle(monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     entered = False
-    with bridge.acquire_agent_for_delegation():
+    with bridge.acquire_agent_for_delegation("sentinel"):
         entered = True
 
     assert entered is True
-    assert bridge.AGENT_LOCK.locked() is False
+    assert bridge.get_agent_lock("sentinel").locked() is False
 
 
 def test_acquire_agent_for_delegation_raises_when_busy(monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("working", {"ok": True}))
 
     with pytest.raises(bridge.SentinelBusyError):
-        with bridge.acquire_agent_for_delegation():
+        with bridge.acquire_agent_for_delegation("sentinel"):
             pass
 
-    assert bridge.AGENT_LOCK.locked() is False
+    assert bridge.get_agent_lock("sentinel").locked() is False
 
 
 def test_acquire_agent_for_delegation_raises_when_locked_by_another_caller(monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
-    bridge.AGENT_LOCK.acquire()
+    bridge.get_agent_lock("sentinel").acquire()
     try:
         with pytest.raises(bridge.SentinelBusyError):
-            with bridge.acquire_agent_for_delegation():
+            with bridge.acquire_agent_for_delegation("sentinel"):
                 pass
     finally:
-        bridge.AGENT_LOCK.release()
+        bridge.get_agent_lock("sentinel").release()
 
 
 def test_acquire_agent_for_delegation_raises_when_unreachable(monkeypatch):
     monkeypatch.setattr(
         bridge, "get_agent_status",
-        lambda: (None, {"ok": False, "error": "no route"}),
+        lambda *a, **k: (None, {"ok": False, "error": "no route"}),
     )
 
     with pytest.raises(bridge.SentinelUnavailableError):
-        with bridge.acquire_agent_for_delegation():
+        with bridge.acquire_agent_for_delegation("sentinel"):
             pass
 
-    assert bridge.AGENT_LOCK.locked() is False
+    assert bridge.get_agent_lock("sentinel").locked() is False
 
 
 def test_acquire_agent_for_delegation_releases_lock_when_body_raises(monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     with pytest.raises(ValueError):
-        with bridge.acquire_agent_for_delegation():
+        with bridge.acquire_agent_for_delegation("sentinel"):
             raise ValueError("boom from caller body")
-    assert bridge.AGENT_LOCK.locked() is False
+    assert bridge.get_agent_lock("sentinel").locked() is False
 
 
 def test_acquire_agent_for_delegation_converts_status_query_exception(monkeypatch):
-    def boom():
+    def boom(*a, **k):
         raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=10)
 
     monkeypatch.setattr(bridge, "get_agent_status", boom)
 
     with pytest.raises(bridge.SentinelUnavailableError):
-        with bridge.acquire_agent_for_delegation():
+        with bridge.acquire_agent_for_delegation("sentinel"):
             pass
 
-    assert bridge.AGENT_LOCK.locked() is False
+    assert bridge.get_agent_lock("sentinel").locked() is False
 
 
 import http.client
@@ -421,7 +421,7 @@ def test_health_endpoint_does_not_touch_sentinel(live_server, monkeypatch):
 
 
 def test_ready_endpoint_reports_idle(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     status, body = _get(live_server, "/ready")
 
@@ -431,7 +431,7 @@ def test_ready_endpoint_reports_idle(live_server, monkeypatch):
 
 
 def test_ready_endpoint_reports_busy(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("working", {"ok": True}))
 
     status, body = _get(live_server, "/ready")
 
@@ -441,7 +441,7 @@ def test_ready_endpoint_reports_busy(live_server, monkeypatch):
 
 
 def test_ready_endpoint_reports_unreachable(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: (None, {"ok": False}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: (None, {"ok": False}))
 
     status, body = _get(live_server, "/ready")
 
@@ -457,7 +457,7 @@ def test_tasks_list_empty(live_server):
 
 
 def test_tasks_list_returns_created_tasks(live_server):
-    task_id = bridge.create_task("check disk", 1000)
+    task_id = bridge.create_task("check disk", 1000, "sentinel")
 
     status, body = _get(live_server, "/tasks")
 
@@ -473,7 +473,7 @@ def test_task_get_not_found(live_server):
 
 
 def test_task_get_found(live_server):
-    task_id = bridge.create_task("check disk", 1000)
+    task_id = bridge.create_task("check disk", 1000, "sentinel")
 
     status, body = _get(live_server, f"/tasks/{task_id}")
 
@@ -521,7 +521,7 @@ def test_delegate_defaults_timeout_to_six_hours(live_server):
 
 
 def test_delegate_does_not_check_busy_state(live_server, monkeypatch):
-    def boom():
+    def boom(*a, **k):
         raise AssertionError("/delegate must not query Sentinel status")
 
     monkeypatch.setattr(bridge, "get_agent_status", boom)
@@ -532,7 +532,7 @@ def test_delegate_does_not_check_busy_state(live_server, monkeypatch):
 
 
 def test_ask_returns_409_when_busy(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("working", {"ok": True}))
 
     status, body = _post(live_server, "/ask", {"task": "do something"})
 
@@ -544,7 +544,7 @@ def test_ask_returns_409_when_busy(live_server, monkeypatch):
 def test_ask_returns_503_when_sentinel_unreachable(live_server, monkeypatch):
     monkeypatch.setattr(
         bridge, "get_agent_status",
-        lambda: (None, {"ok": False, "error": "no route"}),
+        lambda *a, **k: (None, {"ok": False, "error": "no route"}),
     )
 
     status, body = _post(live_server, "/ask", {"task": "do something"})
@@ -554,7 +554,7 @@ def test_ask_returns_503_when_sentinel_unreachable(live_server, monkeypatch):
 
 
 def test_ask_happy_path(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     def fake_run_herdr(*args, **kwargs):
         if args[1] == "prompt":
@@ -571,7 +571,7 @@ def test_ask_happy_path(live_server, monkeypatch):
 
 
 def test_prompt_returns_prompt_result_without_reading(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     calls = []
 
@@ -595,7 +595,7 @@ def test_ask_rejects_empty_task(live_server):
 
 
 def test_ask_returns_504_on_timeout(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     def fake_run_herdr(*args, **kwargs):
         raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=1)
@@ -610,7 +610,7 @@ def test_ask_returns_504_on_timeout(live_server, monkeypatch):
 
 
 def test_ask_returns_502_when_marker_missing(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
     monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
         "ok": True, "stdout": "始终没有 marker", "stderr": "",
     })
@@ -623,7 +623,7 @@ def test_ask_returns_502_when_marker_missing(live_server, monkeypatch):
 
 
 def test_ask_returns_500_on_prompt_failure(live_server, monkeypatch):
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
     monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
         "ok": False, "stdout": "", "stderr": "herdr exploded",
     })
@@ -639,7 +639,7 @@ def test_task_worker_picks_up_and_completes_queued_task(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
     bridge.init_db()
     monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     def fake_run_herdr(*args, **kwargs):
         if args[1] == "prompt":
@@ -649,7 +649,7 @@ def test_task_worker_picks_up_and_completes_queued_task(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
     monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "worker 完成")
 
-    task_id = bridge.create_task("后台任务", 5000)
+    task_id = bridge.create_task("后台任务", 5000, "sentinel")
 
     stop_event = threading_module.Event()
     worker_thread = threading_module.Thread(
@@ -676,9 +676,9 @@ def test_task_worker_skips_when_sentinel_busy(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
     bridge.init_db()
     monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("working", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("working", {"ok": True}))
 
-    task_id = bridge.create_task("后台任务", 5000)
+    task_id = bridge.create_task("后台任务", 5000, "sentinel")
 
     stop_event = threading_module.Event()
     worker_thread = threading_module.Thread(
@@ -703,7 +703,7 @@ def test_task_worker_survives_peek_next_task_exception(tmp_path, monkeypatch):
 
     calls = {"count": 0}
 
-    def flaky_peek():
+    def flaky_peek(*a, **k):
         calls["count"] += 1
         if calls["count"] <= 3:
             raise sqlite3.OperationalError("simulated DB hiccup")
@@ -730,7 +730,7 @@ def test_task_worker_survives_peek_next_task_exception(tmp_path, monkeypatch):
 
 
 def test_do_get_returns_500_instead_of_crashing_on_unexpected_error(live_server, monkeypatch):
-    def boom():
+    def boom(*a, **k):
         raise RuntimeError("simulated unexpected failure")
 
     monkeypatch.setattr(bridge, "get_agent_status", boom)
@@ -796,7 +796,7 @@ def test_execute_sentinel_task_recovery_timeout_raises_timeout_error(monkeypatch
 
     with pytest.raises(TimeoutError):
         bridge.execute_sentinel_task(
-            "55555555-5555-5555-5555-555555555555", "task", 60000
+            "sentinel", "55555555-5555-5555-5555-555555555555", "task", 60000
         )
 
 
@@ -807,7 +807,7 @@ def test_execute_sentinel_task_marker_missing_includes_raw_output(monkeypatch):
 
     with pytest.raises(bridge.SentinelMarkerMissingError) as exc_info:
         bridge.execute_sentinel_task(
-            "66666666-6666-6666-6666-666666666666", "task", 60000
+            "sentinel", "66666666-6666-6666-6666-666666666666", "task", 60000
         )
 
     assert "这是终端里最后的原始输出" in exc_info.value.raw_output
@@ -816,7 +816,7 @@ def test_execute_sentinel_task_marker_missing_includes_raw_output(monkeypatch):
 def test_orphan_task_sets_status(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
-    task_id = bridge.create_task("t", 1000)
+    task_id = bridge.create_task("t", 1000, "sentinel")
     bridge.claim_task(task_id)
     bridge.orphan_task(task_id, "bridge timeout")
 
@@ -829,7 +829,7 @@ def test_task_worker_orphans_on_recovery_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
     bridge.init_db()
     monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
-    monkeypatch.setattr(bridge, "get_agent_status", lambda: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     def fake_run_herdr(*args, **kwargs):
         if args[1] == "prompt":
@@ -840,7 +840,7 @@ def test_task_worker_orphans_on_recovery_timeout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
-    task_id = bridge.create_task("会在恢复阶段超时的任务", 5000)
+    task_id = bridge.create_task("会在恢复阶段超时的任务", 5000, "sentinel")
 
     stop_event = threading_module.Event()
     worker_thread = threading_module.Thread(
@@ -1087,3 +1087,233 @@ def test_auth_token_warning_when_valid_ascii_token(monkeypatch):
     monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
 
     assert bridge.auth_token_warning() is None
+
+
+# -- multi-agent support ----------------------------------------------------
+
+def test_init_db_migrates_pre_multi_agent_schema(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    monkeypatch.setattr(bridge, "DEFAULT_AGENT", "legacy-default")
+
+    # Build a DB with the schema from before the `agent` column existed,
+    # with one row already in it -- init_db() must add the column and
+    # backfill it, not just work on a fresh DB.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY,
+            task TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            timeout_ms INTEGER NOT NULL,
+            result_text TEXT,
+            error_text TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks (task_id, task, status, created_at, timeout_ms) "
+        "VALUES ('pre-existing', 'old task', 'queued', '2026-01-01', 1000)"
+    )
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    task = bridge.get_task("pre-existing")
+    assert task["agent"] == "legacy-default"
+
+
+def test_create_task_stores_agent(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("check disk", 1000, "agent-a")
+    task = bridge.get_task(task_id)
+
+    assert task["agent"] == "agent-a"
+
+
+def test_get_agent_lock_returns_same_lock_for_same_name():
+    assert bridge.get_agent_lock("agent-x") is bridge.get_agent_lock("agent-x")
+
+
+def test_get_agent_lock_returns_different_locks_for_different_names():
+    assert bridge.get_agent_lock("agent-x") is not bridge.get_agent_lock("agent-y")
+
+
+def test_acquire_agent_for_delegation_does_not_block_a_different_agent(monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+
+    with bridge.acquire_agent_for_delegation("agent-a"):
+        # A concurrent request against a completely different agent must
+        # not be blocked by agent-a's lock -- that's the entire point of
+        # per-agent locks over one global AGENT_LOCK.
+        entered = False
+        with bridge.acquire_agent_for_delegation("agent-b"):
+            entered = True
+
+        assert entered is True
+
+    assert bridge.get_agent_lock("agent-a").locked() is False
+    assert bridge.get_agent_lock("agent-b").locked() is False
+
+
+def test_agents_endpoint_returns_parsed_list(live_server, monkeypatch):
+    fake_agents = [
+        {"name": "sentinel-opencode", "agent_status": "working", "pane_id": "w1:p3"},
+        {"name": "sentinel", "agent_status": "idle", "pane_id": "w1:p9"},
+    ]
+
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True,
+        "stdout": json_module.dumps({"result": {"agents": fake_agents, "type": "agent_list"}}),
+        "stderr": "",
+    })
+
+    status, body = _get(live_server, "/agents")
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["agents"] == fake_agents
+
+
+def test_agents_endpoint_returns_503_on_herdr_failure(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "stdout": "", "stderr": "herdr not reachable",
+    })
+
+    status, body = _get(live_server, "/agents")
+
+    assert status == 503
+    assert body["ok"] is False
+
+
+def test_delegate_stores_explicit_agent(live_server):
+    status, body = _post(
+        live_server, "/delegate", {"task": "check disk", "agent": "agent-a"}
+    )
+
+    assert status == 202
+    task = bridge.get_task(body["task_id"])
+    assert task["agent"] == "agent-a"
+
+
+def test_delegate_defaults_agent_when_not_specified(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "check disk"})
+
+    task = bridge.get_task(body["task_id"])
+    assert task["agent"] == bridge.DEFAULT_AGENT
+
+
+def test_ask_uses_explicit_agent(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+
+    calls = []
+
+    def fake_run_herdr(*args, **kwargs):
+        calls.append(args)
+        if args[1] == "prompt":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "raw", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "done")
+
+    status, body = _post(
+        live_server, "/ask", {"task": "do something", "agent": "agent-a"}
+    )
+
+    assert status == 200
+    # every run_herdr call's third positional arg is the agent name
+    assert all(call[2] == "agent-a" for call in calls)
+
+
+def test_ready_endpoint_respects_agent_query_param(live_server, monkeypatch):
+    seen = {}
+
+    def fake_get_agent_status(agent_name):
+        seen["agent_name"] = agent_name
+        return "idle", {"ok": True}
+
+    monkeypatch.setattr(bridge, "get_agent_status", fake_get_agent_status)
+
+    status, body = _get(live_server, "/ready?agent=agent-a")
+
+    assert status == 200
+    assert seen["agent_name"] == "agent-a"
+
+
+def test_ready_endpoint_defaults_agent_when_no_query_param(live_server, monkeypatch):
+    seen = {}
+
+    def fake_get_agent_status(agent_name):
+        seen["agent_name"] = agent_name
+        return "idle", {"ok": True}
+
+    monkeypatch.setattr(bridge, "get_agent_status", fake_get_agent_status)
+
+    _get(live_server, "/ready")
+
+    assert seen["agent_name"] == bridge.DEFAULT_AGENT
+
+
+def test_health_reports_default_agent(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "DEFAULT_AGENT", "agent-a")
+
+    status, body = _get(live_server, "/health")
+
+    assert status == 200
+    assert body["default_agent"] == "agent-a"
+    assert body["version"] == 4
+
+
+def test_task_worker_skips_busy_agent_to_run_a_different_idle_agents_task(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+
+    def fake_get_agent_status(agent_name):
+        # agent-busy never becomes available; agent-idle always is.
+        return ("working", {"ok": True}) if agent_name == "agent-busy" else ("idle", {"ok": True})
+
+    monkeypatch.setattr(bridge, "get_agent_status", fake_get_agent_status)
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "raw", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "done")
+
+    # The busy agent's task is queued first (oldest), the idle agent's
+    # task second -- a naive "always take the oldest queued task" worker
+    # would starve the second task forever behind the first.
+    busy_task_id = bridge.create_task("stuck behind busy agent", 5000, "agent-busy")
+    idle_task_id = bridge.create_task("should run despite being queued second", 5000, "agent-idle")
+
+    stop_event = threading_module.Event()
+    worker_thread = threading_module.Thread(
+        target=bridge.task_worker, args=(stop_event,), daemon=True
+    )
+    worker_thread.start()
+
+    try:
+        deadline = time_module.time() + 5
+        idle_task = bridge.get_task(idle_task_id)
+
+        while idle_task["status"] == "queued" and time_module.time() < deadline:
+            time_module.sleep(0.05)
+            idle_task = bridge.get_task(idle_task_id)
+
+        assert idle_task["status"] == "done"
+        # the busy agent's task must still be untouched -- proves it was
+        # skipped, not silently dropped or run out of order incorrectly
+        assert bridge.get_task(busy_task_id)["status"] == "queued"
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=2)

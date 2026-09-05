@@ -10,7 +10,8 @@ param(
         "status",
         "ready",
         "read",
-        "health"
+        "health",
+        "agents"
     )]
     [string]$Command,
 
@@ -19,7 +20,12 @@ param(
 
     [int]$Lines = 80,
 
-    [int]$TimeoutMs = 120000
+    [int]$TimeoutMs = 120000,
+
+    # Which herdr agent to target. Omit to use the bridge's own
+    # SENTINEL_AGENT default -- see `agents` for the full list of what's
+    # actually available on the remote host right now.
+    [string]$Agent
 )
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -29,6 +35,14 @@ $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding           = $Utf8
 
 $BaseUrl = if ($env:SENTINEL_BRIDGE_URL) { $env:SENTINEL_BRIDGE_URL } else { "http://127.0.0.1:8765" }
+
+# Query-string suffix for the GET endpoints that accept ?agent=... . Empty
+# when -Agent wasn't passed, so the bridge falls back to its own default.
+$AgentQuery = if ($PSBoundParameters.ContainsKey("Agent")) {
+    "?agent=$([uri]::EscapeDataString($Agent))"
+} else {
+    ""
+}
 
 
 function Join-TaskText {
@@ -94,7 +108,7 @@ switch ($Command) {
     }
 
     "status" {
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/status"
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/status$AgentQuery"
 
         if (-not $result.ok) {
             Write-Error $result.stderr
@@ -105,7 +119,7 @@ switch ($Command) {
     }
 
     "read" {
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/read"
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/read$AgentQuery"
 
         if (-not $result.ok) {
             Write-Error $result.stderr
@@ -113,6 +127,15 @@ switch ($Command) {
         }
 
         $result.stdout
+    }
+
+    "agents" {
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/agents"
+        $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
     }
 
     "prompt" {
@@ -123,10 +146,16 @@ switch ($Command) {
             exit 1
         }
 
-        $body = @{
+        $payload = @{
             task       = $task
             timeout_ms = $TimeoutMs
-        } | ConvertTo-Json -Compress
+        }
+
+        if ($PSBoundParameters.ContainsKey("Agent")) {
+            $payload["agent"] = $Agent
+        }
+
+        $body = $payload | ConvertTo-Json -Compress
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body
         $result | ConvertTo-Json -Depth 20
@@ -144,11 +173,17 @@ switch ($Command) {
             exit 1
         }
 
-        $body = @{
+        $payload = @{
             task       = $task
             timeout_ms = $TimeoutMs
             lines      = 500
-        } | ConvertTo-Json -Compress
+        }
+
+        if ($PSBoundParameters.ContainsKey("Agent")) {
+            $payload["agent"] = $Agent
+        }
+
+        $body = $payload | ConvertTo-Json -Compress
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
         $result | ConvertTo-Json -Depth 20
@@ -172,6 +207,10 @@ switch ($Command) {
             $payload["timeout_ms"] = $TimeoutMs
         }
 
+        if ($PSBoundParameters.ContainsKey("Agent")) {
+            $payload["agent"] = $Agent
+        }
+
         $body = $payload | ConvertTo-Json -Compress
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/delegate" -Method Post -Body $body
@@ -183,7 +222,7 @@ switch ($Command) {
     }
 
     "ready" {
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/ready"
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/ready$AgentQuery"
         $result | ConvertTo-Json -Depth 10
     }
 
