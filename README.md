@@ -108,6 +108,37 @@ agent **把结果写进一个文件**，bridge 读那个文件——不是从终
 
 如果 agent 完成了却没写文件，bridge 会补发一次**只要求写文件**的提醒（明确禁止重新执行任务），仍然没有才判为 `error`，并把终端末尾附在错误信息里供排查——终端读取只在这条失败诊断路径上出现，正常路径完全不碰。
 
+#### 这个目录必须在 agent 的写权限白名单里
+
+这是从"打印文本"换成"写文件"带来的**新依赖**：打印不需要任何权限，写文件要过 agent 自己的权限系统。而且拒绝发生在**任务做完之后**——工作白做，结果拿不到（终端末尾会附在错误里，但那是降级的诊断信息，不是干净结果）。
+
+实测两种 agent 各有各的拦截机制：
+
+- **OpenCode**：`~/.config/opencode/opencode.json` 默认 `edit`/`bash` 为 `ask`、`external_directory` 为 `deny`，项目级配置还会把可写路径限定成白名单。**`/tmp` 默认不在里面**。
+- **Claude Code**：即使开了 auto mode，仍有分类器会拦截操作（实测连 `ls -la ~/.claude/` 都被 "Blocked by classifier" 拒过）。
+
+所以要么把 `SENTINEL_RESULT_DIR` 指到 agent 已经允许写的路径，要么给这一个目录加一条**窄授权**——不要为此整个会话旁路审批：
+
+```jsonc
+// opencode.json —— 只放开结果目录，其余规则不动
+{
+  "permission": {
+    "bash": { "cat > /path/to/your/result-dir/*": "allow" }
+  }
+}
+```
+
+```jsonc
+// ~/.claude/settings.json —— 同理
+{
+  "permissions": {
+    "allow": ["Write(/path/to/your/result-dir/**)"]
+  }
+}
+```
+
+任务失败并提示 `never wrote its result file` 时，先查这里。
+
 ## 鉴权（可选，默认关闭）
 
 默认没有任何鉴权——任何能连到 `127.0.0.1:8765` 的本地进程都能提交任务。要开启：

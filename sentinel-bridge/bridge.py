@@ -546,7 +546,15 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500)
     if response is None:
         raise SentinelResultMissingError(
             "Sentinel finished but never wrote its result file "
-            f"({result_file_path(task_id)}), including after a reminder.",
+            f"({result_file_path(task_id)}), including after a reminder. "
+            "The most likely cause is that the agent lacks write permission "
+            f"for {RESULT_DIR} -- agents run under their own permission systems "
+            "(OpenCode's external_directory/allowlist rules, Claude Code's "
+            "auto-mode classifier), and a denial lands only after the work "
+            "is already done. Check that directory is on the agent's "
+            "allowlist, or point SENTINEL_RESULT_DIR at one that is. The "
+            "terminal tail below is attached as diagnostics -- the work may "
+            "well have succeeded even though its result was never delivered.",
             raw_output=_read_terminal_tail(agent_name, read_lines),
         )
 
@@ -722,7 +730,9 @@ cat > '{path}' <<'SENTINEL_EOF'
 <你的结果>
 SENTINEL_EOF
 
-结果里简洁说明做了什么、得到什么；如果涉及 Slurm job、修改了文件、或者被什么卡住了，一并写清楚。
+写这个结果文件是交付方式本身，不算"修改文件"：**如果上面的任务要求你不要修改任何文件，那条限制不包括这个结果文件。**
+
+结果里简洁说明做了什么、得到什么；如果涉及 Slurm job、修改了文件、或者被什么卡住了，一并写清楚。注意结果文件会被完整取走，不要把密钥、token 等凭据原文写进去。
 """.strip()
 
 class Handler(BaseHTTPRequestHandler):

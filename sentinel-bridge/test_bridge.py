@@ -1457,3 +1457,34 @@ def test_execute_sentinel_task_survives_a_failing_diagnostic_read(tmp_path, monk
         bridge.execute_sentinel_task(
             "sentinel", "99999999-9999-9999-9999-999999999999", "task", 60000
         )
+
+
+def test_delegation_prompt_exempts_the_result_file_from_read_only_tasks(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompt = bridge.build_delegation_prompt(
+        "只读探测，不要修改任何文件", "aaaaaaaa-1111-2222-3333-444444444444"
+    )
+
+    # Without this carve-out the prompt contradicts its own task text: the
+    # task says "modify nothing", the contract demands a file write. A real
+    # agent flagged the conflict in its own answer before this was added.
+    assert "不包括" in prompt or "例外" in prompt
+
+
+def test_missing_result_error_points_at_write_permission(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "terminal tail", "stderr": "",
+    })
+
+    with pytest.raises(bridge.SentinelResultMissingError) as exc_info:
+        bridge.execute_sentinel_task(
+            "sentinel", "bbbbbbbb-1111-2222-3333-444444444444", "task", 60000
+        )
+
+    # the most likely cause by far -- agents run under permission systems
+    # that can deny writes outside an allowlist, and the denial lands after
+    # the work is already done
+    assert "权限" in str(exc_info.value) or "permission" in str(exc_info.value).lower()
+    assert str(tmp_path) in str(exc_info.value)
