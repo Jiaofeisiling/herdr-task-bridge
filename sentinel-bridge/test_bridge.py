@@ -1512,3 +1512,131 @@ def test_reminder_is_logged_so_the_hit_rate_is_observable(tmp_path, monkeypatch,
     # extra prompt. That has to show up somewhere operators can count it,
     # rather than only being visible by interrogating the agent afterwards.
     assert "reminder" in capsys.readouterr().out.lower()
+
+
+# -- provider quota failover -------------------------------------------------
+
+def test_quota_error_detail_recognises_claude_and_opencode_failures():
+    assert bridge.quota_error_detail(
+        "Claude usage limit reached; resets in 4 hours"
+    )
+    assert bridge.quota_error_detail(
+        "OpenCode API error 402: insufficient balance"
+    )
+    assert bridge.quota_error_detail("ordinary permission denied") is None
+
+
+def test_run_prompt_marks_quota_error_from_herdr_output(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False,
+        "stdout": "",
+        "stderr": "HTTP 429: rate limit exceeded",
+    })
+
+    with pytest.raises(bridge.AgentQuotaExhaustedError) as exc_info:
+        bridge._run_herdr_prompt("sentinel-opencode", "task", 1000)
+
+    assert exc_info.value.agent_name == "sentinel-opencode"
+
+
+def test_missing_result_quota_does_not_send_recovery_prompt(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    def fake_run_herdr(*args, **kwargs):
+        calls.append(args)
+        if args[1] == "read":
+            return {
+                "ok": True,
+                "stdout": "OpenCode API: insufficient credits",
+                "stderr": "",
+            }
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(bridge.AgentQuotaExhaustedError):
+        bridge.execute_sentinel_task("sentinel-opencode", "1", "task", 1000)
+
+    assert len([call for call in calls if call[1] == "prompt"]) == 1
+
+
+def test_failover_switches_to_a_different_runtime_and_blocks_primary(
+    tmp_path, monkeypatch
+):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "list_agents", lambda: (
+        [
+            {"name": "sentinel-opencode", "agent": "opencode"},
+            {"name": "sentinel-claude", "agent": "claude"},
+        ],
+        {"ok": True},
+    ))
+    monkeypatch.setattr(
+        bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True})
+    )
+    attempted = []
+
+    def operation(agent_name):
+        attempted.append(agent_name)
+        if agent_name == "sentinel-opencode":
+            raise bridge.AgentQuotaExhaustedError(
+                agent_name, "OpenCode API: insufficient balance"
+            )
+        return "completed by fallback"
+
+    result, used_agent = bridge.run_with_quota_failover(
+        "sentinel-opencode", operation
+    )
+
+    assert result == "completed by fallback"
+    assert used_agent == "sentinel-claude"
+    assert attempted == ["sentinel-opencode", "sentinel-claude"]
+    assert bridge.get_agent_quota_block("sentinel-opencode") is not None
+
+
+def test_failover_never_auto_selects_same_runtime_family(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "list_agents", lambda: (
+        [
+            {"name": "opencode-a", "agent": "opencode"},
+            {"name": "opencode-b", "agent": "opencode"},
+        ],
+        {"ok": True},
+    ))
+    monkeypatch.setattr(
+        bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True})
+    )
+
+    with pytest.raises(bridge.QuotaFailoverExhaustedError):
+        bridge.run_with_quota_failover(
+            "opencode-a",
+            lambda agent: (_ for _ in ()).throw(
+                bridge.AgentQuotaExhaustedError(agent, "credits exhausted")
+            ),
+        )
+
+
+def test_quota_block_can_be_listed_and_cleared(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    bridge.mark_agent_quota_blocked("sentinel-claude", "5h limit reached")
+
+    assert [row["agent"] for row in bridge.list_agent_quota_blocks()] == [
+        "sentinel-claude"
+    ]
+    assert bridge.clear_agent_quota_blocks("sentinel-claude") == 1
+    assert bridge.list_agent_quota_blocks() == []
+
+
+def test_quota_endpoints_list_and_reset(live_server, monkeypatch):
+    bridge.mark_agent_quota_blocked("sentinel-opencode", "credits exhausted")
+
+    status, body = _get(live_server, "/quota")
+    assert status == 200
+    assert body["blocked_agents"][0]["agent"] == "sentinel-opencode"
+
+    status, body = _post(
+        live_server, "/quota/reset", {"agent": "sentinel-opencode"}
+    )
+    assert status == 200
+    assert body["cleared"] == 1

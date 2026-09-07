@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 4
+BRIDGE_VERSION = 5
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -66,6 +66,27 @@ AGENT_NAME_MAX_LENGTH = 200
 # tell "queued, will run eventually" apart from "the queue is effectively
 # stuck". Override via env var for deployments that need a different limit.
 MAX_QUEUE_DEPTH = int(os.environ.get("SENTINEL_MAX_QUEUE_DEPTH", "50"))
+
+# A quota/balance failure belongs to the model provider, not Herdr. Keep a
+# durable circuit per agent so the queue immediately uses a different runtime
+# instead of repeatedly spending requests on an account that cannot answer.
+# Operators clear a circuit explicitly after the provider reset/recharge.
+QUOTA_FAILOVER_AGENTS = tuple(
+    name.strip()
+    for name in os.environ.get("SENTINEL_QUOTA_FAILOVER_AGENTS", "").split(",")
+    if name.strip()
+)
+
+QUOTA_ERROR_PATTERN = re.compile(
+    r"(?:\b(?:429|402)\b|rate[ -]?limit(?:ed|ing)?|too many requests|"
+    r"(?:usage|weekly|5[ -]?(?:hour|hours|h)|1[ -]?(?:week|weeks|w))"
+    r"\s+(?:limit|quota)(?:\s+(?:reached|exceeded|exhausted))?|"
+    r"(?:quota|credits?|balance|spend(?:ing)?)[\s_-]*(?:is[\s_-]*)?"
+    r"(?:exceeded|exhausted|insufficient|depleted|too low)|"
+    r"insufficient (?:credits?|balance|funds)|payment required|"
+    r"billing(?: limit)?|try again (?:in|after)|resets? (?:at|in))",
+    re.IGNORECASE,
+)
 
 
 def validate_timeout_ms(timeout_ms):
@@ -171,6 +192,14 @@ def init_db():
 
                 result_text TEXT,
                 error_text TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS quota_blocks (
+                agent TEXT PRIMARY KEY,
+                detected_at TEXT NOT NULL,
+                detail TEXT NOT NULL
             )
         """)
 
@@ -313,6 +342,18 @@ def claim_task(task_id):
         return cursor.rowcount == 1
 
 
+def requeue_task(task_id):
+    """Return a claimed task to the queue when every fallback is busy."""
+    with db_session() as conn:
+        cursor = conn.execute("""
+            UPDATE tasks
+            SET status = 'queued', started_at = NULL, finished_at = NULL
+            WHERE task_id = ? AND status = 'running'
+        """, (task_id,))
+
+        return cursor.rowcount == 1
+
+
 def complete_task(task_id, result_text):
     with db_session() as conn:
         conn.execute("""
@@ -338,6 +379,56 @@ def orphan_task(task_id, error_text):
             SET status = 'orphaned', error_text = ?, finished_at = ?
             WHERE task_id = ?
         """, (error_text, now_iso(), task_id))
+
+
+def quota_exhausted_task(task_id, error_text):
+    with db_session() as conn:
+        conn.execute("""
+            UPDATE tasks
+            SET status = 'quota_exhausted', error_text = ?, finished_at = ?
+            WHERE task_id = ?
+        """, (error_text, now_iso(), task_id))
+
+
+def mark_agent_quota_blocked(agent_name, detail):
+    with db_session() as conn:
+        conn.execute("""
+            INSERT INTO quota_blocks (agent, detected_at, detail)
+            VALUES (?, ?, ?)
+            ON CONFLICT(agent) DO UPDATE SET
+                detected_at = excluded.detected_at,
+                detail = excluded.detail
+        """, (agent_name, now_iso(), detail))
+
+
+def get_agent_quota_block(agent_name):
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM quota_blocks WHERE agent = ?", (agent_name,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def list_agent_quota_blocks():
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT * FROM quota_blocks ORDER BY detected_at DESC"
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def clear_agent_quota_blocks(agent_name=None):
+    with db_session() as conn:
+        if agent_name is None:
+            cursor = conn.execute("DELETE FROM quota_blocks")
+        else:
+            cursor = conn.execute(
+                "DELETE FROM quota_blocks WHERE agent = ?", (agent_name,)
+            )
+
+    return cursor.rowcount
 
 
 # One lock per agent name, not one global lock -- a request against
@@ -416,6 +507,27 @@ class SentinelPromptError(RuntimeError):
     pass
 
 
+class AgentQuotaExhaustedError(SentinelPromptError):
+    def __init__(self, agent_name, detail, raw_output=""):
+        self.agent_name = agent_name
+        self.detail = detail
+        self.raw_output = raw_output
+        super().__init__(f"Agent quota exhausted ({agent_name}): {detail}")
+
+
+class QuotaFailoverExhaustedError(AgentQuotaExhaustedError):
+    def __init__(self, quota_errors):
+        self.quota_errors = quota_errors
+        detail = "; ".join(
+            f"{error.agent_name}: {error.detail}" for error in quota_errors
+        )
+        super().__init__(
+            ", ".join(error.agent_name for error in quota_errors),
+            "all eligible fallback agents are quota-blocked or quota-exhausted; "
+            + detail,
+        )
+
+
 class SentinelResultMissingError(RuntimeError):
     def __init__(self, message, raw_output=""):
         self.raw_output = raw_output
@@ -449,6 +561,74 @@ def read_result_file(task_id, cleanup=True):
             pass
 
     return content or None
+
+
+def quota_error_detail(text):
+    """Return a compact provider error when text looks like a quota failure."""
+    if not text or not QUOTA_ERROR_PATTERN.search(text):
+        return None
+
+    compact = " ".join(text.strip().split())
+    return compact[-1000:] or "provider reported a quota or balance failure"
+
+
+def _agent_runtime_family(agent):
+    """Map Herdr's runtime field to a provider family for safe auto-failover."""
+    raw = str(agent.get("agent", "")).strip().lower()
+    name = str(agent.get("name", "")).strip().lower()
+
+    for value in (raw, name):
+        if "opencode" in value:
+            return "opencode"
+        if "claude" in value:
+            return "claude"
+        if "codex" in value:
+            return "codex"
+
+    return raw or None
+
+
+def quota_failover_candidates(primary_agent):
+    """Return alternate agents in a different runtime family.
+
+    `SENTINEL_QUOTA_FAILOVER_AGENTS` is an explicit ordered allowlist. Without
+    it, use Herdr discovery, but never silently switch to another session of
+    the same provider family because it may share the same exhausted account.
+    """
+    agents, list_result = list_agents()
+    if agents is None:
+        raise SentinelUnavailableError(
+            list_result.get("error", "unable to discover fallback agents")
+        )
+
+    by_name = {
+        agent.get("name"): agent
+        for agent in agents
+        if isinstance(agent, dict) and agent.get("name")
+    }
+    primary_family = _agent_runtime_family(by_name.get(primary_agent, {}))
+
+    if QUOTA_FAILOVER_AGENTS:
+        names = QUOTA_FAILOVER_AGENTS
+    else:
+        names = tuple(by_name)
+
+    candidates = []
+    for name in names:
+        if name == primary_agent or name not in by_name:
+            continue
+
+        # A configured allowlist is an operator's explicit decision to use
+        # these sessions. Discovery mode is stricter and insists on a
+        # different runtime family before it can switch automatically.
+        if not QUOTA_FAILOVER_AGENTS:
+            family = _agent_runtime_family(by_name[name])
+            if not primary_family or not family or family == primary_family:
+                continue
+
+        candidates.append(name)
+
+    return candidates
 
 
 def build_result_reminder_prompt(task_id):
@@ -485,6 +665,11 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms):
             "Bridge stopped waiting for Sentinel. "
             "Sentinel may still be executing the task."
         )
+
+    output = "\n".join((result.get("stderr", ""), result.get("stdout", "")))
+    detail = quota_error_detail(output)
+    if detail:
+        raise AgentQuotaExhaustedError(agent_name, detail, raw_output=output)
 
     if not result["ok"]:
         raise SentinelPromptError(
@@ -532,6 +717,13 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500)
     response = read_result_file(task_id)
 
     if response is None:
+        terminal_tail = _read_terminal_tail(agent_name, read_lines)
+        detail = quota_error_detail(terminal_tail)
+        if detail:
+            raise AgentQuotaExhaustedError(
+                agent_name, detail, raw_output=terminal_tail
+            )
+
         # The agent's turn ended without a result file. Ask once for just the
         # file -- it already did the work, so this is far cheaper than the old
         # "restate everything" recovery, and it cannot re-run anything.
@@ -567,7 +759,7 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500)
             "allowlist, or point SENTINEL_RESULT_DIR at one that is. The "
             "terminal tail below is attached as diagnostics -- the work may "
             "well have succeeded even though its result was never delivered.",
-            raw_output=_read_terminal_tail(agent_name, read_lines),
+            raw_output=terminal_tail,
         )
 
     return response
@@ -581,6 +773,69 @@ class SentinelBusyError(RuntimeError):
 
 class SentinelUnavailableError(RuntimeError):
     pass
+
+
+def _remember_quota_error(error):
+    mark_agent_quota_blocked(error.agent_name, error.detail)
+
+
+def _run_quota_fallbacks(primary_agent, operation, first_error):
+    """Try eligible alternate providers after the primary is quota-blocked."""
+    quota_errors = [first_error]
+    unavailable = []
+
+    for agent_name in quota_failover_candidates(primary_agent):
+        existing_block = get_agent_quota_block(agent_name)
+        if existing_block:
+            quota_errors.append(AgentQuotaExhaustedError(
+                agent_name,
+                "quota circuit is open since " + existing_block["detected_at"],
+            ))
+            continue
+
+        try:
+            with acquire_agent_for_delegation(agent_name):
+                return operation(agent_name), agent_name
+        except AgentQuotaExhaustedError as error:
+            _remember_quota_error(error)
+            quota_errors.append(error)
+        except (SentinelBusyError, SentinelUnavailableError) as error:
+            unavailable.append(f"{agent_name}: {error}")
+
+    if unavailable:
+        raise SentinelBusyError(
+            "quota fallback unavailable; " + "; ".join(unavailable)
+        )
+
+    raise QuotaFailoverExhaustedError(quota_errors)
+
+
+def run_with_quota_failover(primary_agent, operation, primary_locked=False):
+    """Run once on the requested agent, then actively switch providers.
+
+    The caller receives both the operation result and the actual agent name.
+    A persisted quota circuit avoids hitting a known-exhausted account again.
+    """
+    existing_block = get_agent_quota_block(primary_agent)
+    if existing_block:
+        return _run_quota_fallbacks(
+            primary_agent,
+            operation,
+            AgentQuotaExhaustedError(
+                primary_agent,
+                "quota circuit is open since " + existing_block["detected_at"],
+            ),
+        )
+
+    try:
+        if primary_locked:
+            return operation(primary_agent), primary_agent
+
+        with acquire_agent_for_delegation(primary_agent):
+            return operation(primary_agent), primary_agent
+    except AgentQuotaExhaustedError as error:
+        _remember_quota_error(error)
+        return _run_quota_fallbacks(primary_agent, operation, error)
 
 
 @contextlib.contextmanager
@@ -646,58 +901,79 @@ def task_worker(stop_event=None):
             # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
             # 避免维护两份重复的加锁逻辑。
             agent_name = task_row["agent"]
+            task_id = task_row["task_id"]
+            claimed = False
 
             try:
-                with acquire_agent_for_delegation(agent_name):
-                    task_id = task_row["task_id"]
+                operation = lambda target: execute_sentinel_task(
+                    agent_name=target,
+                    task_id=task_id,
+                    task=task_row["task"],
+                    timeout_ms=task_row["timeout_ms"],
+                )
 
+                if get_agent_quota_block(agent_name):
+                    # The primary was already proved unavailable for quota
+                    # reasons. Claim once, then actively use a fallback
+                    # without sending another prompt to that account.
                     if not claim_task(task_id):
-                        # 任务已被别的地方 claim（正常情况下不会发生，
-                        # 因为只有这一个 worker），直接进入下一轮。
                         continue
-
-                    print(f"[task {task_id}] running (agent={agent_name})")
-
-                    try:
-                        result = execute_sentinel_task(
-                            agent_name=agent_name,
-                            task_id=task_id,
-                            task=task_row["task"],
-                            timeout_ms=task_row["timeout_ms"],
+                    claimed = True
+                    result, used_agent = run_with_quota_failover(
+                        agent_name, operation
+                    )
+                else:
+                    with acquire_agent_for_delegation(agent_name):
+                        if not claim_task(task_id):
+                            continue
+                        claimed = True
+                        result, used_agent = run_with_quota_failover(
+                            agent_name, operation, primary_locked=True
                         )
 
-                    except TimeoutError as e:
-                        # Claude 有可能还在继续工作，
-                        # 所以不能简单标 error。
-                        orphan_task(task_id, str(e))
-                        print(f"[task {task_id}] orphaned")
+                complete_task(task_id, result)
+                print(f"[task {task_id}] done (agent={used_agent})")
 
-                    except Exception as e:
-                        detail = str(e)
+            except TimeoutError as e:
+                # The agent may still be executing, so it cannot safely be
+                # retried on another provider.
+                if claimed:
+                    orphan_task(task_id, str(e))
+                    print(f"[task {task_id}] orphaned")
 
-                        if isinstance(e, SentinelResultMissingError) and e.raw_output:
-                            detail += (
-                                "\n\nRaw Sentinel output (last 4000 chars):\n"
-                                + e.raw_output
-                            )
-
-                        fail_task(task_id, detail)
-                        print(f"[task {task_id}] error: {e}")
-
-                    else:
-                        # 只有 execute_sentinel_task 真正成功才走到这里；
-                        # 如果 complete_task 自己失败，不应该被上面那段
-                        # "except Exception" 错误地标成任务失败。
-                        complete_task(task_id, result)
-                        print(f"[task {task_id}] done")
+            except QuotaFailoverExhaustedError as e:
+                detail = str(e)
+                if e.raw_output:
+                    detail += "\n\nRaw provider output:\n" + e.raw_output
+                if claimed:
+                    quota_exhausted_task(task_id, detail)
+                    print(f"[task {task_id}] quota exhausted: {e}")
 
             except (SentinelBusyError, SentinelUnavailableError):
+                if claimed:
+                    # A quota fallback exists but is temporarily occupied or
+                    # unreachable. Preserve the task and retry later; do not
+                    # misreport this as either a completed fallback or a
+                    # permanent quota failure.
+                    requeue_task(task_id)
+
                 # This agent's busy/unreachable -- remember that for the
                 # rest of this pass and immediately look for a task
                 # against a different agent, instead of sleeping and
                 # retrying the same oldest-but-busy task.
                 busy_this_pass.add(agent_name)
                 continue
+
+            except Exception as e:
+                if claimed:
+                    detail = str(e)
+                    if isinstance(e, SentinelResultMissingError) and e.raw_output:
+                        detail += (
+                            "\n\nRaw Sentinel output (last 4000 chars):\n"
+                            + e.raw_output
+                        )
+                    fail_task(task_id, detail)
+                    print(f"[task {task_id}] error: {e}")
 
         except Exception as e:
             # Anything else -- a DB hiccup in peek_next_task/claim_task,
@@ -859,6 +1135,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "ok": True,
                 "agents": agents,
+            })
+            return
+
+        if path == "/quota":
+            self.send_json({
+                "ok": True,
+                "blocked_agents": list_agent_quota_blocks(),
             })
             return
 
@@ -1026,6 +1309,28 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/quota/reset":
+            try:
+                body = self.read_json()
+                agent_value = body.get("agent")
+                agent_name = (
+                    validate_agent_name(agent_value)
+                    if agent_value is not None else None
+                )
+            except Exception as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"}, 400
+                )
+                return
+
+            cleared = clear_agent_quota_blocks(agent_name)
+            self.send_json({
+                "ok": True,
+                "agent": agent_name,
+                "cleared": cleared,
+            })
+            return
+
         if path not in ("/prompt", "/ask"):
             self.send_json(
                 {"error": "not found"},
@@ -1065,29 +1370,51 @@ class Handler(BaseHTTPRequestHandler):
         task_id = str(uuid.uuid4())
 
         try:
-            with acquire_agent_for_delegation(agent_name):
-                if path == "/prompt":
-                    prompt_result = run_prompt_only(
-                        agent_name, task_id, task, timeout_ms
-                    )
-
-                    self.send_json({
-                        "ok": True,
-                        "task_id": task_id,
-                        "prompt": prompt_result,
-                    })
-                    return
-
-                result_text = execute_sentinel_task(
-                    agent_name, task_id, task, timeout_ms, read_lines
+            if path == "/prompt":
+                prompt_result, used_agent = run_with_quota_failover(
+                    agent_name,
+                    lambda target: run_prompt_only(
+                        target, task_id, task, timeout_ms
+                    ),
                 )
 
                 self.send_json({
                     "ok": True,
                     "task_id": task_id,
-                    "result": {"text": result_text},
+                    "agent": used_agent,
+                    "prompt": prompt_result,
                 })
                 return
+
+            result_text, used_agent = run_with_quota_failover(
+                agent_name,
+                lambda target: execute_sentinel_task(
+                    target, task_id, task, timeout_ms, read_lines
+                ),
+            )
+
+            self.send_json({
+                "ok": True,
+                "task_id": task_id,
+                "agent": used_agent,
+                "result": {"text": result_text},
+            })
+            return
+
+        except QuotaFailoverExhaustedError as e:
+            self.send_json(
+                {
+                    "ok": False,
+                    "status": "quota_exhausted",
+                    "task_id": task_id,
+                    "agents": [
+                        error.agent_name for error in e.quota_errors
+                    ],
+                    "error": str(e),
+                },
+                429,
+            )
+            return
 
         except SentinelBusyError as e:
             self.send_json(

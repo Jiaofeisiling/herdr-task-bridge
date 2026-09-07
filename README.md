@@ -63,8 +63,10 @@ If the host has more than one Herdr agent, inspect them and select one explicitl
 | `ready` | GET | `/ready` | Reports whether the selected agent can accept work (`idle` or `done`). |
 | `status` | GET | `/status` | Returns the raw `herdr agent get` response. |
 | `read` | GET | `/read` | Reads recent agent-terminal lines for diagnosis. |
+| `quota` | GET | `/quota` | Lists agents temporarily blocked after a provider quota or balance failure. |
+| `quota-reset` | POST | `/quota/reset` | Clears one agent's quota circuit with `-Agent`, or all circuits when deliberately called without it. |
 | `delegate <task>` | POST | `/delegate` | Queues a task and returns a `task_id`; default server timeout is six hours. |
-| `task <task_id>` | GET | `/tasks/<id>` | Gets task state: `queued`, `running`, `done`, `error`, or `orphaned`. |
+| `task <task_id>` | GET | `/tasks/<id>` | Gets task state: `queued`, `running`, `done`, `error`, `orphaned`, or `quota_exhausted`. |
 | `wait <task_id>` | GET | `/tasks/<id>` | Polls every three seconds until a terminal state, then prints the result or error. |
 | `tasks` | GET | `/tasks` | Lists the 20 most recent tasks. |
 | `ask <task>` | POST | `/ask` | Runs synchronously and returns the agent result; returns `409` if that agent is busy. |
@@ -77,16 +79,32 @@ Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask
 ```
 queued → running → done
               ↓        ↑ (one result-file reminder)
-           error / orphaned
+    error / orphaned / quota_exhausted
 ```
 
 - `orphaned` means the bridge lost the completion signal, not that the remote task necessarily failed. Do **not** blindly retry it; inspect the task's real effects first.
 - `error` means the bridge confirmed an execution or result-collection failure.
+- `quota_exhausted` means every eligible fallback was also quota-blocked or reported a quota/balance failure. The task was not retried after that result.
 - On restart, a task that was `running` becomes `orphaned`. The bridge never reruns it automatically.
 
 Agents return results by writing one file per task under `SENTINEL_RESULT_DIR`; the bridge reads and removes the file. This avoids terminal scraping, truncation, UI noise, and coupling to an agent's terminal format. If the file is missing after an agent finishes, the bridge sends one narrowly scoped reminder to write the result file only. A second failure is reported as `error` with terminal output retained for diagnosis.
 
 The result directory must be writable by both the bridge process and the selected agent. Grant only that narrow write permission; do not weaken an agent's general approval policy merely to collect results.
+
+### Active quota failover
+
+The bridge recognises common provider signals such as Claude 5-hour/weekly usage limits, HTTP `429`, OpenCode API `402`, and insufficient API credit or balance. On detection it opens a durable circuit for the failed agent, skips the otherwise normal result-file reminder, and actively tries an eligible alternate agent.
+
+With automatic discovery, an alternate must be a **different runtime family** (for example, Claude ↔ OpenCode) so the bridge does not simply move to another session that may share the same exhausted account. Set `SENTINEL_QUOTA_FAILOVER_AGENTS` to an ordered, explicit allowlist when your deployment has known independent fallback accounts. An unavailable fallback leaves asynchronous work queued for another attempt; only exhausted eligible fallbacks produce `quota_exhausted`.
+
+After a provider's reset or an account recharge, verify the account outside the bridge and clear its circuit deliberately:
+
+```powershell
+sentinel quota
+sentinel quota-reset -Agent "your-agent-name"
+```
+
+Do not clear a circuit merely because an agent is `idle`: provider limits can leave an agent idle while its account remains unavailable.
 
 ## Configuration and security
 
@@ -101,6 +119,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_RESULT_DIR` | System temp directory / `sentinel-bridge-results` | Shared directory for agent result files. |
 | `SENTINEL_BRIDGE_TOKEN` | unset | Optional shared-secret authentication token. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
+| `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |
 
 Copy [`remote/bridge.env.example`](remote/bridge.env.example) to the untracked `remote/bridge.env` for deployment-specific values. Never commit real hostnames, project identifiers, paths, usernames, prompts, or tokens; see [CONTRIBUTING.md](CONTRIBUTING.md) for the project's sensitive-data rules.
 
@@ -140,7 +159,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-The Python suite has 104 mocked tests and does not require a real Herdr installation or network. The Windows client has a 15-test Pester suite that runs against a local HTTP stub:
+The Python suite has 111 mocked tests and does not require a real Herdr installation or network. The Windows client has a 16-test Pester suite that runs against a local HTTP stub:
 
 ```powershell
 Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser  # first time only

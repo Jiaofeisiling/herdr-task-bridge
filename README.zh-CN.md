@@ -63,8 +63,10 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `ready` | GET | `/ready` | 检查所选 agent 是否可接收任务（`idle` 或 `done`）。 |
 | `status` | GET | `/status` | 返回原始 `herdr agent get` 响应。 |
 | `read` | GET | `/read` | 读取最近的 agent 终端输出，供诊断使用。 |
+| `quota` | GET | `/quota` | 列出因模型提供商额度或余额错误而被临时阻断的 agent。 |
+| `quota-reset` | POST | `/quota/reset` | 使用 `-Agent` 清除一个 agent 的额度熔断；刻意不传时清除全部熔断。 |
 | `delegate <task>` | POST | `/delegate` | 将任务加入队列并返回 `task_id`；服务端默认超时为 6 小时。 |
-| `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态：`queued`、`running`、`done`、`error` 或 `orphaned`。 |
+| `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态：`queued`、`running`、`done`、`error`、`orphaned` 或 `quota_exhausted`。 |
 | `wait <task_id>` | GET | `/tasks/<id>` | 每 3 秒轮询至终态，再输出结果或错误。 |
 | `tasks` | GET | `/tasks` | 列出最近 20 个任务。 |
 | `ask <task>` | POST | `/ask` | 同步执行并返回 agent 结果；目标 agent 忙时返回 `409`。 |
@@ -77,16 +79,32 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 ```
 queued → running → done
               ↓        ↑（一次结果文件提醒）
-           error / orphaned
+    error / orphaned / quota_exhausted
 ```
 
 - `orphaned` 表示 bridge 没有等到任务完成信号，**不等于**远程任务一定失败。不要直接重试；应先检查该任务是否已经产生实际影响。
 - `error` 表示 bridge 已确认执行或结果收集失败。
+- `quota_exhausted` 表示所有合资格备用 agent 也被额度熔断或报告了额度/余额失败；任务到此为止，不会继续重试。
 - bridge 重启时，所有仍为 `running` 的任务会被标记为 `orphaned`，绝不会被自动重跑。
 
 agent 会把结果写入 `SENTINEL_RESULT_DIR` 下的一任务一文件；bridge 读出后会删除该文件。这样可避免从终端抓取文本所带来的截断、界面噪声以及对特定 agent 终端格式的依赖。agent 完成却没有写出结果文件时，bridge 只会补发一次“写入结果文件”的窄范围提醒；仍失败才报为 `error`，并保留终端输出用于诊断。
 
 结果目录必须同时可被 bridge 进程与所选 agent 写入。请只授予这一个目录的窄写入权限；不要为了收集结果而削弱 agent 的整体审批策略。
+
+### 主动额度故障转移
+
+bridge 会识别常见的提供商信号，包括 Claude 的 5 小时/周限额、HTTP `429`、OpenCode API `402`、API credit 或余额不足。识别后，它会为失败 agent 持久化一条额度熔断记录，跳过原本会发送的“写入结果文件”提醒，并主动尝试合资格的备用 agent。
+
+自动发现备用 agent 时，候选必须属于**不同的运行时家族**（例如 Claude ↔ OpenCode），避免只是切换到可能共享同一已耗尽账户的会话。如果部署中有已知的独立备用账户，请设置有序白名单 `SENTINEL_QUOTA_FAILOVER_AGENTS`。备用 agent 暂时不可用时，异步任务会保留在队列中稍后再尝试；只有所有合资格备用项都额度耗尽时，任务才会变为 `quota_exhausted`。
+
+在提供商限额重置或账户充值后，应先在 bridge 外部确认账户可用，再主动清除熔断：
+
+```powershell
+sentinel quota
+sentinel quota-reset -Agent "your-agent-name"
+```
+
+不要仅仅因为 agent 显示 `idle` 就清除熔断：模型提供商额度未恢复时，agent 仍然可能显示为空闲。
 
 ## 配置与安全
 
@@ -101,6 +119,7 @@ agent 会把结果写入 `SENTINEL_RESULT_DIR` 下的一任务一文件；bridge
 | `SENTINEL_RESULT_DIR` | 系统临时目录中的 `sentinel-bridge-results` | agent 结果文件共用目录。 |
 | `SENTINEL_BRIDGE_TOKEN` | 未设置 | 可选的共享密钥鉴权令牌。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
+| `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
 
 将 [`remote/bridge.env.example`](remote/bridge.env.example) 复制为未追踪的 `remote/bridge.env`，再填写部署专用配置。绝不要提交真实主机名、项目标识、路径、用户名、任务提示词或令牌；项目的敏感信息规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
@@ -140,7 +159,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-Python 测试套件含 104 个 mock 测试，不需要真实的 Herdr 安装或网络。Windows 客户端还有一个 15 用例的 Pester 套件，通过本地 HTTP stub 执行：
+Python 测试套件含 111 个 mock 测试，不需要真实的 Herdr 安装或网络。Windows 客户端还有一个 16 用例的 Pester 套件，通过本地 HTTP stub 执行：
 
 ```powershell
 Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser  # 首次需要
