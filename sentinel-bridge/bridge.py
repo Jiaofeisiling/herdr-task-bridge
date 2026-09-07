@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -32,6 +33,21 @@ DB_PATH = os.environ.get(
     "SENTINEL_DB",
     os.path.expanduser("~/sentinel-bridge/tasks.db"),
 )
+
+# Where the agent drops its answer. The bridge runs on the same host as the
+# agents it drives, so a plain file is the cheapest possible channel -- and a
+# far better one than the terminal: `pane.read` comes back truncated and
+# carries TUI chrome the agent never said (see experiments/FINDINGS.md), while
+# a file has no rendering, no wrapping and no truncation.
+RESULT_DIR = os.environ.get(
+    "SENTINEL_RESULT_DIR",
+    os.path.join(tempfile.gettempdir(), "sentinel-bridge-results"),
+)
+
+# Budget for the one reminder sent when the agent finished but never wrote
+# the file. Short on purpose: it only has to write a file it already knows
+# the contents of, not redo any work.
+RESULT_REMINDER_TIMEOUT_MS = 120_000
 
 # Bounds for the client-supplied timeout_ms on /ask, /prompt, /delegate.
 # Below the min there's no realistic chance Sentinel responds in time;
@@ -400,40 +416,54 @@ class SentinelPromptError(RuntimeError):
     pass
 
 
-class SentinelReadError(RuntimeError):
-    pass
-
-
-class SentinelMarkerMissingError(RuntimeError):
+class SentinelResultMissingError(RuntimeError):
     def __init__(self, message, raw_output=""):
         self.raw_output = raw_output
         super().__init__(message)
 
 
-def build_recovery_prompt(task_id):
+def result_file_path(task_id):
     token = task_id.replace("-", "")
+    return os.path.join(RESULT_DIR, f"result-{token}.txt")
 
+
+def read_result_file(task_id, cleanup=True):
+    """Return the agent's answer, or None if it never wrote one."""
+    path = result_file_path(task_id)
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        print(f"[result] unreadable result file {path}: {e}")
+        return None
+
+    if cleanup:
+        try:
+            os.remove(path)
+        except OSError:
+            # A leftover file is untidy, not a failure -- the content is
+            # already in hand and the name is task-unique either way.
+            pass
+
+    return content or None
+
+
+def build_result_reminder_prompt(task_id):
     return f"""
-你刚才已经完成了来自 Windows Codex 的任务。
+你刚才已经完成了委派的任务，但没有把结果写入约定的文件。
 
-不要重新执行任务。
-不要再次运行命令。
-不要修改文件。
+不要重新执行任务，不要再次运行命令，不要修改任何文件。
 
-请仅根据你刚才已经完成的工作：
-1. 简洁总结最终结果；
-2. 列出重要操作；
-3. 如有 Slurm job，给出 job ID；
-4. 如有修改文件，列出路径；
-5. 如被阻塞，说明原因。
+请仅根据你刚才已经做完的工作，把最终结果写入：
+{result_file_path(task_id)}
 
-Task token:
-{token}
-
-最后一行必须由字面前缀 SENTINEL_DONE_
-紧接 Task token 组成，中间不得有空格。
-
-最后一行后不要输出其他内容。
+写法示例：
+cat > '{result_file_path(task_id)}' <<'SENTINEL_EOF'
+<你刚才的结果>
+SENTINEL_EOF
 """.strip()
 
 
@@ -469,68 +499,55 @@ def run_prompt_only(agent_name, task_id, task, timeout_ms):
     return _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
 
 
+def _read_terminal_tail(agent_name, read_lines):
+    """Terminal text, for failure diagnostics only. Never on the happy path:
+    a broken/slow read here must not mask the error being diagnosed."""
+    try:
+        result = run_herdr(
+            "agent",
+            "read",
+            agent_name,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            str(read_lines),
+            timeout=60,
+        )
+    except Exception as e:
+        return f"(unable to read terminal for diagnostics: {e})"
+
+    if not result["ok"]:
+        return "(terminal read failed: " + result.get("stderr", "") + ")"
+
+    return result["stdout"][-4000:]
+
+
 def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500):
-    delegated_prompt = build_delegation_prompt(task, task_id)
+    os.makedirs(RESULT_DIR, exist_ok=True)
 
-    _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
-
-    read_result = run_herdr(
-        "agent",
-        "read",
-        agent_name,
-        "--source",
-        "recent-unwrapped",
-        "--lines",
-        str(read_lines),
-        timeout=60,
+    _run_herdr_prompt(
+        agent_name, build_delegation_prompt(task, task_id), timeout_ms
     )
 
-    if not read_result["ok"]:
-        raise SentinelReadError(
-            "Unable to read Sentinel output: " + read_result.get("stderr", "")
+    response = read_result_file(task_id)
+
+    if response is None:
+        # The agent's turn ended without a result file. Ask once for just the
+        # file -- it already did the work, so this is far cheaper than the old
+        # "restate everything" recovery, and it cannot re-run anything.
+        _run_herdr_prompt(
+            agent_name,
+            build_result_reminder_prompt(task_id),
+            RESULT_REMINDER_TIMEOUT_MS,
         )
 
-    response = extract_task_response(read_result["stdout"], task_id)
+        response = read_result_file(task_id)
 
     if response is None:
-        recovery_prompt = build_recovery_prompt(task_id)
-
-        try:
-            recovery_result = run_herdr(
-                "agent",
-                "prompt",
-                agent_name,
-                recovery_prompt,
-                "--wait",
-                "--timeout",
-                "120000",
-                timeout=135,
-            )
-        except subprocess.TimeoutExpired:
-            raise TimeoutError(
-                "Bridge stopped waiting for Sentinel during recovery. "
-                "Sentinel may still be executing the task."
-            )
-
-        if recovery_result["ok"]:
-            read_result = run_herdr(
-                "agent",
-                "read",
-                agent_name,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                str(read_lines),
-                timeout=60,
-            )
-
-            response = extract_task_response(read_result["stdout"], task_id)
-
-    if response is None:
-        raise SentinelMarkerMissingError(
-            "Sentinel finished but no completion marker was found, "
-            "including after recovery.",
-            raw_output=read_result["stdout"][-4000:],
+        raise SentinelResultMissingError(
+            "Sentinel finished but never wrote its result file "
+            f"({result_file_path(task_id)}), including after a reminder.",
+            raw_output=_read_terminal_tail(agent_name, read_lines),
         )
 
     return response
@@ -638,7 +655,7 @@ def task_worker(stop_event=None):
                     except Exception as e:
                         detail = str(e)
 
-                        if isinstance(e, SentinelMarkerMissingError) and e.raw_output:
+                        if isinstance(e, SentinelResultMissingError) and e.raw_output:
                             detail += (
                                 "\n\nRaw Sentinel output (last 4000 chars):\n"
                                 + e.raw_output
@@ -689,57 +706,24 @@ def run_herdr(*args, timeout=None):
 
 
 def build_delegation_prompt(task, task_id):
-    token = task_id.replace("-", "")
+    path = result_file_path(task_id)
 
     return f"""
-你正在接受来自 Windows Codex 的远程委派任务。
-
-Task token:
-{token}
+以下是一个远程委派的任务。
 
 任务：
 {task}
 
-请正常完成任务。
+完成后，把最终结果写入这个文件——**只有文件内容会被采集，打印在终端里的内容不会被读取**：
+{path}
 
-完成后：
-1. 简洁总结结果。
-2. 如果执行了重要操作，请说明。
-3. 如果涉及 Slurm job，请给出 job ID。
-4. 如果修改了文件，请列出文件。
-5. 如果被阻塞，请明确说明原因和 Windows Codex 下一步需要做什么。
+写法示例：
+cat > '{path}' <<'SENTINEL_EOF'
+<你的结果>
+SENTINEL_EOF
 
-最后一行必须是：
-字面前缀 SENTINEL_DONE_ 后立即连接上面的 Task token，中间不得有空格。
-
-最后一行之后不要输出其他内容。
+结果里简洁说明做了什么、得到什么；如果涉及 Slurm job、修改了文件、或者被什么卡住了，一并写清楚。
 """.strip()
-
-def extract_task_response(raw, task_id):
-    token = task_id.replace("-", "")
-    marker = f"SENTINEL_DONE_{token}"
-
-    pos = raw.rfind(marker)
-
-    if pos == -1:
-        return None
-
-    before = raw[:pos]
-
-    # Claude Code 的最终回答通常以 "● " 开始。
-    assistant_pos = before.rfind("\n● ")
-
-    if assistant_pos == -1:
-        assistant_pos = before.rfind("● ")
-
-    if assistant_pos != -1:
-        response = before[assistant_pos + 2:].strip()
-    else:
-        # fallback：至少返回 marker 前面的最近文本
-        response = before[-4000:].strip()
-
-    return response
-
 
 class Handler(BaseHTTPRequestHandler):
 
@@ -1122,7 +1106,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        except SentinelMarkerMissingError as e:
+        except SentinelResultMissingError as e:
             self.send_json(
                 {
                     "ok": False,
@@ -1134,7 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        except (SentinelPromptError, SentinelReadError) as e:
+        except SentinelPromptError as e:
             self.send_json(
                 {
                     "ok": False,

@@ -1,10 +1,26 @@
 import sys
 import os
+import re
 import sqlite3
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 import bridge
+
+
+def compliant_agent(text="ok"):
+    """A fake run_herdr that behaves the way the delegation prompt asks a
+    real agent to: it finds the result path in the prompt it was handed and
+    writes the answer there, instead of printing it to the terminal."""
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            match = re.search(r"(\S*result-[0-9a-f]+\.txt)", args[3])
+            if match:
+                with open(match.group(1), "w", encoding="utf-8") as f:
+                    f.write(text)
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    return fake_run_herdr
 
 
 def test_build_delegation_prompt_includes_token_and_task():
@@ -13,36 +29,9 @@ def test_build_delegation_prompt_includes_token_and_task():
 
     assert task_id.replace("-", "") in prompt
     assert "检查磁盘" in prompt
-    assert "SENTINEL_DONE_" in prompt
 
 
-def test_extract_task_response_finds_marker_after_assistant_marker():
-    task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    token = task_id.replace("-", "")
-    raw = f"some earlier noise\n● 这是最终总结\nSENTINEL_DONE_{token}"
 
-    result = bridge.extract_task_response(raw, task_id)
-
-    assert result == "这是最终总结"
-
-
-def test_extract_task_response_returns_none_when_marker_missing():
-    task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    raw = "Claude finished but forgot to print anything useful"
-
-    result = bridge.extract_task_response(raw, task_id)
-
-    assert result is None
-
-
-def test_extract_task_response_falls_back_without_assistant_marker():
-    task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    token = task_id.replace("-", "")
-    raw = f"raw terminal text with no bullet marker\nSENTINEL_DONE_{token}"
-
-    result = bridge.extract_task_response(raw, task_id)
-
-    assert result == "raw terminal text with no bullet marker"
 
 
 def _fresh_db(tmp_path, monkeypatch):
@@ -193,19 +182,13 @@ import subprocess as subprocess_module
 import pytest
 
 
-def test_execute_sentinel_task_happy_path(monkeypatch):
-    task_id = "11111111-1111-1111-1111-111111111111"
-    token = task_id.replace("-", "")
-    marker_output = f"● 一切正常\nSENTINEL_DONE_{token}"
+def test_execute_sentinel_task_happy_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("一切正常"))
 
-    def fake_run_herdr(*args, **kwargs):
-        if args[1] == "prompt":
-            return {"ok": True, "stdout": "", "stderr": ""}
-        return {"ok": True, "stdout": marker_output, "stderr": ""}
-
-    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-
-    result = bridge.execute_sentinel_task("sentinel", task_id, "do a thing", 60000)
+    result = bridge.execute_sentinel_task(
+        "sentinel", "11111111-1111-1111-1111-111111111111", "do a thing", 60000
+    )
 
     assert result == "一切正常"
 
@@ -219,17 +202,6 @@ def test_execute_sentinel_task_prompt_failure_raises(monkeypatch):
         bridge.execute_sentinel_task("sentinel", "id", "task", 60000)
 
 
-def test_execute_sentinel_task_read_failure_raises(monkeypatch):
-    def fake_run_herdr(*args, **kwargs):
-        if args[1] == "prompt":
-            return {"ok": True, "stdout": "", "stderr": ""}
-        return {"ok": False, "stdout": "", "stderr": "read broke"}
-
-    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-
-    with pytest.raises(bridge.SentinelReadError):
-        bridge.execute_sentinel_task("sentinel", "id", "task", 60000)
-
 
 def test_execute_sentinel_task_timeout_raises(monkeypatch):
     def fake_run_herdr(*args, **kwargs):
@@ -241,71 +213,7 @@ def test_execute_sentinel_task_timeout_raises(monkeypatch):
         bridge.execute_sentinel_task("sentinel", "id", "task", 60000)
 
 
-def test_execute_sentinel_task_recovers_missing_marker(monkeypatch):
-    task_id = "22222222-2222-2222-2222-222222222222"
-    token = task_id.replace("-", "")
-    state = {"reads": 0}
 
-    def fake_run_herdr(*args, **kwargs):
-        if args[1] == "prompt":
-            return {"ok": True, "stdout": "", "stderr": ""}
-
-        state["reads"] += 1
-
-        if state["reads"] == 1:
-            return {"ok": True, "stdout": "没有 marker 的输出", "stderr": ""}
-
-        return {
-            "ok": True,
-            "stdout": f"● 补发总结\nSENTINEL_DONE_{token}",
-            "stderr": "",
-        }
-
-    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-
-    result = bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
-
-    assert result == "补发总结"
-
-
-def test_execute_sentinel_task_marker_missing_after_recovery_raises(monkeypatch):
-    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
-        "ok": True, "stdout": "始终没有 marker", "stderr": "",
-    })
-
-    with pytest.raises(bridge.SentinelMarkerMissingError):
-        bridge.execute_sentinel_task(
-            "sentinel", "33333333-3333-3333-3333-333333333333", "task", 60000
-        )
-
-
-def test_execute_sentinel_task_raises_marker_missing_when_recovery_prompt_fails(monkeypatch):
-    task_id = "44444444-4444-4444-4444-444444444444"
-    state = {"prompt_calls": 0, "read_calls": 0}
-
-    def fake_run_herdr(*args, **kwargs):
-        if args[1] == "prompt":
-            state["prompt_calls"] += 1
-            if state["prompt_calls"] == 1:
-                # First prompt (delegation) succeeds
-                return {"ok": True, "stdout": "", "stderr": ""}
-            else:
-                # Second prompt (recovery) fails
-                return {"ok": False, "stdout": "", "stderr": "recovery failed"}
-
-        if args[1] == "read":
-            state["read_calls"] += 1
-            # All reads return no marker
-            return {"ok": True, "stdout": "没有 marker 的输出", "stderr": ""}
-
-    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-
-    with pytest.raises(bridge.SentinelMarkerMissingError):
-        bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
-
-    # Verify that we got exactly 2 prompt calls (initial + recovery) and 1 read call (no second read after failed recovery)
-    assert state["prompt_calls"] == 2
-    assert state["read_calls"] == 1
 
 
 def test_acquire_agent_for_delegation_succeeds_when_idle(monkeypatch):
@@ -553,16 +461,10 @@ def test_ask_returns_503_when_sentinel_unreachable(live_server, monkeypatch):
     assert body["status"] == "unavailable"
 
 
-def test_ask_happy_path(live_server, monkeypatch):
+def test_ask_happy_path(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
-
-    def fake_run_herdr(*args, **kwargs):
-        if args[1] == "prompt":
-            return {"ok": True, "stdout": "", "stderr": ""}
-        return {"ok": True, "stdout": "raw", "stderr": ""}
-
-    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "总结完成")
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("总结完成"))
 
     status, body = _post(live_server, "/ask", {"task": "do something"})
 
@@ -640,14 +542,8 @@ def test_task_worker_picks_up_and_completes_queued_task(tmp_path, monkeypatch):
     bridge.init_db()
     monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
-
-    def fake_run_herdr(*args, **kwargs):
-        if args[1] == "prompt":
-            return {"ok": True, "stdout": "", "stderr": ""}
-        return {"ok": True, "stdout": "raw", "stderr": ""}
-
-    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "worker 完成")
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("worker 完成"))
 
     task_id = bridge.create_task("后台任务", 5000, "sentinel")
 
@@ -799,18 +695,6 @@ def test_execute_sentinel_task_recovery_timeout_raises_timeout_error(monkeypatch
             "sentinel", "55555555-5555-5555-5555-555555555555", "task", 60000
         )
 
-
-def test_execute_sentinel_task_marker_missing_includes_raw_output(monkeypatch):
-    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
-        "ok": True, "stdout": "这是终端里最后的原始输出", "stderr": "",
-    })
-
-    with pytest.raises(bridge.SentinelMarkerMissingError) as exc_info:
-        bridge.execute_sentinel_task(
-            "sentinel", "66666666-6666-6666-6666-666666666666", "task", 60000
-        )
-
-    assert "这是终端里最后的原始输出" in exc_info.value.raw_output
 
 
 def test_orphan_task_sets_status(tmp_path, monkeypatch):
@@ -1207,19 +1091,18 @@ def test_delegate_defaults_agent_when_not_specified(live_server):
     assert task["agent"] == bridge.DEFAULT_AGENT
 
 
-def test_ask_uses_explicit_agent(live_server, monkeypatch):
+def test_ask_uses_explicit_agent(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     calls = []
+    writes_result = compliant_agent("done")
 
     def fake_run_herdr(*args, **kwargs):
         calls.append(args)
-        if args[1] == "prompt":
-            return {"ok": True, "stdout": "", "stderr": ""}
-        return {"ok": True, "stdout": "raw", "stderr": ""}
+        return writes_result(*args, **kwargs)
 
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "done")
 
     status, body = _post(
         live_server, "/ask", {"task": "do something", "agent": "agent-a"}
@@ -1389,14 +1272,8 @@ def test_task_worker_skips_busy_agent_to_run_a_different_idle_agents_task(
         return ("working", {"ok": True}) if agent_name == "agent-busy" else ("idle", {"ok": True})
 
     monkeypatch.setattr(bridge, "get_agent_status", fake_get_agent_status)
-
-    def fake_run_herdr(*args, **kwargs):
-        if args[1] == "prompt":
-            return {"ok": True, "stdout": "", "stderr": ""}
-        return {"ok": True, "stdout": "raw", "stderr": ""}
-
-    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
-    monkeypatch.setattr(bridge, "extract_task_response", lambda raw, task_id: "done")
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("done"))
 
     # The busy agent's task is queued first (oldest), the idle agent's
     # task second -- a naive "always take the oldest queued task" worker
@@ -1425,3 +1302,158 @@ def test_task_worker_skips_busy_agent_to_run_a_different_idle_agents_task(
     finally:
         stop_event.set()
         worker_thread.join(timeout=2)
+
+
+# -- file-based result exchange ---------------------------------------------
+#
+# The agent writes its answer to a file instead of printing it into the
+# terminal for the bridge to scrape back out. Verified against a real herdr:
+# agent.prompt's own response carries no reply text, and pane.read comes back
+# truncated and full of TUI chrome the agent never said, so the terminal is
+# the wrong channel for the result. See experiments/FINDINGS.md.
+
+
+def test_result_file_path_is_under_result_dir_and_keyed_by_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "11111111-2222-3333-4444-555555555555"
+    path = bridge.result_file_path(task_id)
+
+    assert path.startswith(str(tmp_path))
+    assert task_id.replace("-", "") in path
+
+
+def test_delegation_prompt_names_the_result_file_and_drops_the_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "11111111-2222-3333-4444-555555555555"
+    prompt = bridge.build_delegation_prompt("检查磁盘", task_id)
+
+    assert "检查磁盘" in prompt
+    assert bridge.result_file_path(task_id) in prompt
+    # the whole point: no more "last line must be SENTINEL_DONE_<token>"
+    assert "SENTINEL_DONE_" not in prompt
+
+
+def test_read_result_file_returns_content_and_cleans_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "22222222-2222-2222-2222-222222222222"
+    path = bridge.result_file_path(task_id)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("  磁盘使用率 42%  \n")
+
+    assert bridge.read_result_file(task_id) == "磁盘使用率 42%"
+    assert not os.path.exists(path)
+
+
+def test_read_result_file_returns_none_when_agent_never_wrote_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    assert bridge.read_result_file("33333333-3333-3333-3333-333333333333") is None
+
+
+def test_read_result_file_treats_an_empty_file_as_no_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "44444444-4444-4444-4444-444444444444"
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write("   \n")
+
+    assert bridge.read_result_file(task_id) is None
+
+
+def test_execute_sentinel_task_returns_the_file_contents(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "55555555-5555-5555-5555-555555555555"
+
+    def fake_run_herdr(*args, **kwargs):
+        # the agent "writes" its result the moment it is prompted
+        with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+            f.write("干净的结果，没有终端噪音")
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    result = bridge.execute_sentinel_task("sentinel", task_id, "do a thing", 60000)
+
+    assert result == "干净的结果，没有终端噪音"
+
+
+def test_execute_sentinel_task_never_reads_the_terminal_on_the_happy_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "66666666-6666-6666-6666-666666666666"
+    calls = []
+
+    def fake_run_herdr(*args, **kwargs):
+        calls.append(args[1])
+        with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+            f.write("ok")
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
+
+    assert calls == ["prompt"]  # no "read" -- scraping is off the critical path
+
+
+def test_execute_sentinel_task_reminds_once_when_the_file_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "77777777-7777-7777-7777-777777777777"
+    prompts = []
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            prompts.append(args[3])
+            if len(prompts) == 2:
+                # the agent complies with the reminder
+                with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+                    f.write("补写的结果")
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    result = bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
+
+    assert result == "补写的结果"
+    assert len(prompts) == 2
+    # the reminder must not ask for the work to be redone
+    assert "不要重新执行" in prompts[1]
+
+
+def test_execute_sentinel_task_raises_when_still_missing_after_the_reminder(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "终端里最后的原始输出", "stderr": "",
+    })
+
+    with pytest.raises(bridge.SentinelResultMissingError) as exc_info:
+        bridge.execute_sentinel_task(
+            "sentinel", "88888888-8888-8888-8888-888888888888", "task", 60000
+        )
+
+    # a terminal tail is still attached, but only as failure diagnostics
+    assert "终端里最后的原始输出" in exc_info.value.raw_output
+
+
+def test_execute_sentinel_task_survives_a_failing_diagnostic_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "read":
+            raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=60)
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    # the missing result is the real error; a broken diagnostic read must not
+    # mask it with a TimeoutError
+    with pytest.raises(bridge.SentinelResultMissingError):
+        bridge.execute_sentinel_task(
+            "sentinel", "99999999-9999-9999-9999-999999999999", "task", 60000
+        )

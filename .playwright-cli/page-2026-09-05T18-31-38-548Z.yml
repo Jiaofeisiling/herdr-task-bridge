@@ -1,0 +1,219 @@
+- generic [ref=e1]:
+  - toolbar "图表操作" [ref=e2]:
+    - button "切换颜色主题" [pressed] [ref=e3] [cursor=pointer]:
+      - generic [ref=e5]: 浅色
+    - button "当前视觉风格：经典。选择视觉风格" [ref=e7] [cursor=pointer]:
+      - generic [ref=e9]: 经典
+    - button "进入演示模式" [ref=e11] [cursor=pointer]:
+      - generic [ref=e13]: 演示
+    - generic [ref=e14]:
+      - button "导出图表" [expanded] [ref=e15] [cursor=pointer]: 导出
+      - menu "导出" [ref=e216]:
+        - generic [ref=e217]:
+          - strong [ref=e218]: 导出图表
+          - generic [ref=e219]: 便携、整洁的输出
+        - generic [ref=e220]: E
+        - group "分享" [ref=e221]:
+          - generic [aria-hidden] [ref=e222]: 分享
+          - menuitem "分享卡片 1200×630 PNG" [active] [ref=e223] [cursor=pointer]:
+            - generic [ref=e224]:
+              - strong [ref=e225]: 分享卡片
+              - generic [ref=e226]: 1200×630 PNG
+          - menuitem "复制分享卡片 复制 PNG 到剪贴板" [ref=e227] [cursor=pointer]:
+            - generic [ref=e228]:
+              - strong [ref=e229]: 复制分享卡片
+              - generic [ref=e230]: 复制 PNG 到剪贴板
+          - menuitem "复制图表 复制 PNG 到剪贴板" [ref=e231] [cursor=pointer]:
+            - generic [ref=e232]:
+              - strong [ref=e233]: 复制图表
+              - generic [ref=e234]: 复制 PNG 到剪贴板
+        - group "位图" [ref=e235]:
+          - generic [aria-hidden] [ref=e236]: 图像
+          - menuitem "PNG 无损图像" [ref=e237] [cursor=pointer]:
+            - generic [ref=e238]:
+              - strong [ref=e239]: PNG
+              - generic [ref=e240]: 无损图像
+          - menuitem "JPEG 紧凑图像" [ref=e241] [cursor=pointer]:
+            - generic [ref=e242]:
+              - strong [ref=e243]: JPEG
+              - generic [ref=e244]: 紧凑图像
+          - menuitem "WebP 现代图像格式" [ref=e245] [cursor=pointer]:
+            - generic [ref=e246]:
+              - strong [ref=e247]: WebP
+              - generic [ref=e248]: 现代图像格式
+        - group "矢量与动效" [ref=e249]:
+          - generic [aria-hidden] [ref=e250]: 矢量与动效
+          - menuitem "SVG 可编辑矢量图" [ref=e251] [cursor=pointer]:
+            - generic [ref=e252]:
+              - strong [ref=e253]: SVG
+              - generic [ref=e254]: 可编辑矢量图
+          - menuitem "WebM 6 秒动效" [disabled] [ref=e255]:
+            - generic [ref=e256]:
+              - strong [ref=e257]: WebM
+              - generic [ref=e258]: 6 秒动效
+  - generic [ref=e17]:
+    - heading "herdr-task-bridge 目标架构" [level=1] [ref=e21]
+    - generic "图表引导视图" [ref=e22]:
+      - generic [ref=e23]:
+        - generic [ref=e24]:
+          - generic [ref=e25]: 引导视图
+          - generic [ref=e26]: 0 / 3
+        - strong [ref=e28]: 探索此系统
+      - button "播放引导故事" [ref=e30] [cursor=pointer]:
+        - generic [aria-hidden] [ref=e31]: ▶
+        - generic [ref=e32]: 播放故事
+      - navigation "故事章节" [ref=e33]:
+        - list [ref=e34]:
+          - listitem [ref=e35]:
+            - button "打开第 1/3 章：控制路径。章节聚焦差异：0 个保留，7 个进入，0 个离开" [ref=e36] [cursor=pointer]:
+              - generic [aria-hidden] [ref=e37]: "01"
+              - generic [ref=e38]: 控制路径
+              - generic [aria-hidden] [ref=e39]:
+                - generic [ref=e40]: =0
+                - generic [ref=e41]: "+7"
+                - generic [ref=e42]: −0
+          - listitem [ref=e43]:
+            - button "打开第 2/3 章：执行路径。章节聚焦差异：0 个保留，4 个进入，0 个离开" [ref=e44] [cursor=pointer]:
+              - generic [aria-hidden] [ref=e45]: "02"
+              - generic [ref=e46]: 执行路径
+              - generic [aria-hidden] [ref=e47]:
+                - generic [ref=e48]: =0
+                - generic [ref=e49]: "+4"
+                - generic [ref=e50]: −0
+          - listitem [ref=e51]:
+            - button "打开第 3/3 章：报告路径。章节聚焦差异：0 个保留，7 个进入，0 个离开" [ref=e52] [cursor=pointer]:
+              - generic [aria-hidden] [ref=e53]: "03"
+              - generic [ref=e54]: 报告路径
+              - generic [aria-hidden] [ref=e55]:
+                - generic [ref=e56]: =0
+                - generic [ref=e57]: "+7"
+                - generic [ref=e58]: −0
+    - generic [ref=e59]:
+      - img "herdr-task-bridge 目标架构 由 Archify 生成的架构图。" [ref=e60]:
+        - group "直接关系浏览器":
+          - button "检查第 1/11 条关系：用户 到 Primary Coding Model，连接到。按 Enter 查看详情。"
+          - button "检查第 2/11 条关系：Primary Coding Model 到 Windows Gateway，合同与事件。按 Enter 查看详情。"
+          - button "检查第 3/11 条关系：Windows Gateway 到 SSH Tunnel，连接到。按 Enter 查看详情。"
+          - button "检查第 4/11 条关系：SSH Tunnel 到 Remote Bridge，HTTP + 长轮询。按 Enter 查看详情。"
+          - button "检查第 5/11 条关系：Remote Bridge 到 Workflow / Task Store，tasks + events。按 Enter 查看详情。"
+          - button "检查第 6/11 条关系：Remote Bridge 到 Herdr，连接到。按 Enter 查看详情。"
+          - button "检查第 7/11 条关系：Herdr 到 Linux Herdr Agent，连接到。按 Enter 查看详情。"
+          - button "检查第 8/11 条关系：Linux Herdr Agent 到 Linux Workspace，连接到。按 Enter 查看详情。"
+          - button "检查第 9/11 条关系：Linux Workspace 到 NeSI Slurm，授权后 sbatch。按 Enter 查看详情。":
+            - generic [ref=e66] [cursor=pointer]
+          - button "检查第 10/11 条关系：NeSI Slurm 到 Monitor Worker，连接到。按 Enter 查看详情。"
+          - button "检查第 11/11 条关系：Monitor Worker 到 Remote Bridge，状态事件。按 Enter 查看详情。"
+        - button "聚焦用户，授权与决策, 架构组件" [ref=e67] [cursor=pointer]:
+          - generic [ref=e70]: 用户
+          - generic [ref=e71]: 授权与决策
+        - button "聚焦Primary Coding Model，当前：Windows ChatGPT, Windows 用户侧" [ref=e72] [cursor=pointer]:
+          - generic [ref=e75]: Primary Coding Model
+          - generic [ref=e76]: 当前：Windows ChatGPT
+          - generic: 主要研发者
+        - button "聚焦Windows Gateway，接口、订阅、通知, Windows 用户侧" [ref=e77] [cursor=pointer]:
+          - generic [ref=e80]: Windows Gateway
+          - generic [ref=e81]: 接口、订阅、通知
+          - generic: 规划
+        - button "聚焦SSH Tunnel，localhost:8765, Windows 用户侧" [ref=e82] [cursor=pointer]:
+          - generic [ref=e85]: SSH Tunnel
+          - generic [ref=e86]: localhost:8765
+          - generic: 当前
+        - button "聚焦Remote Bridge，HTTP、队列、worker, NeSI / Linux 远端执行侧 › Bridge 控制面, 2 个已验证来源引用" [ref=e87] [cursor=pointer]:
+          - generic [ref=e90]: Remote Bridge
+          - generic [ref=e91]: HTTP、队列、worker
+          - generic: 当前 v4
+          - generic [aria-hidden]:
+            - generic: 来源 2
+        - button "聚焦Workflow / Task Store，tasks + events + cursor, NeSI / Linux 远端执行侧 › Bridge 控制面, 1 个已验证来源引用" [ref=e92] [cursor=pointer]:
+          - generic [ref=e95]: Workflow / Task Store
+          - generic [ref=e96]: tasks + events + cursor
+          - generic: tasks 已有；events 规划
+          - generic [aria-hidden]:
+            - generic: 来源 1
+        - button "聚焦Herdr，持久 Agent 会话管理, NeSI / Linux 远端执行侧" [ref=e97] [cursor=pointer]:
+          - generic [ref=e100]: Herdr
+          - generic [ref=e101]: 持久 Agent 会话管理
+          - generic: 当前
+        - button "聚焦Linux Herdr Agent，执行、诊断、有限小修, NeSI / Linux 远端执行侧" [ref=e102] [cursor=pointer]:
+          - generic [ref=e105]: Linux Herdr Agent
+          - generic [ref=e106]: 执行、诊断、有限小修
+          - generic: 远端执行者
+        - button "聚焦Linux Workspace，Git、环境、数据、测试, NeSI / Linux 远端执行侧" [ref=e107] [cursor=pointer]:
+          - generic [ref=e110]: Linux Workspace
+          - generic [ref=e111]: Git、环境、数据、测试
+        - button "聚焦NeSI Slurm，队列、作业、日志、产物, NeSI / Linux 远端执行侧" [ref=e112] [cursor=pointer]:
+          - generic [ref=e115]: NeSI Slurm
+          - generic [ref=e116]: 队列、作业、日志、产物
+        - button "聚焦Monitor Worker，多层状态监控, NeSI / Linux 远端执行侧 › Bridge 控制面" [ref=e117] [cursor=pointer]:
+          - generic [ref=e120]: Monitor Worker
+          - generic [ref=e121]: 多层状态监控
+          - generic: 规划
+        - generic [ref=e122]: 合同与事件
+        - generic [ref=e125]: HTTP + 长轮询
+        - generic [ref=e128]: tasks + events
+        - generic [ref=e131]: 授权后 sbatch
+        - generic [ref=e134]: 状态事件
+        - generic [ref=e137]: Windows 用户侧
+        - generic [ref=e140]: NeSI / Linux 远端执行侧
+        - generic [ref=e143]: Bridge 控制面
+        - toolbar "语义图例" [ref=e146]:
+          - generic [ref=e147]: 图例
+          - button "检查前端，1 个节点" [ref=e148] [cursor=pointer]:
+            - generic [ref=e151]: 前端
+            - generic [aria-hidden]:
+              - generic: "1"
+          - button "检查后端，3 个节点" [ref=e152] [cursor=pointer]:
+            - generic [ref=e155]: 后端
+            - generic [aria-hidden]:
+              - generic: "3"
+          - button "检查数据库，1 个节点" [ref=e156] [cursor=pointer]:
+            - generic [ref=e159]: 数据库
+            - generic [aria-hidden]:
+              - generic: "1"
+          - button "检查云服务，1 个节点" [ref=e160] [cursor=pointer]:
+            - generic [ref=e163]: 云服务
+            - generic [aria-hidden]:
+              - generic: "1"
+          - button "检查安全，1 个节点" [ref=e164] [cursor=pointer]:
+            - generic [ref=e167]: 安全
+            - generic [aria-hidden]:
+              - generic: "1"
+          - button "检查消息总线，2 个节点" [ref=e168] [cursor=pointer]:
+            - generic [ref=e171]: 消息总线
+            - generic [aria-hidden]:
+              - generic: "2"
+          - button "检查外部系统，2 个节点" [ref=e172] [cursor=pointer]:
+            - generic [ref=e175]: 外部系统
+            - generic [aria-hidden]:
+              - generic: "2"
+      - status [ref=e176]
+      - toolbar "图表视图控制" [ref=e177]:
+        - button "追踪有向路径" [ref=e178] [cursor=pointer]: 路径
+        - button "打开语义雷达" [ref=e179] [cursor=pointer]: 地图
+        - button "打开语义透镜" [ref=e180] [cursor=pointer]: 透镜
+        - button "查找节点" [ref=e181] [cursor=pointer]
+        - button "打开图表指南" [ref=e183] [cursor=pointer]
+        - button "缩小" [disabled] [ref=e185]
+        - button "再次放大以显示标签和注释。重置图表视图" [ref=e187] [cursor=pointer]:
+          - generic [ref=e188]: 100%
+        - button "放大" [ref=e189] [cursor=pointer]
+    - generic [ref=e191]:
+      - generic [ref=e192]:
+        - heading "角色边界" [level=3] [ref=e195]
+        - list [ref=e196]:
+          - listitem [ref=e197]: • Primary Coding Model 编写和审查大部分代码
+          - listitem [ref=e198]: • Linux Agent 贴近环境执行、诊断并做有限小修
+          - listitem [ref=e199]: • Bridge 保存任务事实，不判断科研结论
+      - generic [ref=e200]:
+        - heading "当前与规划" [level=3] [ref=e203]
+        - list [ref=e204]:
+          - listitem [ref=e205]: • v4 已有 CLI、HTTP、SQLite、worker 与多 Agent 路由
+          - listitem [ref=e206]: • Windows Gateway、workflow、events 与 monitor 尚未实现
+          - listitem [ref=e207]: • 虚线报告链代表下一阶段主要开发
+      - generic [ref=e208]:
+        - heading "完成标准" [level=3] [ref=e211]
+        - list [ref=e212]:
+          - listitem [ref=e213]: • 用户无需登录服务器即可完成常规远端执行
+          - listitem [ref=e214]: • 断线后可补收事件，状态变化只通知一次
+          - listitem [ref=e215]: • task、Slurm job、artifact 与科研结果分别取证
+  - status

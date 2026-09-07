@@ -43,7 +43,7 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 │   └── bridge-supervisor.sh        崩溃自动重启循环，screen 里跑这个而不是裸 bridge.py
 ├── sentinel-bridge\
 │   ├── bridge.py                    本地工作副本，与远程部署的版本保持同步
-│   ├── test_bridge.py               pytest 套件（99 个用例，全部 mock 掉 herdr）
+│   ├── test_bridge.py               pytest 套件（101 个用例，全部 mock 掉 herdr）
 │   └── .venv\                       项目专用虚拟环境（miniforge3 的 conda 环境对非管理员只读，装不了包）
 └── docs\superpowers\plans\
     └── 2026-08-30-sentinel-bridge-v2.2-v2.3.md   完整实施计划（18 个任务的详细设计与代码）
@@ -92,13 +92,21 @@ $id = (.\sentinel.ps1 delegate "检查当前 NeSI 项目的 Git 状态，不要�
 
 ```
 queued → running → done
-              ↓        ↑ (missing marker，自动补发一次恢复提示)
+              ↓        ↑ (没写结果文件，自动提醒一次)
            error / orphaned
 ```
 
 - `orphaned`：Sentinel 可能还在继续执行，只是 bridge 等不到完成信号了（例如 `herdr` 调用超时）——**不代表任务失败**，只是状态未知。
-- `error`：任务确认执行失败（herdr 命令本身出错、恢复提示也没等到结果等）。
+- `error`：任务确认执行失败（herdr 命令本身出错、提醒之后仍然没有结果文件等）。
 - bridge 进程重启时，任何还停留在 `running` 的任务会被自动标记为 `orphaned`，绝不会自动重跑（避免危险操作被无意中重复执行）。
+
+### 结果是怎么传回来的
+
+agent **把结果写进一个文件**，bridge 读那个文件——不是从终端里刮文本。路径由 `SENTINEL_RESULT_DIR` 决定（默认在系统临时目录下的 `sentinel-bridge-results/`），每个任务一个 `result-<token>.txt`，读完即删。
+
+之所以不走终端，是实测出来的：`pane.read` 会返回 `truncated: true`，内容里还混着 agent 根本没说过的界面元素（`✻ Brewed for 1s`、`✔ Update installed · Restart to update`、LSP 状态栏等）。而且旧的提取逻辑靠倒着找 `● ` 来定位回复开头，那是 Claude Code 特有的符号，换成 OpenCode 就完全失效、只能退化成「取最后 4000 字符」，把上述噪音连同 prompt 原文一起吞进结果里。文件没有这些问题：不渲染、不换行、不截断、跟 agent 类型无关。完整证据见 [experiments/FINDINGS.md](experiments/FINDINGS.md)。
+
+如果 agent 完成了却没写文件，bridge 会补发一次**只要求写文件**的提醒（明确禁止重新执行任务），仍然没有才判为 `error`，并把终端末尾附在错误信息里供排查——终端读取只在这条失败诊断路径上出现，正常路径完全不碰。
 
 ## 鉴权（可选，默认关闭）
 
@@ -124,6 +132,7 @@ queued → running → done
 | `HERDR_BIN` | `herdr` | herdr 可执行文件路径 |
 | `SENTINEL_AGENT` | `sentinel` | 请求没指定 `agent` 时用哪一个——不是"唯一能用的 agent"，一台主机上可以有多个（`herdr agent list`/`GET /agents` 能看到全部） |
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | 任务队列数据库路径 |
+| `SENTINEL_RESULT_DIR` | 系统临时目录下的 `sentinel-bridge-results/` | agent 写结果文件的目录，bridge 从这里读；必须是 bridge 和 agent 都能访问的路径（同机部署时默认值即可） |
 | `SENTINEL_BRIDGE_TOKEN` | 空 | 鉴权密钥，留空即不启用鉴权 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | `/delegate` 队列里同时允许多少个 `queued` 任务，超过返回 `429` |
 
@@ -208,7 +217,7 @@ cd sentinel-bridge
 .venv/Scripts/python.exe -m pytest test_bridge.py -v
 ```
 
-99 个用例，全部通过 monkeypatch 模拟 `run_herdr`/`get_agent_status`，不需要真实 herdr 或网络。
+101 个用例，全部通过 monkeypatch 模拟 `run_herdr`/`get_agent_status`，不需要真实 herdr 或网络。
 
 ```powershell
 Invoke-Pester -Path .\sentinel.Tests.ps1 -Output Detailed
