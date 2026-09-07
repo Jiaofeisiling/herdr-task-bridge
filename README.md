@@ -38,56 +38,17 @@ Linux Herdr Agent 可以自主编写更适合在 Linux 环境中完成的内容�
 
 ## 目标架构
 
-```mermaid
-flowchart LR
-    U[用户<br/>目标、授权、决策] --> M[Primary Coding Model<br/>Windows ChatGPT / Claude / Cursor]
+[![herdr-task-bridge 目标架构图](docs/diagrams/research-execution-architecture.png)](docs/diagrams/research-execution-architecture.html)
 
-    subgraph W[Windows 用户侧]
-        M <--> G[Windows Gateway<br/>会话适配、隧道、订阅、通知<br/>规划中]
-        G <--> T[SSH Tunnel]
-    end
-
-    subgraph N[NeSI / Linux 远程执行侧]
-        T <--> B[Remote Bridge<br/>HTTP、路由、队列、worker]
-        B <--> D[(Workflow / Task / Event Store<br/>events 规划中)]
-        B --> H[Herdr<br/>持久 Agent 会话管理]
-        H --> A[Linux Herdr Agent<br/>执行、诊断、有限修复]
-        A --> L[Linux Workspace<br/>Git、环境、数据、测试]
-        L --> S[NeSI Slurm<br/>队列、作业、日志、产物]
-        S --> O[Monitor Worker<br/>多层状态监控<br/>规划中]
-        O --> B
-    end
-```
-
-[打开可缩放、可切换主题和导出的交互式架构图](docs/diagrams/research-execution-architecture.html)
+> 点击图片打开可缩放、可切换主题和导出的交互式架构图。
 
 目标架构把控制面和执行面分开：主模型生成执行合同，Gateway/Bridge 负责可靠传输与状态，Herdr agent 负责真实环境执行，Monitor Worker 独立追踪长任务。监控不应长期占用执行 agent。
 
 ## 端到端科研工作流
 
-```mermaid
-flowchart TD
-    U[用户提出科研目标<br/>边界、预算、授权] --> M[Windows 主模型<br/>设计方案并编写主要代码]
-    M --> C[结构化执行合同<br/>目标、目录、commit、权限、验收]
-    C --> A[Linux Herdr Agent<br/>在真实环境检查与执行]
+[![远程科研执行工作流图](docs/diagrams/research-execution-workflow.png)](docs/diagrams/research-execution-workflow.html)
 
-    A --> Q{需要写代码吗？}
-    Q -->|Linux 专属或最小修复| F[在授权范围内修改并验证]
-    F --> A
-    Q -->|核心代码或超出范围| R[报告证据和建议<br/>交回主模型修改]
-    R --> M
-
-    A --> G{昂贵、破坏性、重跑<br/>或科学含义不明确？}
-    G -->|是| P[请求用户授权]
-    P --> A
-    G -->|否/已授权| S[dry-run / TEST_ONLY<br/>必要时唯一正式 Slurm 提交]
-    S --> O[独立监控 task / agent / Slurm / artifacts]
-    O --> E[结构化结果与证据<br/>状态、日志、产物、指标、限制]
-    E --> M
-    M --> Z[向用户给出结论<br/>可说 / 不可说 / 下一步]
-```
-
-[打开可缩放、可切换主题和导出的交互式工作流图](docs/diagrams/research-execution-workflow.html)
+> 点击图片打开可缩放、可切换主题和导出的交互式工作流图。
 
 建议的执行合同至少包含：
 
@@ -198,8 +159,10 @@ Persistent Claude Sentinel (Herdr 管理的终端会话)
 ├── docs\diagrams\
 │   ├── research-execution-architecture.json   目标架构图源规范
 │   ├── research-execution-architecture.html   可交互目标架构图
+│   ├── research-execution-architecture.png    README 内嵌目标架构图
 │   ├── research-execution-workflow.json       工作流图源规范
-│   └── research-execution-workflow.html       可交互端到端工作流图
+│   ├── research-execution-workflow.html       可交互端到端工作流图
+│   └── research-execution-workflow.png        README 内嵌端到端工作流图
 └── docs\superpowers\plans\
     └── 2026-08-30-sentinel-bridge-v2.2-v2.3.md   完整实施计划（18 个任务的详细设计与代码）
 ```
