@@ -11,7 +11,9 @@ param(
         "ready",
         "read",
         "health",
-        "agents"
+        "agents",
+        "quota",
+        "quota-reset"
     )]
     [string]$Command,
 
@@ -164,6 +166,30 @@ switch ($Command) {
 
     "agents" {
         $result = Invoke-SentinelApi -Uri "$BaseUrl/agents"
+        $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
+    }
+
+    "quota" {
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/quota"
+        $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
+    }
+
+    "quota-reset" {
+        $payload = @{}
+        if ($PSBoundParameters.ContainsKey("Agent")) {
+            $payload["agent"] = $Agent
+        }
+
+        $body = $payload | ConvertTo-Json -Compress
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/quota/reset" -Method Post -Body $body
         $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {
@@ -343,6 +369,11 @@ switch ($Command) {
                     }
 
                     exit 2
+                }
+
+                "quota_exhausted" {
+                    Write-Error $task.error_text
+                    exit 3
                 }
 
                 default {

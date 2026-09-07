@@ -13,14 +13,33 @@
 
 set -u
 
-BRIDGE_DIR="$HOME/herdr-task-bridge/sentinel-bridge"
+BRIDGE_ROOT="$HOME/herdr-task-bridge"
+BRIDGE_DIR="$BRIDGE_ROOT/sentinel-bridge"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
+
+# Deployment-specific settings live in an untracked file next to this one
+# (see bridge.env.example). Real HPC project codes, usernames and absolute
+# cluster paths must not be committed -- see CONTRIBUTING.md's "Sensitive
+# paths" -- so anything site-specific belongs there, not in this script.
+# Sourcing it here rather than relying on ~/.bashrc means the settings hold
+# no matter how the supervisor was launched.
+ENV_FILE="$BRIDGE_ROOT/remote/bridge.env"
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+fi
+
 export SENTINEL_AGENT="${SENTINEL_AGENT:-sentinel-opencode}"
+
+if [ -n "${SENTINEL_RESULT_DIR:-}" ]; then
+    export SENTINEL_RESULT_DIR
+    mkdir -p "$SENTINEL_RESULT_DIR" 2>/dev/null || true
+fi
 
 cd "$BRIDGE_DIR" || exit 1
 
 while true; do
-    echo "$(date -Is) starting bridge.py (SENTINEL_AGENT=$SENTINEL_AGENT)" >> "$LOG_FILE"
+    echo "$(date -Is) starting bridge.py (SENTINEL_AGENT=$SENTINEL_AGENT, SENTINEL_RESULT_DIR=${SENTINEL_RESULT_DIR:-<default>})" >> "$LOG_FILE"
 
     python3 bridge.py >> "$LOG_FILE" 2>&1
     exit_code=$?

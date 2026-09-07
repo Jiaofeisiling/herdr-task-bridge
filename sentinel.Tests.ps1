@@ -340,6 +340,30 @@ Describe "wait" {
             $stub.Listener.Stop()
         }
     }
+
+    It "exits 3 when all eligible agents are quota exhausted" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("wait", "t1")
+
+            $req = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true
+                task = @{
+                    status = "quota_exhausted"
+                    error_text = "all eligible fallback agents are quota exhausted"
+                }
+            }
+
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 3
+            $result.StdErr | Should -Match "quota exhausted"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
 }
 
 Describe "agents" {
