@@ -1488,3 +1488,27 @@ def test_missing_result_error_points_at_write_permission(tmp_path, monkeypatch):
     # the work is already done
     assert "权限" in str(exc_info.value) or "permission" in str(exc_info.value).lower()
     assert str(tmp_path) in str(exc_info.value)
+
+
+def test_reminder_is_logged_so_the_hit_rate_is_observable(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "cccccccc-1111-2222-3333-444444444444"
+    prompts = []
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            prompts.append(args[3])
+            if len(prompts) == 2:
+                with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+                    f.write("written on the second ask")
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
+
+    # An agent whose write got denied still succeeds, but it costs a whole
+    # extra prompt. That has to show up somewhere operators can count it,
+    # rather than only being visible by interrogating the agent afterwards.
+    assert "reminder" in capsys.readouterr().out.lower()
