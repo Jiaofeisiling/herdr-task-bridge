@@ -77,14 +77,40 @@ QUOTA_FAILOVER_AGENTS = tuple(
     if name.strip()
 )
 
+# Deliberately biased towards missing a real quota failure rather than
+# inventing one. A match opens a durable circuit that only an operator can
+# clear, so a false positive removes an agent from service until a human
+# notices; a false negative just costs one wasted prompt.
+#
+# What the earlier, looser version got wrong, measured against real text:
+#   - a bare `\b(429|402)\b` matched ordinary HPC output (Slurm job ids,
+#     row counts, file sizes)
+#   - `try again (in|after)`, `billing`, and a bare `rate[ -]?limit` matched
+#     everyday English, including tasks *about* rate limiting
+#   - being English-only, it missed the single real quota failure this
+#     deployment has produced, because the provider proxy reports in Chinese
 QUOTA_ERROR_PATTERN = re.compile(
-    r"(?:\b(?:429|402)\b|rate[ -]?limit(?:ed|ing)?|too many requests|"
-    r"(?:usage|weekly|5[ -]?(?:hour|hours|h)|1[ -]?(?:week|weeks|w))"
-    r"\s+(?:limit|quota)(?:\s+(?:reached|exceeded|exhausted))?|"
-    r"(?:quota|credits?|balance|spend(?:ing)?)[\s_-]*(?:is[\s_-]*)?"
-    r"(?:exceeded|exhausted|insufficient|depleted|too low)|"
-    r"insufficient (?:credits?|balance|funds)|payment required|"
-    r"billing(?: limit)?|try again (?:in|after)|resets? (?:at|in))",
+    "|".join([
+        # HTTP statuses, only where something actually marks them as one
+        r"\b429\b[^\n]{0,24}too many requests",
+        r"too many requests[^\n]{0,24}\b429\b",
+        r"\b402\b[^\n]{0,24}payment required",
+        r"payment required",
+        r"(?:http|https|status|code|error)[^\n]{0,12}\b(?:429|402)\b",
+        # provider quota / credit wording
+        r"insufficient\s+(?:credits?|balance|funds|quota)",
+        r"(?:credits?|balance|quota)\s+(?:exceeded|exhausted|insufficient|depleted|too low)",
+        r"quota\s+(?:exceeded|exhausted|reached)",
+        r"out of credits?",
+        r"rate[ -]?limit(?:ed)?\s+(?:exceeded|reached)",
+        # Anthropic-style usage windows, in either word order
+        r"(?:usage|weekly|daily|5[ -]?hour|1[ -]?week)\s+limit\s+(?:reached|exceeded|exhausted)",
+        r"(?:reached|exceeded)[^\n]{0,24}(?:usage|weekly|daily)\s+limit",
+        # Chinese -- the reference deployment's proxy reports in Chinese
+        r"额度不足", r"余额不足", r"余额不够", r"预扣费额度失败", r"欠费",
+        r"配额(?:不足|已?用尽|超限|耗尽)",
+        r"额度(?:已?用尽|超限|耗尽)",
+    ]),
     re.IGNORECASE,
 )
 
@@ -563,9 +589,21 @@ def read_result_file(task_id, cleanup=True):
     return content or None
 
 
-def quota_error_detail(text):
-    """Return a compact provider error when text looks like a quota failure."""
-    if not text or not QUOTA_ERROR_PATTERN.search(text):
+def quota_error_detail(text, ignore=None):
+    """Return a compact provider error when text looks like a quota failure.
+
+    `ignore` is text the agent merely echoed rather than produced -- the
+    delegated task itself, which the terminal always contains. Without this,
+    a task *about* rate limits reads as the agent having hit one.
+    """
+    if not text:
+        return None
+
+    haystack = text
+    if ignore:
+        haystack = haystack.replace(ignore, " ")
+
+    if not QUOTA_ERROR_PATTERN.search(haystack):
         return None
 
     compact = " ".join(text.strip().split())
@@ -718,7 +756,11 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500)
 
     if response is None:
         terminal_tail = _read_terminal_tail(agent_name, read_lines)
-        detail = quota_error_detail(terminal_tail)
+
+        # `ignore=task`: the terminal echoes the delegated task back, so
+        # without this a task about rate limits would read as the agent
+        # having hit one -- and that would durably circuit-break the agent.
+        detail = quota_error_detail(terminal_tail, ignore=task)
         if detail:
             raise AgentQuotaExhaustedError(
                 agent_name, detail, raw_output=terminal_tail
@@ -759,7 +801,10 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500)
             "allowlist, or point SENTINEL_RESULT_DIR at one that is. The "
             "terminal tail below is attached as diagnostics -- the work may "
             "well have succeeded even though its result was never delivered.",
-            raw_output=terminal_tail,
+            # Re-read rather than reusing the pre-reminder snapshot: when this
+            # error fires, what happened *during* the reminder is the whole
+            # question, and that snapshot predates it.
+            raw_output=_read_terminal_tail(agent_name, read_lines),
         )
 
     return response

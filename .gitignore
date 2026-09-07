@@ -13,6 +13,10 @@ sentinel-bridge/.venv/
 sentinel-bridge/tasks.db
 sentinel-bridge/bridge.log
 
+# Stray logs from editors/tooling that happen to run in this directory
+# (Electron/Chromium drop a debug.log). Never something to version.
+*.log
+
 # Local secrets / environment overrides. SENTINEL_BRIDGE_TOKEN, NESI_SSH_HOST,
 # and any other deployment-specific values belong in environment variables or
 # an untracked local file, never in a committed one. If you create a local

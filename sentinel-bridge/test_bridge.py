@@ -1640,3 +1640,72 @@ def test_quota_endpoints_list_and_reset(live_server, monkeypatch):
     )
     assert status == 200
     assert body["cleared"] == 1
+
+
+# -- quota detection precision ----------------------------------------------
+#
+# A match opens a *durable* circuit in quota_blocks that only an operator can
+# clear, so a false positive takes an agent out of service until a human
+# notices. False negatives merely cost one wasted prompt. The pattern is
+# therefore tuned to prefer misses over mistakes.
+
+
+def test_quota_detection_ignores_bare_status_like_numbers():
+    # 429/402 turn up constantly in ordinary HPC output -- job ids, row
+    # counts, sizes. On their own they say nothing about a provider quota.
+    assert bridge.quota_error_detail(
+        "JOBID PARTITION NAME ST TIME NODES\n429 large train R 1:02:03 4"
+    ) is None
+    assert bridge.quota_error_detail("processed 402 files, 0 errors") is None
+
+
+def test_quota_detection_ignores_ordinary_english_prose():
+    assert bridge.quota_error_detail(
+        "If the node is busy, try again in a few minutes."
+    ) is None
+    assert bridge.quota_error_detail(
+        "Investigate the API rate limit handling in our client code"
+    ) is None
+
+
+def test_quota_detection_recognises_chinese_provider_errors():
+    # The reference deployment's OpenCode proxy reports in Chinese. This is
+    # verbatim the only real quota failure this deployment has produced, and
+    # the original English-only pattern missed it entirely.
+    assert bridge.quota_error_detail(
+        "预扣费额度失败, 用户剩余额度: 0.289294, 需要预扣费额度: 0.311940"
+    )
+    assert bridge.quota_error_detail("API 返回：余额不足，请充值")
+
+
+def test_quota_detection_ignores_the_delegated_task_text():
+    # The terminal echoes the task back, so a task *about* rate limits must
+    # not read as the agent having hit one.
+    task = "排查我们客户端的 rate limit exceeded 处理逻辑"
+    terminal = f"user: {task}\nagent: 好的，我先看看代码"
+
+    assert bridge.quota_error_detail(terminal) is not None  # would false-positive
+    assert bridge.quota_error_detail(terminal, ignore=task) is None
+
+
+def test_missing_result_diagnostics_cover_the_reminder_attempt(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    reads = []
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "read":
+            reads.append(len(reads))
+            return {"ok": True, "stdout": f"terminal state #{len(reads)}", "stderr": ""}
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(bridge.SentinelResultMissingError) as exc_info:
+        bridge.execute_sentinel_task(
+            "sentinel", "dddddddd-1111-2222-3333-444444444444", "task", 60000
+        )
+
+    # The whole question when this error fires is "what happened during the
+    # reminder", so the attached tail has to be read after it, not before.
+    assert "#2" in exc_info.value.raw_output
