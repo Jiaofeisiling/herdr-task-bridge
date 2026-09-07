@@ -22,6 +22,11 @@ sentinel-bridge/bridge.log
 *.local
 *secrets*
 
+# The supervisor's deployment settings -- real cluster paths, project codes
+# and the auth token live here. bridge.env.example (a placeholders-only
+# template) stays tracked; the filled-in copy never does.
+remote/bridge.env
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

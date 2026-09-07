@@ -164,6 +164,7 @@ agent **把结果写进一个文件**，bridge 读那个文件——不是从终
 | `SENTINEL_AGENT` | `sentinel` | 请求没指定 `agent` 时用哪一个——不是"唯一能用的 agent"，一台主机上可以有多个（`herdr agent list`/`GET /agents` 能看到全部） |
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | 任务队列数据库路径 |
 | `SENTINEL_RESULT_DIR` | 系统临时目录下的 `sentinel-bridge-results/` | agent 写结果文件的目录，bridge 从这里读；必须是 bridge 和 agent 都能访问的路径（同机部署时默认值即可） |
+| — | — | 部署侧的实际取值写在 `remote/bridge.env`（不进 git，见 [remote/bridge.env.example](remote/bridge.env.example)），由 `bridge-supervisor.sh` 启动时 source；真实集群路径/项目代码/用户名不要写进任何被跟踪的文件 |
 | `SENTINEL_BRIDGE_TOKEN` | 空 | 鉴权密钥，留空即不启用鉴权 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | `/delegate` 队列里同时允许多少个 `queued` 任务，超过返回 `429` |
 
