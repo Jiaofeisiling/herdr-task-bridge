@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "远程科研执行工作流",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/diagrams/research-execution-workflow.html",
+    "viewBox": [970, 1020],
+    "views": [
+      {
+        "id": "main_flow",
+        "label": "主执行链",
+        "focus": ["user_goal", "primary_model", "execution_contract", "remote_agent", "approval_gate", "slurm_evidence", "user_result"],
+        "note": "从用户目标、主要代码开发到远端验证、Slurm 与证据回传。"
+      },
+      {
+        "id": "repair_boundary",
+        "label": "修复边界",
+        "focus": ["remote_agent", "code_handoff", "primary_model"],
+        "note": "Linux 特有小修由远端处理，核心代码问题交回主模型。"
+      },
+      {
+        "id": "evidence_boundary",
+        "label": "结果边界",
+        "focus": ["slurm_evidence", "user_result"],
+        "note": "提交、运行、产物与科研结论必须分别验证。"
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "user", "label": "用户与授权" },
+    { "id": "windows", "label": "Windows 主模型" },
+    { "id": "bridge", "label": "任务控制面" },
+    { "id": "agent", "label": "Linux Herdr Agent" },
+    { "id": "slurm", "label": "NeSI / Slurm" },
+    { "id": "evidence_lane", "label": "证据与结果" },
+    { "id": "exceptions", "label": "异常与交接", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "define", "label": "定义与开发", "fromCol": 0, "toCol": 1 },
+    { "id": "delegate", "label": "委派与远端验证", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "approve", "label": "授权与收口", "fromCol": 4, "toCol": 5, "variant": "security" }
+  ],
+  "groups": [
+    { "id": "remote_scope", "label": "受控远端执行", "lane": "agent", "fromCol": 3, "toCol": 4, "variant": "emphasis" },
+    { "id": "handoff_scope", "label": "不能在现场安全解决", "lane": "exceptions", "fromCol": 3, "toCol": 4, "variant": "security" }
+  ],
+  "mainPath": ["user_goal", "primary_model", "execution_contract", "remote_agent", "approval_gate", "slurm_evidence", "user_result"],
+  "nodes": [
+    { "id": "user_goal", "lane": "user", "col": 0, "type": "external", "label": "提出科研目标", "sublabel": "边界、预算与预期" },
+    { "id": "approval_gate", "lane": "user", "col": 4, "type": "security", "label": "关键授权", "sublabel": "提交、重跑、破坏性操作", "tag": "默认停止等待" },
+    { "id": "user_result", "lane": "user", "col": 5, "type": "frontend", "label": "最终结论", "sublabel": "可说 / 不可说" },
+    { "id": "primary_model", "lane": "windows", "col": 1, "type": "frontend", "label": "Windows 主模型", "sublabel": "架构与主要代码", "tag": "Primary Coding Model", "width": 128 },
+    { "id": "code_handoff", "lane": "exceptions", "col": 4, "type": "messagebus", "label": "交回主模型", "sublabel": "核心代码与复现证据", "width": 124 },
+    { "id": "execution_contract", "lane": "bridge", "col": 2, "type": "messagebus", "label": "结构化执行合同", "sublabel": "commit、权限、验收", "width": 126 },
+    { "id": "remote_agent", "lane": "agent", "col": 3, "type": "backend", "label": "远端检查与执行", "sublabel": "命令、测试、诊断", "width": 122, "tag": "允许有限现场小修" },
+    { "id": "slurm_evidence", "lane": "slurm", "col": 5, "type": "cloud", "label": "Slurm 与证据", "sublabel": "job、日志、产物" }
+  ],
+  "edges": [
+    { "id": "goal_to_model", "from": "user_goal", "to": "primary_model", "label": "目标与约束", "variant": "emphasis", "role": "main" },
+    { "id": "model_to_contract", "from": "primary_model", "to": "execution_contract", "label": "主要代码 + 执行意图", "variant": "emphasis", "role": "main" },
+    { "id": "contract_to_agent", "from": "execution_contract", "to": "remote_agent", "label": "通过 bridge / herdr", "variant": "emphasis", "role": "main" },
+    { "id": "agent_to_approval", "from": "remote_agent", "to": "approval_gate", "label": "TEST_ONLY 通过", "variant": "security", "role": "main" },
+    { "id": "approval_to_slurm", "from": "approval_gate", "to": "slurm_evidence", "label": "授权一次提交", "variant": "security", "role": "main", "fromSide": "bottom", "toSide": "top", "route": "drop" },
+    { "id": "evidence_to_result", "from": "slurm_evidence", "to": "user_result", "label": "结构化证据", "variant": "emphasis", "role": "return" },
+    { "id": "agent_to_handoff", "from": "remote_agent", "to": "code_handoff", "label": "核心代码或超授权", "variant": "security", "role": "error" },
+    { "id": "handoff_to_model", "from": "code_handoff", "to": "primary_model", "variant": "dashed", "role": "return", "route": "return-left" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "代码所有权",
+      "items": [
+        "Windows 主模型负责编写和审查大部分代码",
+        "Linux Agent 默认执行、诊断与验证",
+        "远端只自主处理 Linux 特有或明确的小修"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "授权边界",
+      "items": [
+        "提交、重跑、取消和破坏性操作必须显式授权",
+        "状态未知时不得自动重试",
+        "主模型与远端 Agent 不同时修改同一工作区"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "证据边界",
+      "items": [
+        "task done 不等于 Slurm completed",
+        "job completed 不等于科研结果有效",
+        "最终报告分别列出 commit、job、日志、产物与指标"
+      ]
+    }
+  ]
+}

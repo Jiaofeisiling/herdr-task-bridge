@@ -9,14 +9,121 @@
 
 English | [简体中文](README.zh-CN.md)
 
-`herdr-task-bridge` lets a Windows PowerShell client delegate work to persistent Herdr agent sessions on a reachable Linux host. It provides synchronous requests, a durable asynchronous queue, per-agent mutual exclusion, and recoverable task status.
+`herdr-task-bridge` is an execution gateway for remote research computing. It lets you work entirely in ChatGPT, Claude, Cursor, or another AI development tool on Windows while the commands, verification, and Slurm work that need a Linux/NeSI environment are carried out by a persistent Herdr agent — without logging into the server for routine operations yourself.
 
-The maintained reference deployment is **Windows ↔ NeSI ↔ Herdr agents**. The bridge is not NeSI-specific: it can be deployed on another HPC system or a rented Linux server when the operator supplies a reachable Linux host, Python 3, the `herdr` CLI, and an appropriate private network or port-forwarding path.
+v4 provides the Windows CLI, the HTTP bridge behind an SSH tunnel, the SQLite asynchronous task queue, multi-agent routing, mutual exclusion, and conservative recovery. The "Target architecture" below also covers the Windows Gateway, event stream, active notification, and dedicated monitoring worker that are **not yet implemented**; this document distinguishes what exists from what is planned.
 
-> [!IMPORTANT]
-> This repository is a bridge, not a cluster-management product. Site-specific SSH, port forwarding, scheduler, authentication, storage, quota, and agent-permission configuration remain the deployer's responsibility. Test any deployment against your own security and data-governance rules before delegating work.
+## What this project is
 
-## What it does
+This is not a thin wrapper around a remote shell, and not two AIs chatting freely. It connects roles with distinct, complementary responsibilities:
+
+- **Windows primary coding model** — the main model you choose; typically ChatGPT on Windows today. It understands the research goal and owns architecture, algorithms, most of the code, cross-file refactoring, review, and PRs.
+- **Linux Herdr agent (remote execution engineer)** — runs commands in the real Linux/NeSI environment, diagnoses environment problems, runs tests and minimal fixes, submits or monitors Slurm work within its authorisation, and returns structured evidence. It is not the default primary code author.
+- **You (owner / approver)** — define goals, budget, and permission boundaries, choose the primary model, and make the final call on anything expensive, destructive, irreversible, or scientifically ambiguous.
+- **Bridge / gateway (control plane)** — reliably delivers execution contracts, persists tasks and events, recovers connections, deduplicates, routes, and notifies. It makes neither the research decisions nor the Linux execution.
+
+A workflow has exactly one primary coding model at a time. ChatGPT, Claude, and Cursor can each serve as the entry point or adapter, but they must not modify the same workspace concurrently without an explicit handover and branch isolation.
+
+### Code ownership boundary
+
+The Linux Herdr agent may independently write what genuinely belongs in the Linux environment: Bash/Slurm scripts, module/conda/CUDA environment glue, diagnostic scripts, and the minimal local fixes needed to get something passing in the real environment. The following stays with the Windows primary model by default: core algorithms, model architecture, data splits, evaluation protocol, public APIs, cross-module refactoring, and most business code.
+
+Every execution contract should choose one coding policy:
+
+| Mode | What the Linux Herdr agent may change |
+|---|---|
+| `no_code_changes` | Read-only inspection and execution; no code modification. |
+| `environment_and_minimal_fix` | Default. Linux-specific glue plus the minimal fixes needed for verification. |
+| `scoped_development` | A bounded piece of development within named files, branches, and acceptance criteria. |
+
+Whichever mode applies, the single-writer rule holds: the Windows primary model and the Linux Herdr agent never edit the same file at the same time. Genuine parallel work uses separate Git branches or worktrees and hands over through commits/PRs.
+
+## Target architecture
+
+[![herdr-task-bridge target architecture](docs/diagrams/research-execution-architecture.png)](docs/diagrams/research-execution-architecture.html)
+
+> Click the image for an interactive diagram with zoom, theme switching, and export.
+
+The target architecture separates the control plane from the execution plane: the primary model produces execution contracts, the gateway/bridge handles reliable delivery and state, the Herdr agent executes in the real environment, and a monitor worker independently tracks long-running jobs. Monitoring should not occupy an execution agent for long stretches.
+
+## End-to-end research workflow
+
+[![remote research execution workflow](docs/diagrams/research-execution-workflow.png)](docs/diagrams/research-execution-workflow.html)
+
+> Click the image for an interactive diagram with zoom, theme switching, and export.
+
+An execution contract should carry at least:
+
+```yaml
+objective: the research or engineering goal
+project: project identifier
+workdir: an explicit working directory on Linux
+expected_git_commit: the expected baseline commit
+allowed_actions: which reads, modifications, installs, submissions or cancellations are permitted
+coding_policy: no_code_changes | environment_and_minimal_fix | scoped_development
+slurm_policy: dry-run only, TEST_ONLY permitted, or a single authorised real submission
+acceptance: machine-checkable acceptance conditions
+reporting: which logs, artifacts, metrics, limitations and evidence to return
+```
+
+## Status and evidence boundaries
+
+These layers must be reported separately. A single `done` must never stand in for all of them:
+
+1. Whether the bridge service is reachable.
+2. Whether the Herdr agent is `idle`, `working`, `done`, or in an error state.
+3. Whether the bridge `task_id` is `queued`, `running`, `done`, `error`, or `orphaned`.
+4. Whether the Slurm `job_id` is queued, running, completed, failed, or cancelled.
+5. Whether logs, checkpoints, tables, and other artifacts exist and are complete.
+6. Whether the metrics, sample counts, configuration, and evaluation protocol actually support a research conclusion.
+
+Therefore: **a bridge task reaching `done` does not mean the Slurm job finished, and Slurm reporting `COMPLETED` does not mean the research result is valid.** `orphaned` only means the bridge lost reliable tracking; the remote action may still be running. Inspect the real effects before doing anything else, and never blindly retry.
+
+Active reporting should use a durable event stream rather than having the Windows side poll a wall of terminal text. The intended design has the remote side write `task_events` transactionally while a Windows gateway uses a cursor-based long poll or subscription: silent while nothing changes, and notifying on `needs_input`, `error`, `orphaned`, completion, or a new artifact. The correlation identifiers are:
+
+```text
+workflow_id → task_id → command_run_id → slurm_job_id → artifact_id
+                                      ↘ event_seq
+```
+
+## When "main development" can be called complete
+
+Not yet. Below is the acceptance checklist from v4 to that point. Only once every blocking item is done **and** verified end to end against a real NeSI environment does this move into a maintenance-and-extension phase.
+
+### Already in place
+
+- [x] Windows PowerShell CLI and HTTP bridge.
+- [x] Persistent SQLite tasks, asynchronous delegation, conservative `orphaned` marking after a restart.
+- [x] Multi-agent discovery, explicit routing, and per-agent mutual exclusion.
+- [x] Synchronous/asynchronous execution, queue depth limits, timeouts, and basic token authentication.
+- [x] Bridge supervisor, deployment aliases, and a pytest/Pester/CI baseline.
+- [x] Documentation of roles, code ownership, target architecture, workflow, and evidence boundaries.
+- [x] **Reliable result extraction** — agents deliver results through a per-task file rather than scraped terminal text, so a backend's terminal rendering (Claude Code vs OpenCode) no longer determines whether a result can be read at all.
+
+### Blocking items for main development
+
+- [ ] **Workflow and execution contracts** — add `workflow_id`, an execution-contract schema, originating client, permission/coding policy, idempotency keys, and correlation IDs.
+- [ ] **Durable event stream** — transactional `task_events`, a monotonic `event_seq`, a cursor/long-poll API, and no missed or duplicated reports across reconnects.
+- [ ] **Windows Gateway** — lift the shared client, SSH tunnel lifecycle, reconnection, subscriptions, and ChatGPT/Claude/Cursor adapters out of a single-shot CLI.
+- [ ] **Active notification** — notify only on completion, failure, an authorisation request, `orphaned`, or important new evidence; deduplicate, stay quiet while nothing changes, and stop automatically at a terminal state.
+- [ ] **Independent monitoring worker** — track bridge tasks, Herdr agents, Slurm jobs, and artifacts separately without occupying an execution agent.
+- [ ] **Slurm safety gate** — built-in static check → dry run → `TEST_ONLY` → a single authorised real submission; record job IDs and never auto-resubmit from an unknown state.
+- [ ] **Structured remote reporting** — support progress, `needs_input`, artifact, metric, warning, and final report rather than relying on terminal text extraction.
+- [ ] **Controlled concurrency and write isolation** — execute asynchronous tasks concurrently per agent, with single-writer or branch/worktree isolation and explicit handover for writes to the same project.
+- [ ] **Secure defaults** — token authentication on by default for production deployments, plus secret management, command/directory allowlists, per-task permissions, and audit records.
+- [ ] **Reproducible evidence bundle** — a final report that always carries the commit, workdir, commands, environment, job/task IDs, log and artifact paths, metric configuration, sample counts, and what may and may not be claimed.
+- [ ] **Real end-to-end acceptance** — covering normal execution, bridge restart, tunnel interruption, duplicate requests, timeout/`orphaned`, authorisation pauses, Slurm success and failure, and notification recovery.
+- [ ] **Release readiness** — install/upgrade/uninstall documentation, compatibility notes, migration scripts, and a stable release/tag verified on real NeSI.
+
+### Extensions that do not block main development
+
+- Web dashboard, mobile notifications, and further UI.
+- Schedulers beyond Slurm, or cloud compute backends.
+- Large file transfer, online artifact preview, and integration with long-term experiment tracking platforms.
+- More primary-model adapters and cross-host federated scheduling.
+
+## Current v4 implementation
+
 
 ```
 Windows PowerShell client (sentinel.ps1)
