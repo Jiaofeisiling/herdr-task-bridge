@@ -198,6 +198,10 @@ Agents return results by writing one file per task under `SENTINEL_RESULT_DIR`; 
 
 The result directory must be writable by both the bridge process and the selected agent. Put it **under the agents' own working directory** (`herdr agent list`, or `GET /agents`, reports each agent's `cwd`). The default falls in the system temp directory, outside that `cwd`, where an agent's permission system — OpenCode's `external_directory` rules, Claude Code's auto-mode classifier — sees an external write and can stall the task after the work is already done. Inside the `cwd` it is an ordinary in-project write. Never weaken an agent's general approval policy merely to collect results; move the directory instead.
 
+### Driving the bridge from an AI session
+
+[`docs/CLIENT_PROMPT.md`](docs/CLIENT_PROMPT.md) is a ready-made system prompt for the AI session on the calling side — endpoints, task states, when to use `/ask` versus `/delegate`, and the operational rules that are not discoverable from the API alone. It deliberately hard-codes no cluster configuration: partition names, QoS limits and quotas are the executing agent's job to determine at run time, not the client's to assert from a machine it cannot see.
+
 ### Active quota failover
 
 The bridge recognises common provider signals such as Claude 5-hour/weekly usage limits, HTTP `429`, OpenCode API `402`, and insufficient API credit or balance. On detection it opens a durable circuit for the failed agent, skips the otherwise normal result-file reminder, and actively tries an eligible alternate agent.
