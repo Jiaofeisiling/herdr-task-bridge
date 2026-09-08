@@ -72,6 +72,37 @@ Read from `herdr api schema --json`, not the docs page:
 - `pane.read` / `pane.close` take `{"pane_id": ...}` (`PaneTarget`).
 - `tab.close` takes `{"tab_id": ...}` (`TabTarget`).
 
+## Does the delegation prompt need to justify itself? — No
+
+Two sentences had accumulated in `build_delegation_prompt`: one asserting
+that only the file is read and terminal output is not, one carving the
+result file out of a task's own "don't modify any files" restriction. Both
+were defended on the grounds that a real agent would otherwise fail. Neither
+claim had been tested. A live A/B against `sentinel-opencode`, driven
+cross-agent, sent two raw prompts with the sentences removed:
+
+| Variant | Task text | Outcome |
+| --- | --- | --- |
+| A | plain probe | wrote the file, no hesitation, one-line sign-off |
+| B | probe + "不要修改任何文件" | spotted the conflict, resolved it unaided, wrote the file |
+
+B's own reasoning, verbatim from its terminal:
+
+> The task says read-only probe, don't modify files, but then says write
+> result to b.txt. The result file itself is the delivery method. Let me run
+> the probe and write to b.txt (delivery file is exempt).
+
+That is the carve-out sentence's exact conclusion, reached without it.
+Neither write drew a permission prompt or an interception.
+
+**Consequence:** both sentences were deleted (379 -> 228 characters). An
+instruction the agent already follows does not need a rationale attached,
+and a rationale is not free — it is tokens on every task, and it invites the
+agent to treat a routine write as a question worth deliberating over. Note
+the sample: one agent (OpenCode), one run per variant. The evidence is
+enough to remove text that was itself never evidenced, not enough to claim
+no model would ever need it.
+
 ## Approaches tried and rejected
 
 - **Prompting the agent that is executing the probe.** Self-referential: it

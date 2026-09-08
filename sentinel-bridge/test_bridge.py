@@ -1459,20 +1459,66 @@ def test_execute_sentinel_task_survives_a_failing_diagnostic_read(tmp_path, monk
         )
 
 
-def test_delegation_prompt_exempts_the_result_file_from_read_only_tasks(tmp_path, monkeypatch):
+def test_delegation_prompt_does_not_explain_itself(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
 
     prompt = bridge.build_delegation_prompt(
         "只读探测，不要修改任何文件", "aaaaaaaa-1111-2222-3333-444444444444"
     )
 
-    # Without this carve-out the prompt contradicts its own task text: the
-    # task says "modify nothing", the contract demands a file write. A real
-    # agent flagged the conflict in its own answer before this was added.
-    assert "不包括" in prompt or "例外" in prompt
+    # The prompt used to carry two justifications: that terminal output is
+    # never read, and that the result file is exempt from a task's own
+    # "don't modify files" restriction. An A/B against a live agent removed
+    # the grounds for both. Without the first, it wrote the file anyway with
+    # no hesitation. Without the second, given a task that did say "don't
+    # modify any files", it spotted the conflict and resolved it unaided --
+    # "The result file itself is the delivery method ... (delivery file is
+    # exempt)" -- reaching the same conclusion the sentence used to state,
+    # then wrote the file. Neither changed behaviour, so both are gone: an
+    # instruction the agent follows does not need a rationale attached.
+    assert "不约束" not in prompt
+    assert "终端" not in prompt
+    assert "交付通道" not in prompt
 
 
-def test_missing_result_error_points_at_write_permission(tmp_path, monkeypatch):
+def test_delegation_prompt_does_not_negotiate_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompt = bridge.build_delegation_prompt(
+        "检查磁盘", "aaaaaaaa-1111-2222-3333-444444444444"
+    )
+
+    # RESULT_DIR used to default to /tmp -- outside the agents' cwd, so every
+    # agent permission system flagged the write, and the prompt grew a
+    # paragraph coaching the agent to retry past its own guardrails. The fix
+    # for that was to move the directory (deployments point SENTINEL_RESULT_DIR
+    # at a path under the agents' cwd), not to keep the coaching. Writing a
+    # file in your own working directory is not a permission event; a prompt
+    # that says otherwise invites the agent to treat it as one.
+    assert "权限" not in prompt
+    assert "拒绝" not in prompt
+    assert "拦" not in prompt
+
+
+def test_prompts_do_not_prescribe_how_to_write_the_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "aaaaaaaa-1111-2222-3333-444444444444"
+    prompts = [
+        bridge.build_delegation_prompt("检查磁盘", task_id),
+        bridge.build_result_reminder_prompt(task_id),
+    ]
+
+    # A prescribed `cat > ... <<EOF` reads as "run a shell command", which is
+    # exactly the shape an auto-approval classifier stops. The agent's own
+    # file-write tool is both simpler and less likely to be interrupted, so
+    # neither prompt should name a mechanism at all.
+    for prompt in prompts:
+        assert "cat >" not in prompt
+        assert "EOF" not in prompt
+
+
+def test_missing_result_error_leads_with_the_likeliest_cause(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
         "ok": True, "stdout": "terminal tail", "stderr": "",
@@ -1483,11 +1529,17 @@ def test_missing_result_error_points_at_write_permission(tmp_path, monkeypatch):
             "sentinel", "bbbbbbbb-1111-2222-3333-444444444444", "task", 60000
         )
 
-    # the most likely cause by far -- agents run under permission systems
-    # that can deny writes outside an allowlist, and the denial lands after
-    # the work is already done
-    assert "权限" in str(exc_info.value) or "permission" in str(exc_info.value).lower()
-    assert str(tmp_path) in str(exc_info.value)
+    message = str(exc_info.value)
+
+    # This message used to open by naming a denied write as "the most likely
+    # cause", which was never measured -- and pointed the reader away from
+    # the one thing that is actually in hand. Send them to the evidence
+    # first and keep the permission angle as a recurrence check; the bridge
+    # cannot tell these cases apart, so it should not rank them.
+    assert "Read the terminal tail below" in message
+    assert str(tmp_path) in message
+    assert "likely cause" not in message
+    assert message.index("terminal tail") < message.index("permission")
 
 
 def test_reminder_is_logged_so_the_hit_rate_is_observable(tmp_path, monkeypatch, capsys):

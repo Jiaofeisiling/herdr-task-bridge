@@ -196,7 +196,7 @@ queued → running → done
 
 agent 会把结果写入 `SENTINEL_RESULT_DIR` 下的一任务一文件；bridge 读出后会删除该文件。这样可避免从终端抓取文本所带来的截断、界面噪声以及对特定 agent 终端格式的依赖。agent 完成却没有写出结果文件时，bridge 只会补发一次“写入结果文件”的窄范围提醒；仍失败才报为 `error`，并保留终端输出用于诊断。
 
-结果目录必须同时可被 bridge 进程与所选 agent 写入。请只授予这一个目录的窄写入权限；不要为了收集结果而削弱 agent 的整体审批策略。
+结果目录必须同时可被 bridge 进程与所选 agent 写入。请把它放在 **agent 自己的工作目录之下**（`herdr agent list` 或 `GET /agents` 会给出每个 agent 的 `cwd`）。默认值落在系统临时目录，位于该 `cwd` 之外，agent 的权限系统（OpenCode 的 `external_directory` 规则、Claude Code 的 auto-mode 分类器）会把它判为外部写入，可能在工作已经做完之后才卡住任务。放在 `cwd` 之内，它就只是一次普通的项目内写入。不要为了收集结果而削弱 agent 的整体审批策略——该移动的是目录。
 
 ### 主动额度故障转移
 
