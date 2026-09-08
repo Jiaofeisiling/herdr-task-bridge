@@ -196,7 +196,7 @@ queued → running → done
 
 Agents return results by writing one file per task under `SENTINEL_RESULT_DIR`; the bridge reads and removes the file. This avoids terminal scraping, truncation, UI noise, and coupling to an agent's terminal format. If the file is missing after an agent finishes, the bridge sends one narrowly scoped reminder to write the result file only. A second failure is reported as `error` with terminal output retained for diagnosis.
 
-The result directory must be writable by both the bridge process and the selected agent. Grant only that narrow write permission; do not weaken an agent's general approval policy merely to collect results.
+The result directory must be writable by both the bridge process and the selected agent. Put it **under the agents' own working directory** (`herdr agent list`, or `GET /agents`, reports each agent's `cwd`). The default falls in the system temp directory, outside that `cwd`, where an agent's permission system — OpenCode's `external_directory` rules, Claude Code's auto-mode classifier — sees an external write and can stall the task after the work is already done. Inside the `cwd` it is an ordinary in-project write. Never weaken an agent's general approval policy merely to collect results; move the directory instead.
 
 ### Active quota failover
 

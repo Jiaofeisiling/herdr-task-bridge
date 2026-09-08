@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 5
+BRIDGE_VERSION = 6
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -671,17 +671,12 @@ def quota_failover_candidates(primary_agent):
 
 def build_result_reminder_prompt(task_id):
     return f"""
-你刚才已经完成了委派的任务，但没有把结果写入约定的文件。
+你刚才那条委派任务已经做完了，但结果没有写进约定的文件。
 
-不要重新执行任务，不要再次运行命令，不要修改任何文件。
+不要重新执行任务，不要再运行任何命令，不要改动任何文件。
 
-请仅根据你刚才已经做完的工作，把最终结果写入：
+只需要把你刚才已经得到的结果写入：
 {result_file_path(task_id)}
-
-写法示例：
-cat > '{result_file_path(task_id)}' <<'SENTINEL_EOF'
-<你刚才的结果>
-SENTINEL_EOF
 """.strip()
 
 
@@ -770,12 +765,12 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500)
         # file -- it already did the work, so this is far cheaper than the old
         # "restate everything" recovery, and it cannot re-run anything.
         #
-        # Logged because this costs a whole extra prompt and the usual cause
-        # is a permission denial on the write, which is otherwise invisible
-        # from the bridge side -- observed live: an agent's first two write
-        # attempts were blocked by its own classifier and only the reminder
-        # got the result out. If this line shows up often, grant the agent
-        # write access to RESULT_DIR instead of paying for it every time.
+        # Logged because it costs a whole extra prompt, and because the hit
+        # rate is the only signal the bridge has about how often results go
+        # missing at all. It fired when RESULT_DIR sat in /tmp, outside the
+        # agents' cwd, where an agent's permission system blocked the write
+        # (observed once, and only the reminder got that result out). If it
+        # starts recurring, check RESULT_DIR has not moved back outside.
         print(
             f"[task {task_id}] no result file after the task prompt, "
             f"sending reminder (agent={agent_name})"
@@ -793,14 +788,13 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500)
         raise SentinelResultMissingError(
             "Sentinel finished but never wrote its result file "
             f"({result_file_path(task_id)}), including after a reminder. "
-            "The most likely cause is that the agent lacks write permission "
-            f"for {RESULT_DIR} -- agents run under their own permission systems "
-            "(OpenCode's external_directory/allowlist rules, Claude Code's "
-            "auto-mode classifier), and a denial lands only after the work "
-            "is already done. Check that directory is on the agent's "
-            "allowlist, or point SENTINEL_RESULT_DIR at one that is. The "
-            "terminal tail below is attached as diagnostics -- the work may "
-            "well have succeeded even though its result was never delivered.",
+            "Read the terminal tail below before re-running anything: the "
+            "work itself may have succeeded and only the delivery was "
+            f"missed. If this recurs, check that {RESULT_DIR} is writable by "
+            "the agent and inside what its own permission system allows "
+            "(OpenCode's external_directory rules, Claude Code's auto-mode "
+            "classifier) -- pointing SENTINEL_RESULT_DIR at a directory "
+            "under the agent's cwd rules that class out.",
             # Re-read rather than reusing the pre-reminder snapshot: when this
             # error fires, what happened *during* the reminder is the whole
             # question, and that snapshot predates it.
@@ -1050,19 +1044,16 @@ def build_delegation_prompt(task, task_id):
     path = result_file_path(task_id)
 
     return f"""
-以下是一个远程委派的任务。
+以下是一条远程委派的任务。
 
-任务：
+===== 任务开始 =====
 {task}
+===== 任务结束 =====
 
-完成后，把最终结果写入这个文件——**只有文件内容会被采集，打印在终端里的内容不会被读取**：
+做完后把结果写入：
 {path}
 
-用你自己最顺手、权限上最不容易被拦的方式写（文件写入工具、重定向、任意方式都行，不指定）。如果某种写法被权限系统拒绝，直接换一种再试，不要就此放弃。
-
-写这个结果文件是交付方式本身，不算"修改文件"：**如果上面的任务要求你不要修改任何文件，那条限制不包括这个结果文件。**
-
-结果里简洁说明做了什么、得到什么；如果涉及 Slurm job、修改了文件、或者被什么卡住了，一并写清楚。注意结果文件会被完整取走，不要把密钥、token 等凭据原文写进去。
+写清楚做了什么、结论是什么、有没有卡住或改动了什么。文件会被整份取走，别写凭据。
 """.strip()
 
 class Handler(BaseHTTPRequestHandler):
