@@ -224,6 +224,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_AGENT` | `sentinel` | Default target agent when none is specified. |
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | SQLite task-queue path. |
 | `SENTINEL_RESULT_DIR` | System temp directory / `sentinel-bridge-results` | Shared directory for agent result files. |
+| `SENTINEL_RESULT_RETENTION_DAYS` | `7` | Age at which the startup sweep deletes uncollected result files. `0` disables it. |
 | `SENTINEL_BRIDGE_TOKEN` | unset | Optional shared-secret authentication token. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |

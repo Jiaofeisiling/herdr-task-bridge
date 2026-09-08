@@ -224,6 +224,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_AGENT` | `sentinel` | 未指定时的默认目标 agent。 |
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | SQLite 任务队列路径。 |
 | `SENTINEL_RESULT_DIR` | 系统临时目录中的 `sentinel-bridge-results` | agent 结果文件共用目录。 |
+| `SENTINEL_RESULT_RETENTION_DAYS` | `7` | 启动清扫删除未被取走结果文件的年龄阈值；`0` 表示关闭。 |
 | `SENTINEL_BRIDGE_TOKEN` | 未设置 | 可选的共享密钥鉴权令牌。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
