@@ -41,7 +41,14 @@ cd "$BRIDGE_DIR" || exit 1
 while true; do
     echo "$(date -Is) starting bridge.py (SENTINEL_AGENT=$SENTINEL_AGENT, SENTINEL_RESULT_DIR=${SENTINEL_RESULT_DIR:-<default>})" >> "$LOG_FILE"
 
-    python3 bridge.py >> "$LOG_FILE" 2>&1
+    # -u is load-bearing. Python block-buffers stdout when it is a file
+    # rather than a TTY, and bridge-restart stops bridge.py with SIGTERM,
+    # whose default handler exits without flushing -- so every startup
+    # banner, request line, reminder and task log sat in an unflushed
+    # buffer and was thrown away. The log held only the two lines this
+    # script echoes itself, which is why a v7 deploy appeared to produce
+    # no startup output at all.
+    python3 -u bridge.py >> "$LOG_FILE" 2>&1
     exit_code=$?
 
     echo "$(date -Is) bridge.py exited (code $exit_code) -- restarting in 5s" >> "$LOG_FILE"
