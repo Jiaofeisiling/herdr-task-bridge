@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 6
+BRIDGE_VERSION = 7
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -43,6 +43,11 @@ RESULT_DIR = os.environ.get(
     "SENTINEL_RESULT_DIR",
     os.path.join(tempfile.gettempdir(), "sentinel-bridge-results"),
 )
+
+# How long an uncollected result file survives before the startup sweep
+# takes it. Only failed deliveries ever reach this age -- a collected file
+# is deleted the moment it is read. 0 disables the sweep.
+RESULT_RETENTION_DAYS = int(os.environ.get("SENTINEL_RESULT_RETENTION_DAYS", "7"))
 
 # Budget for the one reminder sent when the agent finished but never wrote
 # the file. Short on purpose: it only has to write a file it already knows
@@ -563,6 +568,89 @@ class SentinelResultMissingError(RuntimeError):
 def result_file_path(task_id):
     token = task_id.replace("-", "")
     return os.path.join(RESULT_DIR, f"result-{token}.txt")
+
+
+def purge_stale_result_files():
+    """Delete result files nobody came back for. Returns how many went.
+
+    read_result_file() removes a file only once it has read it, so every
+    timeout, orphaned task and failed delivery leaves one behind. Under the
+    system temp dir the OS eventually reclaimed those; deployments now point
+    RESULT_DIR at project storage, which reclaims nothing, so the bridge has
+    to sweep up after itself. Startup is enough -- the leak is slow, and a
+    restart is the one moment when no task can be mid-flight.
+    """
+    if RESULT_RETENTION_DAYS <= 0:
+        return 0
+
+    cutoff = time.time() - RESULT_RETENTION_DAYS * 86400
+    removed = 0
+
+    try:
+        names = os.listdir(RESULT_DIR)
+    except OSError:
+        # Not created yet (first boot), or unreadable. Housekeeping must
+        # never be the reason the bridge fails to start.
+        return 0
+
+    for name in names:
+        # Only files this bridge created. An operator's own notes, or
+        # anything else sharing the directory, is not ours to delete.
+        if not (name.startswith("result-") and name.endswith(".txt")):
+            continue
+
+        path = os.path.join(RESULT_DIR, name)
+
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                continue
+            os.remove(path)
+            removed += 1
+        except OSError:
+            # Raced with a live read, or not ours to remove. Either way the
+            # next restart gets another go.
+            continue
+
+    return removed
+
+
+def result_dir_scope_warning():
+    """Warn when RESULT_DIR sits outside an agent's own working directory.
+
+    That configuration is what made agents' permission systems flag the
+    result write -- and the denial lands *after* the task has run, so it
+    surfaces as an unexplained mid-task stall. Checking it at boot turns a
+    puzzling runtime failure into a line in the startup log. Advisory only:
+    the bridge cannot see an agent's allowlist, just this one common cause.
+    """
+    agents, _ = list_agents()
+
+    if not agents:
+        # herdr not up yet is normal at boot. Don't invent a warning out of
+        # missing information.
+        return None
+
+    result_dir = os.path.abspath(RESULT_DIR)
+    outside = []
+
+    for agent in agents:
+        cwd = agent.get("cwd")
+        if not cwd:
+            continue
+
+        if os.path.commonpath([result_dir, os.path.abspath(cwd)]) != os.path.abspath(cwd):
+            outside.append(agent.get("name") or agent.get("pane_id") or "?")
+
+    if not outside:
+        return None
+
+    return (
+        f"WARNING: {RESULT_DIR} is outside the working directory of: "
+        f"{', '.join(outside)}. Those agents' permission systems may treat "
+        "writing the result file as an external write and block it -- after "
+        "the task has already run, so it looks like an unexplained stall. "
+        "Point SENTINEL_RESULT_DIR at a directory under their cwd."
+    )
 
 
 def read_result_file(task_id, cleanup=True):
@@ -1528,9 +1616,13 @@ if __name__ == "__main__":
     print(f"Database: {DB_PATH}")
     print(f"Listening: http://{HOST}:{PORT}")
 
-    startup_warning = auth_token_warning()
-    if startup_warning:
-        print(startup_warning)
+    swept = purge_stale_result_files()
+    if swept:
+        print(f"Swept {swept} result file(s) older than {RESULT_RETENTION_DAYS}d")
+
+    for startup_warning in (auth_token_warning(), result_dir_scope_warning()):
+        if startup_warning:
+            print(startup_warning)
 
     server = ThreadingHTTPServer(
         (HOST, PORT),

@@ -2,6 +2,7 @@ import sys
 import os
 import re
 import sqlite3
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -1761,3 +1762,120 @@ def test_missing_result_diagnostics_cover_the_reminder_attempt(tmp_path, monkeyp
     # The whole question when this error fires is "what happened during the
     # reminder", so the attached tail has to be read after it, not before.
     assert "#2" in exc_info.value.raw_output
+
+
+# --- stale result files -------------------------------------------------
+#
+# read_result_file() only removes a file it managed to read, so every
+# timeout, orphaned task and delivery failure leaves one behind. That was
+# survivable while RESULT_DIR defaulted under the system temp dir, which
+# the OS eventually reclaims; deployments now point it at project storage,
+# which nothing reclaims. Observed live: two abandoned files, one of them
+# with no surviving record of which task it belonged to.
+
+
+def _age_file(path, days):
+    old = time.time() - days * 86400
+    os.utime(path, (old, old))
+
+
+def test_purge_stale_result_files_removes_only_the_expired_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "RESULT_RETENTION_DAYS", 7)
+
+    fresh = tmp_path / "result-aaaa.txt"
+    stale = tmp_path / "result-bbbb.txt"
+    fresh.write_text("fresh", encoding="utf-8")
+    stale.write_text("stale", encoding="utf-8")
+    _age_file(stale, 8)
+
+    assert bridge.purge_stale_result_files() == 1
+    assert fresh.exists()
+    assert not stale.exists()
+
+
+def test_purge_stale_result_files_ignores_files_it_does_not_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "RESULT_RETENTION_DAYS", 7)
+
+    # An operator's own notes, or another tool's state, must survive -- the
+    # bridge only ever created files matching its own result-*.txt naming.
+    intruder = tmp_path / "notes.txt"
+    intruder.write_text("do not delete", encoding="utf-8")
+    _age_file(intruder, 400)
+
+    assert bridge.purge_stale_result_files() == 0
+    assert intruder.exists()
+
+
+def test_purge_stale_result_files_survives_a_missing_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "not-created-yet"))
+    monkeypatch.setattr(bridge, "RESULT_RETENTION_DAYS", 7)
+
+    # Runs at startup, before the first task creates the directory. A
+    # housekeeping step must never be the reason the bridge fails to boot.
+    assert bridge.purge_stale_result_files() == 0
+
+
+def test_purge_stale_result_files_is_disabled_by_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "RESULT_RETENTION_DAYS", 0)
+
+    stale = tmp_path / "result-cccc.txt"
+    stale.write_text("stale", encoding="utf-8")
+    _age_file(stale, 999)
+
+    assert bridge.purge_stale_result_files() == 0
+    assert stale.exists()
+
+
+# --- result dir vs agent cwd -------------------------------------------
+
+
+def _agent_list(monkeypatch, agents):
+    monkeypatch.setattr(bridge, "list_agents", lambda: (agents, {"ok": True}))
+
+
+def test_result_dir_scope_warning_fires_when_outside_every_agent_cwd(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "somewhere-else"))
+    _agent_list(monkeypatch, [{"name": "a", "cwd": str(tmp_path / "project")}])
+
+    warning = bridge.result_dir_scope_warning()
+
+    # This is the configuration that made agents' permission systems flag
+    # the write, after the work was already done -- the exact "莫名的中断"
+    # this check exists to make visible at boot instead of mid-task.
+    assert warning is not None
+    assert "SENTINEL_RESULT_DIR" in warning
+
+
+def test_result_dir_scope_warning_silent_when_inside_an_agent_cwd(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "project" / "results"))
+    _agent_list(monkeypatch, [{"name": "a", "cwd": str(tmp_path / "project")}])
+
+    assert bridge.result_dir_scope_warning() is None
+
+
+def test_result_dir_scope_warning_names_the_agents_it_is_outside_of(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "one" / "results"))
+    _agent_list(monkeypatch, [
+        {"name": "inside", "cwd": str(tmp_path / "one")},
+        {"name": "outside", "cwd": str(tmp_path / "two")},
+    ])
+
+    warning = bridge.result_dir_scope_warning()
+
+    # Partial coverage is the dangerous case: it works until routing picks
+    # the other agent, so the warning has to name who is affected.
+    assert warning is not None
+    assert "outside" in warning
+    assert "inside" not in warning.replace("outside", "")
+
+
+def test_result_dir_scope_warning_stays_quiet_when_herdr_is_unreachable(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "list_agents", lambda: (None, {"ok": False}))
+
+    # herdr not running yet is normal at boot. An advisory check must not
+    # invent a warning out of missing information.
+    assert bridge.result_dir_scope_warning() is None
