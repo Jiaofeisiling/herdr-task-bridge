@@ -198,6 +198,10 @@ agent 会把结果写入 `SENTINEL_RESULT_DIR` 下的一任务一文件；bridge
 
 结果目录必须同时可被 bridge 进程与所选 agent 写入。请把它放在 **agent 自己的工作目录之下**（`herdr agent list` 或 `GET /agents` 会给出每个 agent 的 `cwd`）。默认值落在系统临时目录，位于该 `cwd` 之外，agent 的权限系统（OpenCode 的 `external_directory` 规则、Claude Code 的 auto-mode 分类器）会把它判为外部写入，可能在工作已经做完之后才卡住任务。放在 `cwd` 之内，它就只是一次普通的项目内写入。不要为了收集结果而削弱 agent 的整体审批策略——该移动的是目录。
 
+### 用 AI 会话驱动 bridge
+
+[`docs/CLIENT_PROMPT.zh-CN.md`](docs/CLIENT_PROMPT.zh-CN.md) 是给调用方 AI 会话用的现成 system prompt：接口、任务状态、何时用 `/ask` 何时用 `/delegate`，以及那些光看 API 无法发现的运维约定。它刻意不写死任何集群配置——分区名、QoS 限额和配额应由执行端 agent 在运行当下查明，而不该由一个看不见那台机器的调用方去断言。
+
 ### 主动额度故障转移
 
 bridge 会识别常见的提供商信号，包括 Claude 的 5 小时/周限额、HTTP `429`、OpenCode API `402`、API credit 或余额不足。识别后，它会为失败 agent 持久化一条额度熔断记录，跳过原本会发送的“写入结果文件”提醒，并主动尝试合资格的备用 agent。
