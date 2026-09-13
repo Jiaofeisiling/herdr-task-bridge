@@ -8,6 +8,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import bridge
 
+# Captured before the autouse fixture below replaces it, for the few
+# tests whose subject *is* list_agents itself.
+_REAL_LIST_AGENTS = bridge.list_agents
+
 
 def compliant_agent(text="ok"):
     """A fake run_herdr that behaves the way the delegation prompt asks a
@@ -306,6 +310,25 @@ def live_server(tmp_path, monkeypatch):
     server.shutdown()
     server.server_close()
     thread.join(timeout=5)
+
+
+@pytest.fixture(autouse=True)
+def _one_agent_running(monkeypatch):
+    """A herdr with at least one agent is the baseline the bridge assumes.
+
+    Since SENTINEL_AGENT became optional, a request that names no agent
+    asks the bridge to pick one, so most endpoints now need a live agent
+    list to answer at all. Stating that once here keeps every unrelated
+    test -- tokens, queue depth, timeouts -- about its own subject.
+
+    Stubbed at list_agents rather than run_herdr on purpose: tests that
+    assert the bridge makes no gratuitous run_herdr calls keep working.
+    """
+    monkeypatch.setattr(
+        bridge,
+        "list_agents",
+        lambda: ([{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}], {"ok": True}),
+    )
 
 
 def _get(port, path):
@@ -1046,6 +1069,7 @@ def test_acquire_agent_for_delegation_does_not_block_a_different_agent(monkeypat
 
 
 def test_agents_endpoint_returns_parsed_list(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "list_agents", _REAL_LIST_AGENTS)
     fake_agents = [
         {"name": "sentinel-opencode", "agent_status": "working", "pane_id": "w1:p3"},
         {"name": "sentinel", "agent_status": "idle", "pane_id": "w1:p9"},
@@ -1065,6 +1089,7 @@ def test_agents_endpoint_returns_parsed_list(live_server, monkeypatch):
 
 
 def test_agents_endpoint_returns_503_on_herdr_failure(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "list_agents", _REAL_LIST_AGENTS)
     monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
         "ok": False, "stdout": "", "stderr": "herdr not reachable",
     })
@@ -1088,8 +1113,10 @@ def test_delegate_stores_explicit_agent(live_server):
 def test_delegate_defaults_agent_when_not_specified(live_server):
     status, body = _post(live_server, "/delegate", {"task": "check disk"})
 
+    # With SENTINEL_AGENT unset the bridge picks a live agent rather than
+    # storing a placeholder name that may never have existed.
     task = bridge.get_task(body["task_id"])
-    assert task["agent"] == bridge.DEFAULT_AGENT
+    assert task["agent"] == "w1:p1"
 
 
 def test_ask_uses_explicit_agent(live_server, tmp_path, monkeypatch):
@@ -1140,7 +1167,7 @@ def test_ready_endpoint_defaults_agent_when_no_query_param(live_server, monkeypa
 
     _get(live_server, "/ready")
 
-    assert seen["agent_name"] == bridge.DEFAULT_AGENT
+    assert seen["agent_name"] == "w1:p1"
 
 
 def test_health_reports_default_agent(live_server, monkeypatch):
@@ -1155,7 +1182,9 @@ def test_health_reports_default_agent(live_server, monkeypatch):
 
 
 def test_delegate_rejects_invalid_agent_names(live_server):
-    for agent_name in (None, "", "   ", ["agent-a"]):
+    # None is deliberately absent: an explicit null now means "no
+    # preference", the same as omitting the field, and the bridge picks.
+    for agent_name in ("", "   ", ["agent-a"]):
         status, body = _post(
             live_server,
             "/delegate",
@@ -1975,3 +2004,65 @@ def test_ready_distinguishes_a_missing_agent_from_an_unreachable_herdr(monkeypat
     assert status == 404
     assert body["reason"] == "agent_not_found"
     assert "sentinel-claude" in json_module.dumps(body, ensure_ascii=False)
+
+
+# --- naming is optional ------------------------------------------------
+#
+# herdr attaches a name to an agent *session*, so it is lost whenever the
+# agent process restarts -- not just when a window is rebuilt. Observed
+# twice within an hour on the reference deployment, the second time
+# without anyone touching the windows at all. A bridge that needs an
+# agent to be named in order to work would therefore need renaming as
+# routine maintenance, which is not a reasonable thing to ask.
+
+
+def test_resolve_agent_picks_one_when_nothing_is_configured(monkeypatch):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+
+    assert bridge.resolve_agent(None) == "w1:p1"
+
+
+def test_resolve_agent_prefers_an_available_agent_when_choosing(monkeypatch):
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "working"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+    ])
+
+    # "Whichever you like" still shouldn't mean "queue behind a busy one".
+    assert bridge.resolve_agent(None) == "w1:p3"
+
+
+def test_resolve_agent_auto_pick_is_deterministic(monkeypatch):
+    # Two equally idle agents: the choice must not wander between calls,
+    # or consecutive tasks land on different agents for no stated reason.
+    agents = [
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+    ]
+    _live(monkeypatch, agents)
+
+    assert bridge.resolve_agent(None) == bridge.resolve_agent(None) == "w1:p1"
+
+
+def test_resolve_agent_says_so_when_nothing_is_running(monkeypatch):
+    _live(monkeypatch, [])
+
+    with pytest.raises(bridge.AgentNotFoundError) as exc_info:
+        bridge.resolve_agent(None)
+
+    assert "no" in str(exc_info.value).lower()
+
+
+def test_agent_not_found_error_does_not_demand_a_name(monkeypatch):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+
+    with pytest.raises(bridge.AgentNotFoundError) as exc_info:
+        bridge.resolve_agent("sentinel-opencode")
+
+    message = str(exc_info.value)
+
+    # The old text told the reader to run `herdr agent rename`, which
+    # reads as "this tool requires named agents". It does not: a pane id
+    # or a runtime family addresses an agent that was never named.
+    assert "rename" not in message
+    assert "w1:p1" in message
