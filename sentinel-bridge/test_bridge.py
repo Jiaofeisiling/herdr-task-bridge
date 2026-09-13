@@ -2066,3 +2066,60 @@ def test_agent_not_found_error_does_not_demand_a_name(monkeypatch):
     # or a runtime family addresses an agent that was never named.
     assert "rename" not in message
     assert "w1:p1" in message
+
+
+def test_prompt_failure_attaches_the_terminal_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "prompt":
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": '{"error":{"code":"agent_blocked","message":'
+                          '"agent w1:p1 is blocked and requires interactive input"}}',
+            }
+        return {"ok": True, "stdout": "Requesting user permission for action", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    with pytest.raises(bridge.SentinelPromptError) as exc_info:
+        bridge._run_herdr_prompt("w1:p1", "prompt", 1000)
+
+    # herdr says only "blocked". *Why* -- a permission request, a plan-mode
+    # gate, a confirmation dialog -- exists solely on the agent's screen,
+    # so a structured status alone cannot tell an operator what to do next.
+    assert "Requesting user permission" in exc_info.value.raw_output
+
+
+def test_worker_records_the_terminal_tail_for_a_blocked_agent(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "get":
+            return {"ok": True, "stdout": json_module.dumps(
+                {"result": {"agent": {"agent_status": "idle"}}}
+            ), "stderr": ""}
+        if args[1] == "prompt":
+            return {"ok": False, "stdout": "", "stderr": '{"error":{"code":"agent_blocked"}}'}
+        return {"ok": True, "stdout": "Requesting user permission for action", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    task_id = bridge.create_task("do something", 1000, "w1:p1")
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+
+    for _ in range(100):
+        if bridge.get_task(task_id)["status"] == "error":
+            break
+        time.sleep(0.05)
+
+    stop.set()
+    worker.join(timeout=5)
+
+    # Without this the operator sees "agent_blocked" and nothing else --
+    # no way to learn it was a permission prompt waiting for a human.
+    assert "Requesting user permission" in bridge.get_task(task_id)["error_text"]

@@ -29,7 +29,15 @@ if [ -f "$ENV_FILE" ]; then
     . "$ENV_FILE"
 fi
 
-export SENTINEL_AGENT="${SENTINEL_AGENT:-sentinel-opencode}"
+# Only pass this on when a deployment actually set one. Defaulting it to
+# a name here silently pinned every deployment to one agent -- and since
+# herdr drops an agent's name when the agent process restarts, that name
+# stops resolving and every request taking the default fails at once.
+# bridge.py treats "unset" as "pick an agent that can take work", which is
+# what this should have been doing all along.
+if [ -n "${SENTINEL_AGENT:-}" ]; then
+    export SENTINEL_AGENT
+fi
 
 if [ -n "${SENTINEL_RESULT_DIR:-}" ]; then
     export SENTINEL_RESULT_DIR
@@ -39,7 +47,7 @@ fi
 cd "$BRIDGE_DIR" || exit 1
 
 while true; do
-    echo "$(date -Is) starting bridge.py (SENTINEL_AGENT=$SENTINEL_AGENT, SENTINEL_RESULT_DIR=${SENTINEL_RESULT_DIR:-<default>})" >> "$LOG_FILE"
+    echo "$(date -Is) starting bridge.py (SENTINEL_AGENT=${SENTINEL_AGENT:-<auto-select>}, SENTINEL_RESULT_DIR=${SENTINEL_RESULT_DIR:-<default>})" >> "$LOG_FILE"
 
     # -u is load-bearing. Python block-buffers stdout when it is a file
     # rather than a TTY, and bridge-restart stops bridge.py with SIGTERM,
