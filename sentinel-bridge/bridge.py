@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 9
+BRIDGE_VERSION = 10
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -651,7 +651,9 @@ def list_agents():
 
 
 class SentinelPromptError(RuntimeError):
-    pass
+    def __init__(self, message, raw_output=""):
+        self.raw_output = raw_output
+        super().__init__(message)
 
 
 class AgentQuotaExhaustedError(SentinelPromptError):
@@ -927,8 +929,15 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False)
                     target, delegated_prompt, timeout_ms, _retrying=True
                 )
 
+        # herdr reports a refusal as a code -- "agent_blocked" -- and
+        # nothing more. Why the agent is blocked (a permission request, a
+        # read-only plan mode, a confirmation dialog) lives only on its
+        # screen, so a structured status alone leaves an operator with no
+        # idea what to do next. This is the case that keeps terminal
+        # reading worth having even though results no longer come from it.
         raise SentinelPromptError(
-            "Herdr prompt command failed: " + result.get("stderr", "")
+            "Herdr prompt command failed: " + result.get("stderr", ""),
+            raw_output=_read_terminal_tail(agent_name, READ_LINES_DEFAULT),
         )
 
     return result
@@ -1228,10 +1237,14 @@ def task_worker(stop_event=None):
             except Exception as e:
                 if claimed:
                     detail = str(e)
-                    if isinstance(e, SentinelResultMissingError) and e.raw_output:
+                    # Any failure carrying a terminal tail gets it attached,
+                    # not just a missing result: a refused prompt says only
+                    # "agent_blocked", and the reason is on the screen.
+                    raw_output = getattr(e, "raw_output", "")
+                    if raw_output:
                         detail += (
                             "\n\nRaw Sentinel output (last 4000 chars):\n"
-                            + e.raw_output
+                            + raw_output
                         )
                     fail_task(task_id, detail)
                     print(f"[task {task_id}] error: {e}")
