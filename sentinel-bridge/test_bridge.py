@@ -1879,3 +1879,99 @@ def test_result_dir_scope_warning_stays_quiet_when_herdr_is_unreachable(tmp_path
     # herdr not running yet is normal at boot. An advisory check must not
     # invent a warning out of missing information.
     assert bridge.result_dir_scope_warning() is None
+
+
+# --- agent identifier resolution ---------------------------------------
+#
+# herdr agent names do not survive a session rebuild, and pane ids shift
+# when panes are recreated. Observed live: an operator restarted the herdr
+# session and rebuilt both agent windows without renaming them, so
+# SENTINEL_AGENT=sentinel-opencode stopped resolving and every call that
+# did not name a pane id explicitly failed -- while /health, /agents and
+# the worker all still looked perfectly healthy.
+
+
+def _live(monkeypatch, agents, ok=True):
+    monkeypatch.setattr(bridge, "list_agents", lambda: (agents if ok else None, {"ok": ok}))
+
+
+def test_resolve_agent_prefers_an_exact_name(monkeypatch):
+    _live(monkeypatch, [
+        {"name": "sentinel-opencode", "agent": "opencode", "pane_id": "w1:p1"},
+    ])
+
+    assert bridge.resolve_agent("sentinel-opencode") == "sentinel-opencode"
+
+
+def test_resolve_agent_accepts_a_pane_id(monkeypatch):
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3"}])
+
+    assert bridge.resolve_agent("w1:p3") == "w1:p3"
+
+
+def test_resolve_agent_falls_back_to_a_unique_runtime_family(monkeypatch):
+    # The repair for the observed outage: SENTINEL_AGENT="opencode" keeps
+    # working across a rebuild, because the family outlives both the name
+    # and the pane id.
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1"},
+        {"agent": "claude", "pane_id": "w1:p3"},
+    ])
+
+    assert bridge.resolve_agent("opencode") == "w1:p1"
+
+
+def test_resolve_agent_refuses_an_ambiguous_family(monkeypatch):
+    # Two candidates means the bridge would be guessing which session gets
+    # the task. Dispatching to the wrong agent is worse than failing.
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1"},
+        {"agent": "opencode", "pane_id": "w1:p5"},
+    ])
+
+    with pytest.raises(bridge.AgentNotFoundError) as exc_info:
+        bridge.resolve_agent("opencode")
+
+    assert "w1:p1" in str(exc_info.value)
+    assert "w1:p5" in str(exc_info.value)
+
+
+def test_agent_not_found_error_lists_what_is_actually_live(monkeypatch):
+    _live(monkeypatch, [
+        {"name": "sentinel-claude", "agent": "claude", "pane_id": "w1:p3"},
+    ])
+
+    with pytest.raises(bridge.AgentNotFoundError) as exc_info:
+        bridge.resolve_agent("sentinel-opencode")
+
+    # The whole failure mode was a caller staring at "unreachable" with no
+    # way to learn what it should have asked for instead.
+    message = str(exc_info.value)
+    assert "sentinel-opencode" in message
+    assert "sentinel-claude" in message
+
+
+def test_resolve_agent_passes_through_when_herdr_is_unreachable(monkeypatch):
+    _live(monkeypatch, None, ok=False)
+
+    # herdr being down is a different failure with a different fix, and it
+    # is not resolve_agent's to diagnose. Hand the name on untouched and
+    # let the herdr call itself report it.
+    assert bridge.resolve_agent("sentinel-opencode") == "sentinel-opencode"
+
+
+def test_ready_distinguishes_a_missing_agent_from_an_unreachable_herdr(monkeypatch, live_server):
+    # herdr answers `agent list` fine; it is only `agent get <stale-name>`
+    # that fails. That combination is exactly what a rebuilt session
+    # produces, and what the old single "unreachable" reason hid.
+    _live(monkeypatch, [{"name": "sentinel-claude", "agent": "claude", "pane_id": "w1:p3"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: (None, {"ok": False}))
+
+    status, body = _get(live_server, "/ready?agent=sentinel-opencode")
+
+    # "sentinel_unreachable" sent a real caller off trying to restore a
+    # channel that was never down: the bridge, herdr and both agents were
+    # all healthy, and only the name had stopped resolving.
+    assert status == 404
+    assert body["reason"] == "agent_not_found"
+    assert "sentinel-claude" in json_module.dumps(body, ensure_ascii=False)

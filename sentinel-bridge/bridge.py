@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 7
+BRIDGE_VERSION = 8
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -485,6 +485,76 @@ def get_agent_lock(agent_name):
         return lock
 
 
+class AgentNotFoundError(RuntimeError):
+    pass
+
+
+def agent_identifiers(agent):
+    """Every string herdr will accept as a target for this agent."""
+    return [v for v in (agent.get("name"), agent.get("pane_id")) if v]
+
+
+def describe_live_agents(agents):
+    return ", ".join(
+        f"{a.get('name') or a.get('pane_id')} ({a.get('agent')})"
+        for a in agents
+    ) or "none"
+
+
+def resolve_agent(identifier):
+    """Map a caller's identifier onto something herdr can address today.
+
+    A herdr agent's name does not survive a session rebuild and its
+    pane_id shifts when panes are recreated. Observed live: an operator
+    restarted the herdr session and rebuilt both agent windows without
+    renaming them, so a configured SENTINEL_AGENT stopped resolving and
+    every call that did not hard-code a pane id failed -- while /health,
+    /agents and the worker all still reported healthy.
+
+    Resolution is deliberately ordered from most to least specific, and
+    stops rather than guesses when a choice would be arbitrary: sending a
+    task to the wrong agent is worse than refusing to send it.
+    """
+    try:
+        agents, _ = list_agents()
+    except Exception:
+        # Missing binary, timeout, anything: same conclusion as an empty
+        # list below.
+        agents = None
+
+    if not agents:
+        # herdr being down is a different failure with a different fix,
+        # and diagnosing it is not this function's job. Pass the name
+        # through and let the herdr call itself report what went wrong.
+        return identifier
+
+    for agent in agents:
+        if identifier in agent_identifiers(agent):
+            return identifier
+
+    # Nothing matched exactly. A runtime family ("opencode", "claude")
+    # outlives both the name and the pane id, so it is the one identifier
+    # a deployment can configure and still have working after a rebuild.
+    family = [a for a in agents if a.get("agent") == identifier]
+
+    if len(family) == 1:
+        return agent_identifiers(family[0])[0]
+
+    if len(family) > 1:
+        raise AgentNotFoundError(
+            f"'{identifier}' matches {len(family)} live agents "
+            f"({', '.join(agent_identifiers(a)[0] for a in family)}). "
+            "Name the one you mean -- the bridge will not pick for you."
+        )
+
+    raise AgentNotFoundError(
+        f"No live herdr agent matches '{identifier}'. Live agents: "
+        f"{describe_live_agents(agents)}. Names are lost when a herdr "
+        "session is rebuilt and pane ids shift when panes are recreated; "
+        "`herdr agent rename <pane_id> <name>` restores a stable name."
+    )
+
+
 def get_agent_status(agent_name):
     result = run_herdr(
         "agent",
@@ -768,7 +838,7 @@ def build_result_reminder_prompt(task_id):
 """.strip()
 
 
-def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms):
+def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False):
     try:
         result = run_herdr(
             "agent",
@@ -793,6 +863,18 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms):
         raise AgentQuotaExhaustedError(agent_name, detail, raw_output=output)
 
     if not result["ok"]:
+        # Delivery failed, so nothing reached an agent and re-sending
+        # cannot double-execute anything. This is the one safe place to
+        # recover from a stale identifier -- and it costs nothing on the
+        # happy path, unlike resolving every request up front.
+        if not _retrying:
+            target = resolve_agent(agent_name)
+
+            if target != agent_name:
+                return _run_herdr_prompt(
+                    target, delegated_prompt, timeout_ms, _retrying=True
+                )
+
         raise SentinelPromptError(
             "Herdr prompt command failed: " + result.get("stderr", "")
         )
@@ -1301,11 +1383,35 @@ class Handler(BaseHTTPRequestHandler):
             )
 
             if agent_status is None:
+                # Only now is it worth asking herdr what is actually live.
+                # The old code reported every failure here as
+                # "sentinel_unreachable", which sent a real caller off
+                # trying to restore a channel that was never down: the
+                # bridge, herdr and both agents were healthy, and only a
+                # rebuilt session's lost name had stopped resolving.
+                try:
+                    target = resolve_agent(agent_name)
+                except AgentNotFoundError as e:
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "ready": False,
+                            "reason": "agent_not_found",
+                            "error": str(e),
+                        },
+                        404,
+                    )
+                    return
+
+                if target != agent_name:
+                    agent_status, status_result = get_agent_status(target)
+
+            if agent_status is None:
                 self.send_json(
                     {
                         "ok": False,
                         "ready": False,
-                        "reason": "sentinel_unreachable",
+                        "reason": "herdr_unreachable",
                     },
                     503,
                 )
