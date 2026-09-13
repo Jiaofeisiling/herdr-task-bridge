@@ -225,7 +225,7 @@ sentinel quota-reset -Agent "your-agent-name"
 |---|---|---|
 | `SENTINEL_BRIDGE_PORT` | `8765` | 监听端口。 |
 | `HERDR_BIN` | `herdr` | Herdr 可执行文件路径。 |
-| `SENTINEL_AGENT` | `sentinel` | 未指定时的默认目标 agent。 |
+| `SENTINEL_AGENT` | 未设置（自动选择） | 固定默认目标 agent；不设置则由 bridge 自动挑选一个可接活的 agent。 |
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | SQLite 任务队列路径。 |
 | `SENTINEL_RESULT_DIR` | 系统临时目录中的 `sentinel-bridge-results` | agent 结果文件共用目录。 |
 | `SENTINEL_RESULT_RETENTION_DAYS` | `7` | 启动清扫删除未被取走结果文件的年龄阈值；`0` 表示关闭。 |

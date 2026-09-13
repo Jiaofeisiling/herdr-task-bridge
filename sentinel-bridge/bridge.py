@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 8
+BRIDGE_VERSION = 9
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -25,7 +25,13 @@ HERDR = os.environ.get("HERDR_BIN", "herdr")
 # agent any more -- herdr can host several concurrent agent sessions on
 # one host (see /agents, and the `agent` field on /ask, /prompt,
 # /delegate), this is just what a caller gets if it doesn't pick one.
-DEFAULT_AGENT = os.environ.get("SENTINEL_AGENT", "sentinel")
+# Unset means "pick an available agent", not a literal agent called
+# "sentinel". Pinning a deployment to one name was the old default and it
+# ages badly: herdr drops an agent's name when the agent process restarts,
+# so the configured name stops resolving and every request that took the
+# default fails at once. Leave this unset unless a deployment genuinely
+# needs one specific agent.
+DEFAULT_AGENT = os.environ.get("SENTINEL_AGENT") or None
 
 AUTH_TOKEN = os.environ.get("SENTINEL_BRIDGE_TOKEN", "")
 
@@ -141,6 +147,11 @@ def validate_read_lines(read_lines):
 
 
 def validate_agent_name(agent_name):
+    if agent_name is None:
+        # "No preference" is a legitimate request, not a malformed one:
+        # resolve_agent() turns it into whichever agent can take work.
+        return None
+
     if not isinstance(agent_name, str):
         raise ValueError("agent must be a string")
 
@@ -489,6 +500,16 @@ class AgentNotFoundError(RuntimeError):
     pass
 
 
+def agent_or_auto(agent_name):
+    """Resolve only when there is nothing to resolve from.
+
+    A concrete identifier is passed through untouched so the happy path
+    never pays for an extra `herdr agent list`; resolution of a stale one
+    happens later, at the point where it has actually failed.
+    """
+    return agent_name if agent_name else resolve_agent(None)
+
+
 def agent_identifiers(agent):
     """Every string herdr will accept as a target for this agent."""
     return [v for v in (agent.get("name"), agent.get("pane_id")) if v]
@@ -522,6 +543,30 @@ def resolve_agent(identifier):
         # list below.
         agents = None
 
+    if not identifier:
+        # Nothing configured and nothing asked for. Naming an agent is
+        # optional -- herdr drops a name whenever the agent process
+        # restarts, so a bridge that required one would make renaming a
+        # routine chore -- and "any of them" is a perfectly good answer
+        # when the caller expressed no preference.
+        if not agents:
+            raise AgentNotFoundError(
+                "No herdr agents are running, so there is nothing to "
+                "delegate to. Start one and try again."
+            )
+
+        # Prefer an agent that can start work now, and break ties by a
+        # stable key so consecutive defaults don't wander between agents
+        # for no reason the caller can see.
+        pick = min(
+            agents,
+            key=lambda a: (
+                a.get("agent_status") not in AVAILABLE_STATES,
+                agent_identifiers(a)[0],
+            ),
+        )
+        return agent_identifiers(pick)[0]
+
     if not agents:
         # herdr being down is a different failure with a different fix,
         # and diagnosing it is not this function's job. Pass the name
@@ -549,9 +594,10 @@ def resolve_agent(identifier):
 
     raise AgentNotFoundError(
         f"No live herdr agent matches '{identifier}'. Live agents: "
-        f"{describe_live_agents(agents)}. Names are lost when a herdr "
-        "session is rebuilt and pane ids shift when panes are recreated; "
-        "`herdr agent rename <pane_id> <name>` restores a stable name."
+        f"{describe_live_agents(agents)}. Naming an agent is optional and "
+        "a name does not survive the agent process restarting -- address "
+        "one by pane id, by runtime family (opencode, claude), or leave "
+        "the agent unset to let the bridge pick an available one."
     )
 
 
@@ -868,7 +914,13 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False)
         # recover from a stale identifier -- and it costs nothing on the
         # happy path, unlike resolving every request up front.
         if not _retrying:
-            target = resolve_agent(agent_name)
+            try:
+                target = resolve_agent(agent_name)
+            except AgentNotFoundError:
+                # Resolution is here to recover, not to reinterpret. If it
+                # cannot help, the prompt failure is still the fact worth
+                # reporting -- masking it would hide herdr's own message.
+                target = agent_name
 
             if target != agent_name:
                 return _run_herdr_prompt(
@@ -1259,7 +1311,9 @@ class Handler(BaseHTTPRequestHandler):
     def query_agent_name(self):
         query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
         values = query.get("agent")
-        return validate_agent_name(values[0] if values else DEFAULT_AGENT)
+        return agent_or_auto(
+            validate_agent_name(values[0] if values else DEFAULT_AGENT)
+        )
 
     def query_read_lines(self):
         query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
@@ -1491,9 +1545,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json()
 
                 task = body["task"].strip()
-                agent_name = validate_agent_name(
+                agent_name = agent_or_auto(validate_agent_name(
                     body.get("agent", DEFAULT_AGENT)
-                )
+                ))
 
                 timeout_ms = validate_timeout_ms(int(
                     body.get(
@@ -1572,9 +1626,9 @@ class Handler(BaseHTTPRequestHandler):
             body = self.read_json()
 
             task = body["task"].strip()
-            agent_name = validate_agent_name(
+            agent_name = agent_or_auto(validate_agent_name(
                 body.get("agent", DEFAULT_AGENT)
-            )
+            ))
 
             timeout_ms = validate_timeout_ms(int(
                 body.get("timeout_ms", 120000)

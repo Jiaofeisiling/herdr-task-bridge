@@ -225,7 +225,7 @@ The remote service reads the following environment variables:
 |---|---|---|
 | `SENTINEL_BRIDGE_PORT` | `8765` | Listening port. |
 | `HERDR_BIN` | `herdr` | Path to the Herdr executable. |
-| `SENTINEL_AGENT` | `sentinel` | Default target agent when none is specified. |
+| `SENTINEL_AGENT` | unset (auto-select) | Pins the default target agent. Unset lets the bridge pick one that can take work. |
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | SQLite task-queue path. |
 | `SENTINEL_RESULT_DIR` | System temp directory / `sentinel-bridge-results` | Shared directory for agent result files. |
 | `SENTINEL_RESULT_RETENTION_DAYS` | `7` | Age at which the startup sweep deletes uncollected result files. `0` disables it. |
