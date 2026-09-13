@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 10
+BRIDGE_VERSION = 11
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -501,13 +501,19 @@ class AgentNotFoundError(RuntimeError):
 
 
 def agent_or_auto(agent_name):
-    """Resolve only when there is nothing to resolve from.
+    """Settle on a real target before anything downstream uses the name.
 
-    A concrete identifier is passed through untouched so the happy path
-    never pays for an extra `herdr agent list`; resolution of a stale one
-    happens later, at the point where it has actually failed.
+    This used to resolve lazily -- pass a concrete identifier straight
+    through, and only consult herdr once something had failed -- to save a
+    subprocess on the happy path. That optimisation cost more than it
+    saved: resolution ended up on the paths that *report* status and
+    absent from the one that *dispatches work*, so a runtime family name
+    answered /ready and then failed /ask with "unable to query Sentinel
+    status". Resolving once, here, is what makes the identifier the same
+    everywhere it matters: the lock key, the prompt target, and the agent
+    recorded against the task.
     """
-    return agent_name if agent_name else resolve_agent(None)
+    return resolve_agent(agent_name)
 
 
 def agent_identifiers(agent):
@@ -1362,6 +1368,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             self._do_GET()
+        except AgentNotFoundError as e:
+            # Not a server fault: the caller named something that is not
+            # running. Say which, so they can correct it in one step.
+            self.send_json(
+                {"ok": False, "reason": "agent_not_found", "error": str(e)},
+                404,
+            )
         except Exception as e:
             self.send_json(
                 {"ok": False, "error": f"internal error: {e}"},
@@ -1540,6 +1553,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self._do_POST()
+        except AgentNotFoundError as e:
+            # Not a server fault: the caller named something that is not
+            # running. Say which, so they can correct it in one step.
+            self.send_json(
+                {"ok": False, "reason": "agent_not_found", "error": str(e)},
+                404,
+            )
         except Exception as e:
             self.send_json(
                 {"ok": False, "error": f"internal error: {e}"},
@@ -1558,9 +1578,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json()
 
                 task = body["task"].strip()
-                agent_name = agent_or_auto(validate_agent_name(
+                agent_name = validate_agent_name(
                     body.get("agent", DEFAULT_AGENT)
-                ))
+                )
 
                 timeout_ms = validate_timeout_ms(int(
                     body.get(
@@ -1579,6 +1599,15 @@ class Handler(BaseHTTPRequestHandler):
                         "error": f"invalid request: {e}",
                     },
                     400,
+                )
+                return
+
+            try:
+                agent_name = agent_or_auto(agent_name)
+            except AgentNotFoundError as e:
+                self.send_json(
+                    {"ok": False, "reason": "agent_not_found", "error": str(e)},
+                    404,
                 )
                 return
 
@@ -1639,9 +1668,9 @@ class Handler(BaseHTTPRequestHandler):
             body = self.read_json()
 
             task = body["task"].strip()
-            agent_name = agent_or_auto(validate_agent_name(
+            agent_name = validate_agent_name(
                 body.get("agent", DEFAULT_AGENT)
-            ))
+            )
 
             timeout_ms = validate_timeout_ms(int(
                 body.get("timeout_ms", 120000)
@@ -1661,6 +1690,15 @@ class Handler(BaseHTTPRequestHandler):
                     "error": f"invalid request: {e}",
                 },
                 400,
+            )
+            return
+
+        try:
+            agent_name = agent_or_auto(agent_name)
+        except AgentNotFoundError as e:
+            self.send_json(
+                {"ok": False, "reason": "agent_not_found", "error": str(e)},
+                404,
             )
             return
 

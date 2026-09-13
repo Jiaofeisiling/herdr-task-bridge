@@ -1100,7 +1100,8 @@ def test_agents_endpoint_returns_503_on_herdr_failure(live_server, monkeypatch):
     assert body["ok"] is False
 
 
-def test_delegate_stores_explicit_agent(live_server):
+def test_delegate_stores_explicit_agent(live_server, monkeypatch):
+    _live(monkeypatch, [{"name": "agent-a", "agent": "opencode", "agent_status": "idle"}])
     status, body = _post(
         live_server, "/delegate", {"task": "check disk", "agent": "agent-a"}
     )
@@ -1120,6 +1121,7 @@ def test_delegate_defaults_agent_when_not_specified(live_server):
 
 
 def test_ask_uses_explicit_agent(live_server, tmp_path, monkeypatch):
+    _live(monkeypatch, [{"name": "agent-a", "agent": "opencode", "agent_status": "idle"}])
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
@@ -1142,6 +1144,7 @@ def test_ask_uses_explicit_agent(live_server, tmp_path, monkeypatch):
 
 
 def test_ready_endpoint_respects_agent_query_param(live_server, monkeypatch):
+    _live(monkeypatch, [{"name": "agent-a", "agent": "opencode", "agent_status": "idle"}])
     seen = {}
 
     def fake_get_agent_status(agent_name):
@@ -1227,6 +1230,7 @@ def test_ready_rejects_blank_agent_query_without_touching_herdr(live_server, mon
 
 
 def test_read_accepts_lines_query(live_server, monkeypatch):
+    _live(monkeypatch, [{"name": "agent-a", "agent": "opencode", "agent_status": "idle"}])
     calls = []
 
     def fake_run_herdr(*args, **kwargs):
@@ -2123,3 +2127,50 @@ def test_worker_records_the_terminal_tail_for_a_blocked_agent(tmp_path, monkeypa
     # Without this the operator sees "agent_blocked" and nothing else --
     # no way to learn it was a permission prompt waiting for a human.
     assert "Requesting user permission" in bridge.get_task(task_id)["error_text"]
+
+
+def test_ask_resolves_a_runtime_family_like_ready_does(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    targets = []
+    writes_result = compliant_agent("done")
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "get":
+            # herdr only knows the pane id; the family name means nothing
+            # to it, which is exactly how the outage presented.
+            if args[2] != "w1:p1":
+                return {"ok": False, "stdout": "", "stderr": "no such agent"}
+            return {"ok": True, "stdout": json_module.dumps(
+                {"result": {"agent": {"agent_status": "idle"}}}
+            ), "stderr": ""}
+        if args[1] == "prompt":
+            targets.append(args[2])
+        return writes_result(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    status, body = _post(
+        live_server, "/ask", {"task": "do something", "agent": "opencode"}
+    )
+
+    # /ready resolved this identifier while /ask did not, because
+    # resolution had been bolted onto two paths and the one that actually
+    # dispatches work was not among them.
+    assert status == 200
+    assert targets == ["w1:p1"]
+
+
+def test_ask_reports_a_missing_agent_as_such(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "stdout": "", "stderr": "no such agent",
+    })
+
+    status, body = _post(
+        live_server, "/ask", {"task": "do something", "agent": "sentinel-opencode"}
+    )
+
+    # "unable_to_query_sentinel" reads as a broken channel and sent a real
+    # caller into a retry loop against a bridge that was working fine.
+    assert status == 404
+    assert body["reason"] == "agent_not_found"
