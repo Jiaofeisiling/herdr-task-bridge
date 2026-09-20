@@ -4,6 +4,8 @@ import re
 import sqlite3
 import time
 
+from datetime import datetime as datetime_module, timezone as datetime_module_tz, timedelta as datetime_module_delta
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 import bridge
@@ -2174,3 +2176,107 @@ def test_ask_reports_a_missing_agent_as_such(live_server, monkeypatch):
     # caller into a retry loop against a bridge that was working fine.
     assert status == 404
     assert body["reason"] == "agent_not_found"
+
+
+# --- quota circuits expire on their own --------------------------------
+#
+# A quota limit is a temporary condition with a known end: the provider
+# text that trips the circuit routinely states it ("You've hit your
+# session limit · resets 4:20pm"). Modelling that as a latch only an
+# operator can release meant a recovered agent stayed unusable until
+# someone noticed -- observed live, with the agent reporting idle and
+# every dispatch to it answered 429 from a circuit hours old.
+
+
+def test_quota_block_expires_after_its_ttl(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "QUOTA_BLOCK_TTL_SECONDS", 3600)
+
+    bridge.mark_agent_quota_blocked("w1:p3", "session limit")
+
+    stale = (
+        datetime_module.now(datetime_module_tz.utc)
+        - datetime_module_delta(seconds=7200)
+    ).isoformat()
+    with bridge.db_session() as conn:
+        conn.execute(
+            "UPDATE quota_blocks SET detected_at = ? WHERE agent = ?",
+            (stale, "w1:p3"),
+        )
+
+    assert bridge.get_agent_quota_block("w1:p3") is None
+
+
+def test_quota_block_holds_inside_its_ttl(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "QUOTA_BLOCK_TTL_SECONDS", 3600)
+
+    bridge.mark_agent_quota_blocked("w1:p3", "session limit")
+
+    assert bridge.get_agent_quota_block("w1:p3") is not None
+
+
+def test_expired_quota_blocks_disappear_from_the_listing(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "QUOTA_BLOCK_TTL_SECONDS", 3600)
+
+    bridge.mark_agent_quota_blocked("w1:p1", "fresh")
+    bridge.mark_agent_quota_blocked("w1:p3", "stale")
+
+    stale = (
+        datetime_module.now(datetime_module_tz.utc)
+        - datetime_module_delta(seconds=7200)
+    ).isoformat()
+    with bridge.db_session() as conn:
+        conn.execute(
+            "UPDATE quota_blocks SET detected_at = ? WHERE agent = ?",
+            (stale, "w1:p3"),
+        )
+
+    # /quota is what an operator reads to decide whether to intervene, so
+    # it must not show a circuit that no longer blocks anything.
+    listed = [b["agent"] for b in bridge.list_agent_quota_blocks()]
+    assert listed == ["w1:p1"]
+
+
+def test_ready_reports_a_quota_blocked_agent_as_not_ready(live_server, tmp_path, monkeypatch):
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    bridge.mark_agent_quota_blocked("w1:p3", "session limit")
+
+    status, body = _get(live_server, "/ready?agent=w1:p3")
+
+    # herdr says idle, so the old /ready said ready -- and the dispatch
+    # that followed was refused 429 by the circuit. A readiness check that
+    # disagrees with what dispatch will do is worse than no check.
+    assert body["ready"] is False
+    assert body["reason"] == "quota_blocked"
+
+
+def test_failover_candidates_work_for_unnamed_agents(monkeypatch):
+    _live(monkeypatch, [
+        {"agent": "claude", "pane_id": "w1:p3"},
+        {"agent": "opencode", "pane_id": "w1:p1"},
+    ])
+
+    # Keyed on name, this returned nothing at all once herdr dropped the
+    # names -- so a quota-exhausted agent reported "all eligible fallback
+    # agents are quota-blocked" while a healthy one sat idle beside it.
+    assert bridge.quota_failover_candidates("w1:p3") == ["w1:p1"]
+
+
+def test_quota_detail_keeps_the_evidence_not_the_screen(tmp_path, monkeypatch):
+    screen = (
+        "任务：访问 /nesi/project/secret-cohort/predictions 并核验 schema\n"
+        + "noise\n" * 200
+        + "You've hit your session limit - resets 4:20pm"
+    )
+
+    detail = bridge.quota_error_detail(screen)
+
+    # The detail is surfaced by /quota. Storing a trailing slab of the
+    # terminal put the delegated task -- paths, dataset names -- into an
+    # endpoint whose job is to report a provider error.
+    assert "hit your session limit" in detail
+    assert "secret-cohort" not in detail
+    assert len(detail) < 400
