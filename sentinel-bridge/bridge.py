@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 11
+BRIDGE_VERSION = 12
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -78,10 +78,22 @@ AGENT_NAME_MAX_LENGTH = 200
 # stuck". Override via env var for deployments that need a different limit.
 MAX_QUEUE_DEPTH = int(os.environ.get("SENTINEL_MAX_QUEUE_DEPTH", "50"))
 
-# A quota/balance failure belongs to the model provider, not Herdr. Keep a
-# durable circuit per agent so the queue immediately uses a different runtime
-# instead of repeatedly spending requests on an account that cannot answer.
-# Operators clear a circuit explicitly after the provider reset/recharge.
+# A quota/balance failure belongs to the model provider, not Herdr. Open a
+# circuit per agent so the queue immediately uses a different runtime instead
+# of repeatedly spending requests on an account that cannot answer.
+#
+# The circuit expires on its own because the condition does: providers state
+# a reset time in the very text that trips it ("resets 4:20pm"). This was
+# originally a latch only an operator could release, which left a recovered
+# agent unusable until somebody noticed -- observed live, with the agent
+# reporting idle and every dispatch refused by a circuit hours old.
+#
+# The default is short because the costs are asymmetric. Expiring too early
+# wastes one prompt and re-opens the circuit; expiring too late takes an
+# agent out of service for no reason. quota-reset still clears one early.
+QUOTA_BLOCK_TTL_SECONDS = int(
+    os.environ.get("SENTINEL_QUOTA_BLOCK_TTL_SECONDS", "3600")
+)
 QUOTA_FAILOVER_AGENTS = tuple(
     name.strip()
     for name in os.environ.get("SENTINEL_QUOTA_FAILOVER_AGENTS", "").split(",")
@@ -117,6 +129,11 @@ QUOTA_ERROR_PATTERN = re.compile(
         # Anthropic-style usage windows, in either word order
         r"(?:usage|weekly|daily|5[ -]?hour|1[ -]?week)\s+limit\s+(?:reached|exceeded|exhausted)",
         r"(?:reached|exceeded)[^\n]{0,24}(?:usage|weekly|daily)\s+limit",
+        # "You've hit your session limit - resets 4:20pm". The live circuit
+        # that stranded an agent only tripped because the same screen also
+        # said "Usage limit reached"; this wording on its own was invisible.
+        # "hit your" is required so the bare word "session" cannot match.
+        r"hit your (?:session|usage|weekly|daily|5[ -]?hour) limit",
         # Chinese -- the reference deployment's proxy reports in Chinese
         r"额度不足", r"余额不足", r"余额不够", r"预扣费额度失败", r"欠费",
         r"配额(?:不足|已?用尽|超限|耗尽)",
@@ -443,13 +460,40 @@ def mark_agent_quota_blocked(agent_name, detail):
         """, (agent_name, now_iso(), detail))
 
 
+def _quota_block_expired(block):
+    if QUOTA_BLOCK_TTL_SECONDS <= 0:
+        return False
+
+    try:
+        detected = datetime.fromisoformat(block["detected_at"])
+    except (TypeError, ValueError):
+        # An unreadable timestamp cannot be aged, and a circuit that can
+        # never expire is the failure this TTL exists to prevent. Treat it
+        # as expired so the agent comes back into service.
+        return True
+
+    age = (datetime.now(timezone.utc) - detected).total_seconds()
+    return age >= QUOTA_BLOCK_TTL_SECONDS
+
+
 def get_agent_quota_block(agent_name):
     with db_session() as conn:
         row = conn.execute(
             "SELECT * FROM quota_blocks WHERE agent = ?", (agent_name,)
         ).fetchone()
 
-    return dict(row) if row else None
+    if row is None:
+        return None
+
+    block = dict(row)
+
+    if _quota_block_expired(block):
+        # Drop it rather than just ignoring it, so /quota, the worker and
+        # the failover path cannot disagree about whether it still holds.
+        clear_agent_quota_blocks(agent_name)
+        return None
+
+    return block
 
 
 def list_agent_quota_blocks():
@@ -458,7 +502,15 @@ def list_agent_quota_blocks():
             "SELECT * FROM quota_blocks ORDER BY detected_at DESC"
         ).fetchall()
 
-    return [dict(row) for row in rows]
+    live = []
+    for row in rows:
+        block = dict(row)
+        if _quota_block_expired(block):
+            clear_agent_quota_blocks(block["agent"])
+            continue
+        live.append(block)
+
+    return live
 
 
 def clear_agent_quota_blocks(agent_name=None):
@@ -818,8 +870,15 @@ def quota_error_detail(text, ignore=None):
     if not QUOTA_ERROR_PATTERN.search(haystack):
         return None
 
-    compact = " ".join(text.strip().split())
-    return compact[-1000:] or "provider reported a quota or balance failure"
+    # Keep the matched evidence and a little context around it, not a
+    # trailing slab of the terminal. /quota surfaces this detail, and the
+    # terminal always contains the delegated task -- paths, dataset names
+    # -- which has no business in an endpoint that reports provider errors.
+    match = QUOTA_ERROR_PATTERN.search(haystack)
+    window = haystack[max(0, match.start() - 80):match.end() + 80]
+    compact = " ".join(window.split())
+
+    return compact or "provider reported a quota or balance failure"
 
 
 def _agent_runtime_family(agent):
@@ -851,28 +910,45 @@ def quota_failover_candidates(primary_agent):
             list_result.get("error", "unable to discover fallback agents")
         )
 
-    by_name = {
-        agent.get("name"): agent
-        for agent in agents
-        if isinstance(agent, dict) and agent.get("name")
-    }
-    primary_family = _agent_runtime_family(by_name.get(primary_agent, {}))
+    # Keyed on whatever herdr will actually accept as a target, not on
+    # name: herdr drops an agent's name when the agent process restarts,
+    # and keying on it meant an all-unnamed host produced no candidates at
+    # all -- so a quota-exhausted agent reported "all eligible fallback
+    # agents are quota-blocked" while a healthy one sat idle beside it.
+    by_id = {}
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        for identifier in agent_identifiers(agent):
+            by_id.setdefault(identifier, agent)
+
+    primary_family = _agent_runtime_family(by_id.get(primary_agent, {}))
 
     if QUOTA_FAILOVER_AGENTS:
         names = QUOTA_FAILOVER_AGENTS
     else:
-        names = tuple(by_name)
+        # One entry per agent, not one per identifier, or an agent with
+        # both a name and a pane id would be offered as two candidates.
+        seen = set()
+        names = []
+        for agent in agents:
+            if not isinstance(agent, dict):
+                continue
+            identifiers = agent_identifiers(agent)
+            if identifiers and id(agent) not in seen:
+                seen.add(id(agent))
+                names.append(identifiers[0])
 
     candidates = []
     for name in names:
-        if name == primary_agent or name not in by_name:
+        if name == primary_agent or name not in by_id:
             continue
 
         # A configured allowlist is an operator's explicit decision to use
         # these sessions. Discovery mode is stricter and insists on a
         # different runtime family before it can switch automatically.
         if not QUOTA_FAILOVER_AGENTS:
-            family = _agent_runtime_family(by_name[name])
+            family = _agent_runtime_family(by_id[name])
             if not primary_family or not family or family == primary_family:
                 continue
 
@@ -1458,6 +1534,22 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/ready":
+            # A readiness check that disagrees with what dispatch will do
+            # is worse than no check. herdr happily reports a quota-blocked
+            # agent as idle, so /ready used to answer ready:true and the
+            # dispatch that followed was refused 429 by the circuit.
+            quota_block = get_agent_quota_block(agent_name)
+
+            if quota_block:
+                self.send_json({
+                    "ok": True,
+                    "ready": False,
+                    "reason": "quota_blocked",
+                    "detected_at": quota_block["detected_at"],
+                    "detail": quota_block["detail"],
+                })
+                return
+
             agent_status, status_result = get_agent_status(
                 agent_name
             )
