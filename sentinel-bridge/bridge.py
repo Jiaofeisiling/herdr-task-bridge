@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 13
+BRIDGE_VERSION = 14
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -493,6 +493,15 @@ def _quota_block_expired(block):
         # as expired so the agent comes back into service.
         return True
 
+    if detected.tzinfo is None:
+        # fromisoformat() accepts a stamp with no offset, but subtracting
+        # one from an aware datetime raises TypeError -- which used to
+        # escape this function entirely, taking /ready, the worker's
+        # dispatch and quota failover down with it. now_iso() writes UTC,
+        # so reading a bare stamp as UTC ages it correctly instead of
+        # crashing or discarding a circuit that is still valid.
+        detected = detected.replace(tzinfo=timezone.utc)
+
     age = (datetime.now(timezone.utc) - detected).total_seconds()
     return age >= QUOTA_BLOCK_TTL_SECONDS
 
@@ -658,8 +667,27 @@ def resolve_agent(identifier):
         # that can actually take the work, and a stable key breaks the
         # remaining ties so consecutive defaults don't wander between
         # agents for no reason the caller can see.
+        # Only entries herdr gave an address to are candidates. An entry
+        # with neither a name nor a pane id cannot be prompted, and
+        # indexing its empty identifier list used to raise IndexError from
+        # inside the sort key -- which took auto-select down completely,
+        # failing every request that named no agent. The same filter is
+        # already applied in quota_failover_candidates(); applying it in
+        # only one of the two left them disagreeing about what an agent is.
+        addressable = [
+            agent for agent in agents
+            if isinstance(agent, dict) and agent_identifiers(agent)
+        ]
+
+        if not addressable:
+            raise AgentNotFoundError(
+                f"{len(agents)} herdr agent(s) are running, but none has a "
+                "name or a pane id to address it by, so none can be given "
+                "work. Check `herdr agent list`."
+            )
+
         pick = min(
-            agents,
+            addressable,
             key=lambda a: (
                 a.get("agent_status") not in AVAILABLE_STATES,
                 agent_priority_rank(a),

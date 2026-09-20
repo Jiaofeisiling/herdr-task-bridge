@@ -2346,3 +2346,86 @@ def test_failover_candidates_follow_the_configured_priority(monkeypatch):
     # A quota failover is exactly when cost order matters most: the
     # primary is gone and the bridge is choosing what to pay for next.
     assert bridge.quota_failover_candidates("w1:p3") == ["w1:p1", "w1:p5"]
+
+
+# --- robustness against data the bridge did not write itself -----------
+#
+# Every severe outage in this project so far has had the same shape: one
+# unexpected value in a field, and a whole path stops working. These
+# cover the remaining places where the bridge trusts input it does not
+# control -- herdr's JSON, and rows that may predate the current writer.
+
+
+def test_quota_block_survives_a_timestamp_without_a_timezone(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "QUOTA_BLOCK_TTL_SECONDS", 3600)
+
+    bridge.mark_agent_quota_blocked("w1:p3", "session limit")
+    with bridge.db_session() as conn:
+        # Parses fine, but cannot be subtracted from an aware datetime.
+        # The guard around the parse did not cover the arithmetic, so this
+        # raised TypeError straight out of the expiry check -- and that
+        # check sits on /ready, the worker's dispatch and quota failover.
+        fresh_naive = (
+            datetime_module.now(datetime_module_tz.utc)
+            .replace(tzinfo=None)
+            .isoformat()
+        )
+        conn.execute(
+            "UPDATE quota_blocks SET detected_at = ? WHERE agent = ?",
+            (fresh_naive, "w1:p3"),
+        )
+
+    block = bridge.get_agent_quota_block("w1:p3")
+
+    # Treated as UTC, which is what now_iso() writes, so a naive stamp is
+    # aged correctly rather than crashing or being discarded outright.
+    assert block is not None
+
+
+def test_quota_block_with_a_naive_stamp_still_expires(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "QUOTA_BLOCK_TTL_SECONDS", 3600)
+
+    bridge.mark_agent_quota_blocked("w1:p3", "session limit")
+    stale = (
+        datetime_module.now(datetime_module_tz.utc)
+        - datetime_module_delta(seconds=7200)
+    ).replace(tzinfo=None).isoformat()
+    with bridge.db_session() as conn:
+        conn.execute(
+            "UPDATE quota_blocks SET detected_at = ? WHERE agent = ?",
+            (stale, "w1:p3"),
+        )
+
+    assert bridge.get_agent_quota_block("w1:p3") is None
+
+
+def test_auto_pick_skips_agents_with_no_usable_identifier(monkeypatch):
+    _live(monkeypatch, [
+        {"agent": "ghost", "agent_status": "idle"},        # no name, no pane_id
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+    ])
+
+    # agent_identifiers() returns [] for the first entry, and indexing it
+    # raised IndexError from inside the sort key -- taking down auto-select
+    # entirely, so every request that named no agent failed at once.
+    assert bridge.resolve_agent(None) == "w1:p1"
+
+
+def test_auto_pick_ignores_malformed_entries(monkeypatch):
+    _live(monkeypatch, [
+        "not-a-dict",
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+    ])
+
+    # quota_failover_candidates() already guarded against this; selection
+    # did not, so the two disagreed about what counts as an agent.
+    assert bridge.resolve_agent(None) == "w1:p1"
+
+
+def test_resolve_reports_clearly_when_no_agent_is_addressable(monkeypatch):
+    _live(monkeypatch, [{"agent": "ghost", "agent_status": "idle"}])
+
+    with pytest.raises(bridge.AgentNotFoundError):
+        bridge.resolve_agent(None)

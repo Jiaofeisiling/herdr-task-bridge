@@ -135,11 +135,23 @@ def main():
     identifiers = []
     families = set()
     for agent in agents:
+        # Guarded because this reads whatever herdr reported, not anything
+        # this script produced. The same assumption -- every entry is a
+        # dict with an identifier -- was a live crash in the bridge's own
+        # agent selection, so it does not get to reappear in the tool
+        # written to catch such things.
+        if not isinstance(agent, dict):
+            continue
         identifier = agent.get("name") or agent.get("pane_id")
         if identifier:
             identifiers.append(identifier)
         if agent.get("agent"):
             families.add(agent["agent"])
+
+    if not identifiers:
+        print("\nAgents are running but none has a name or a pane id, so "
+              "none can be addressed. Check `herdr agent list` on the host.")
+        return 2
 
     print(f"  agents: {', '.join(identifiers)}")
     print(f"  families: {', '.join(sorted(families))}\n")
