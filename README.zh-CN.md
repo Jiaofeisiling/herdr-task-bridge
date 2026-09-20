@@ -251,6 +251,16 @@ bridge-deploy    # 拉取并重启
 bridge-status    # 检查 screen、进程、health 与日志
 ```
 
+部署完成后，对运行中的 bridge 做一次实机验证：
+
+```bash
+python scripts/smoke.py
+```
+
+它会先检查通道，通道不健康时拒绝执行后续功能检查——因为通道中断时每一项都会失败，而这些失败没有一个是关于 bridge 的。退出码：`0` 全部通过，`1` 有功能检查失败，`2` 通道或 agent 不可用、未得出任何结论。
+
+三种通道状态会被区别报告，因为它们需要不同的处理：连接被拒表示没有任何东西在监听；能连上却始终不回应表示本地端口转发还在、但它通往主机的链路已断——这种"半死"状态最容易被误判成 bridge 故障，因为端口看上去完好；能收到回应则表示 bridge 在正常应答，此时下面的任何失败才真正属于它自己。
+
 supervisor 会保留 `screen` 会话，并将重启日志写到 `sentinel-bridge/bridge.log`；不要在 `screen` 中直接运行 `bridge.py`。迁移到其他 HPC 或 Linux 服务器时，只需要按本站情况调整部署细节：clone 位置、服务守护方式、私有连接、环境文件和 agent 权限。bridge 的 API 与安全约定不变。
 
 Windows 端可选地在 PowerShell profile 中加载 [`sentinel.profile.ps1`](sentinel.profile.ps1)，以便在任何目录直接使用 `sentinel`：
