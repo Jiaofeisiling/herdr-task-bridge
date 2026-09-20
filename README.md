@@ -251,6 +251,16 @@ bridge-deploy    # pull and restart
 bridge-status    # inspect screen, process, health, and logs
 ```
 
+After deploying, verify against the running bridge:
+
+```bash
+python scripts/smoke.py
+```
+
+It checks the channel before anything else and refuses to run the functional checks when the channel is unhealthy, because during an outage every one of them fails and none of those failures is about the bridge. Exit codes: `0` all passed, `1` a functional check failed, `2` the channel or the agents are unavailable so nothing was concluded.
+
+Three channel states are reported differently, because they want different fixes: connection refused means nothing is listening; connecting but never replying means the local port forward is alive while its path to the host is gone, which is easy to mistake for a broken bridge since the port still exists; a reply means the bridge is answering and any failure below is genuinely its own.
+
 The supervisor preserves a `screen` session and logs restarts to `sentinel-bridge/bridge.log`; do not run `bridge.py` directly in `screen`. For another HPC system or Linux server, adapt only the deployment details (clone location, service supervisor, private connectivity, environment file, and agent permissions). The bridge API and its safety contract remain the same.
 
 On Windows, optionally load [`sentinel.profile.ps1`](sentinel.profile.ps1) from your PowerShell profile to use `sentinel` from any directory:
