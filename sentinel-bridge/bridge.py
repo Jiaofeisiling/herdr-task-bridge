@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 12
+BRIDGE_VERSION = 13
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -97,6 +97,27 @@ QUOTA_BLOCK_TTL_SECONDS = int(
 QUOTA_FAILOVER_AGENTS = tuple(
     name.strip()
     for name in os.environ.get("SENTINEL_QUOTA_FAILOVER_AGENTS", "").split(",")
+    if name.strip()
+)
+
+# Ordered cost preference, cheapest first, matched against an agent's name
+# or its runtime family. Selection otherwise breaks ties on a stable
+# identifier, which makes the cheapest agent win only by coincidence of
+# sort order.
+#
+# The bridge cannot work this order out for itself: whether a backend is
+# a prepaid subscription or metered per token is a billing arrangement,
+# not something herdr reports. A subscription's quota is already paid for
+# whether it is used or not, so it usually belongs first.
+#
+# Deliberately not time-aware. Metered providers do vary price by hour --
+# DeepSeek bills peak 01:00-04:00 and 06:00-10:00 UTC on weekdays at
+# double its off-peak rate as of 2026-09 -- but a schedule baked in here
+# would go stale silently, and it changes no decision while only one
+# metered backend exists: a subscription outranks it at every hour.
+AGENT_PRIORITY = tuple(
+    name.strip().lower()
+    for name in os.environ.get("SENTINEL_AGENT_PRIORITY", "").split(",")
     if name.strip()
 )
 
@@ -568,6 +589,24 @@ def agent_or_auto(agent_name):
     return resolve_agent(agent_name)
 
 
+def agent_priority_rank(agent):
+    """Position in the operator's cost order; unlisted agents sort last."""
+    if not AGENT_PRIORITY:
+        return 0
+
+    haystack = [
+        str(value).lower()
+        for value in (*agent_identifiers(agent), agent.get("agent"))
+        if value
+    ]
+
+    for rank, wanted in enumerate(AGENT_PRIORITY):
+        if any(wanted in value for value in haystack):
+            return rank
+
+    return len(AGENT_PRIORITY)
+
+
 def agent_identifiers(agent):
     """Every string herdr will accept as a target for this agent."""
     return [v for v in (agent.get("name"), agent.get("pane_id")) if v]
@@ -613,13 +652,17 @@ def resolve_agent(identifier):
                 "delegate to. Start one and try again."
             )
 
-        # Prefer an agent that can start work now, and break ties by a
-        # stable key so consecutive defaults don't wander between agents
-        # for no reason the caller can see.
+        # Being able to start now outranks being cheap: there is no
+        # queue-and-wait path here, so preferring a busy agent would just
+        # return 409 to the caller. Cost order decides among the agents
+        # that can actually take the work, and a stable key breaks the
+        # remaining ties so consecutive defaults don't wander between
+        # agents for no reason the caller can see.
         pick = min(
             agents,
             key=lambda a: (
                 a.get("agent_status") not in AVAILABLE_STATES,
+                agent_priority_rank(a),
                 agent_identifiers(a)[0],
             ),
         )
@@ -954,7 +997,13 @@ def quota_failover_candidates(primary_agent):
 
         candidates.append(name)
 
-    return candidates
+    if QUOTA_FAILOVER_AGENTS:
+        # An explicit allowlist is already an ordered operator decision.
+        return candidates
+
+    # A quota failover is when cost order matters most: the primary is
+    # gone and the bridge is choosing what to pay for next.
+    return sorted(candidates, key=lambda name: agent_priority_rank(by_id[name]))
 
 
 def build_result_reminder_prompt(task_id):

@@ -232,6 +232,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_BRIDGE_TOKEN` | 未设置 | 可选的共享密钥鉴权令牌。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
+| `SENTINEL_AGENT_PRIORITY` | 未设置 | 成本偏好顺序，便宜的在前；按 agent 名或运行时家族匹配。只对当前能接活的 agent 排序。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 
 将 [`remote/bridge.env.example`](remote/bridge.env.example) 复制为未追踪的 `remote/bridge.env`，再填写部署专用配置。绝不要提交真实主机名、项目标识、路径、用户名、任务提示词或令牌；项目的敏感信息规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。

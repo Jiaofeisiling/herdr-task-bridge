@@ -2280,3 +2280,69 @@ def test_quota_detail_keeps_the_evidence_not_the_screen(tmp_path, monkeypatch):
     assert "hit your session limit" in detail
     assert "secret-cohort" not in detail
     assert len(detail) < 400
+
+
+# --- cost-ordered agent selection --------------------------------------
+#
+# Selection had no notion of cost: it broke ties on a stable identifier,
+# which meant the cheapest agent won only by coincidence of sort order.
+# A subscription's quota is already paid for whether it is used or not,
+# while a metered API bills per token, so the operator's ordering is a
+# real cost lever -- and one only they can state, since the bridge cannot
+# see anyone's billing arrangement.
+
+
+def test_auto_pick_follows_the_configured_priority(monkeypatch):
+    monkeypatch.setattr(bridge, "AGENT_PRIORITY", ("claude", "opencode"))
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+    ])
+
+    # Without priority this returned w1:p1 purely because it sorts first.
+    assert bridge.resolve_agent(None) == "w1:p3"
+
+
+def test_priority_never_outranks_being_able_to_take_work(monkeypatch):
+    monkeypatch.setattr(bridge, "AGENT_PRIORITY", ("claude", "opencode"))
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "working"},
+    ])
+
+    # Waiting has a cost too, and the bridge has no queue-and-wait path:
+    # preferring a busy agent would just return 409 to the caller.
+    assert bridge.resolve_agent(None) == "w1:p1"
+
+
+def test_unlisted_agents_sort_after_listed_ones(monkeypatch):
+    monkeypatch.setattr(bridge, "AGENT_PRIORITY", ("claude",))
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+    ])
+
+    assert bridge.resolve_agent(None) == "w1:p3"
+
+
+def test_selection_is_unchanged_when_no_priority_is_configured(monkeypatch):
+    monkeypatch.setattr(bridge, "AGENT_PRIORITY", ())
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+    ])
+
+    assert bridge.resolve_agent(None) == "w1:p1"
+
+
+def test_failover_candidates_follow_the_configured_priority(monkeypatch):
+    monkeypatch.setattr(bridge, "AGENT_PRIORITY", ("claude", "opencode", "gemini"))
+    _live(monkeypatch, [
+        {"agent": "gemini", "pane_id": "w1:p5"},
+        {"agent": "opencode", "pane_id": "w1:p1"},
+        {"agent": "claude", "pane_id": "w1:p3"},
+    ])
+
+    # A quota failover is exactly when cost order matters most: the
+    # primary is gone and the bridge is choosing what to pay for next.
+    assert bridge.quota_failover_candidates("w1:p3") == ["w1:p1", "w1:p5"]
