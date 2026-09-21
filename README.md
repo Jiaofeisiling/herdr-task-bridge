@@ -194,6 +194,10 @@ queued → running → done
 - `quota_exhausted` means every eligible fallback was also quota-blocked or reported a quota/balance failure. The task was not retried after that result.
 - On restart, a task that was `running` becomes `orphaned`. The bridge never reruns it automatically.
 
+While a task runs, `GET /tasks/<id>` also carries a `progress` field, and `wait` prints each new line as it appears. An agent may append to a per-task progress file — a job ID it just got, which step it is on, where it is stuck — using the same channel as the result. It is **optional**: an agent that reports nothing has done nothing wrong, and progress is a convenience for the operator rather than a second contract that can fail a task. The file is removed when the task reaches a terminal state, and the startup sweep collects any left by a task that was killed mid-flight.
+
+Progress travels the file channel rather than the terminal on purpose. Terminal reads truncate, carry TUI chrome, and were measured showing an autocomplete suggestion that a caller read as live work.
+
 Agents return results by writing one file per task under `SENTINEL_RESULT_DIR`; the bridge reads and removes the file. This avoids terminal scraping, truncation, UI noise, and coupling to an agent's terminal format. If the file is missing after an agent finishes, the bridge sends one narrowly scoped reminder to write the result file only. A second failure is reported as `error` with terminal output retained for diagnosis.
 
 The result directory must be writable by both the bridge process and the selected agent. Put it **under the agents' own working directory** (`herdr agent list`, or `GET /agents`, reports each agent's `cwd`). The default falls in the system temp directory, outside that `cwd`, where an agent's permission system — OpenCode's `external_directory` rules, Claude Code's auto-mode classifier — sees an external write and can stall the task after the work is already done. Inside the `cwd` it is an ordinary in-project write. Never weaken an agent's general approval policy merely to collect results; move the directory instead.

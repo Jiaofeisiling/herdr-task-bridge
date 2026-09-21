@@ -343,6 +343,13 @@ switch ($Command) {
             exit 1
         }
 
+        # Progress already shown, so each poll only prints what is new.
+        # Written to stderr, not stdout: stdout carries the result and
+        # may be piped somewhere. Write-Host looked like it would do --
+        # until a test running the script as a child process showed the
+        # progress landing in the captured stdout alongside the result.
+        $shownProgress = ""
+
         while ($true) {
             try {
                 $response = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$taskId"
@@ -366,6 +373,27 @@ switch ($Command) {
                 }
 
                 "running" {
+                    if ($task.progress -and $task.progress -ne $shownProgress) {
+                        # Normally an append, so print the tail. Not
+                        # assumed though: an agent that rewrites the file
+                        # instead would otherwise blow up Substring, and
+                        # guessing the shape of data we do not produce is
+                        # how several bugs in this repo started.
+                        if ($shownProgress -and $task.progress.StartsWith($shownProgress)) {
+                            $fresh = $task.progress.Substring($shownProgress.Length)
+                        }
+                        else {
+                            $fresh = $task.progress
+                        }
+
+                        $fresh = $fresh.Trim()
+                        if ($fresh) {
+                            [Console]::Error.WriteLine($fresh)
+                        }
+
+                        $shownProgress = $task.progress
+                    }
+
                     Start-Sleep -Seconds 3
                 }
 

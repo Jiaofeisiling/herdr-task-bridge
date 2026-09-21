@@ -2641,3 +2641,95 @@ def test_read_still_answers_when_the_status_lookup_fails(live_server, monkeypatc
     assert status == 200
     assert body["stdout"] == "terminal text"
     assert body["agent_status"] is None
+
+
+# --- progress while a task is still running ----------------------------
+#
+# Between /delegate returning a task_id and the result arriving, a caller
+# could see nothing at all. For a Slurm job that is most of the elapsed
+# time. The terminal is not an option: it truncates, carries TUI chrome,
+# and was measured showing an autocomplete suggestion that a caller read
+# as live work. So progress travels the same file channel as the result,
+# which has a day of production use behind it -- but appended as it
+# happens, and optional, because progress is a convenience for the
+# operator rather than another contract the agent must satisfy.
+
+
+def test_progress_file_is_separate_from_the_result_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = "aaaaaaaa-1111-2222-3333-444444444444"
+
+    assert bridge.progress_file_path(task_id) != bridge.result_file_path(task_id)
+
+
+def test_reading_progress_leaves_the_file_in_place(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = "aaaaaaaa-1111-2222-3333-444444444444"
+
+    with open(bridge.progress_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write("submitted job 9213894\n")
+
+    assert "9213894" in bridge.read_progress_file(task_id)
+    # Unlike the result, this is read repeatedly while the task runs.
+    assert "9213894" in bridge.read_progress_file(task_id)
+
+
+def test_missing_progress_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    # An agent that never reports progress has done nothing wrong.
+    assert bridge.read_progress_file("aaaaaaaa-1111-2222-3333-444444444444") is None
+
+
+def test_task_query_exposes_progress_while_running(tmp_path, monkeypatch, live_server):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("跑训练", 60000, "w1:p1")
+    bridge.claim_task(task_id)
+    with open(bridge.progress_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write("submitted job 9213894, queued\n")
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    assert body["task"]["progress"] == "submitted job 9213894, queued"
+
+
+def test_delegation_prompt_offers_the_progress_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = "aaaaaaaa-1111-2222-3333-444444444444"
+
+    prompt = bridge.build_delegation_prompt("跑训练", task_id)
+
+    assert bridge.progress_file_path(task_id) in prompt
+    # Phrased as an option. Making it a requirement would turn a
+    # convenience into a second thing that can fail a task.
+    assert "可选" in prompt
+
+
+def test_progress_file_is_removed_once_the_task_finishes(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    _fresh_db(tmp_path, monkeypatch)
+
+    task_id = bridge.create_task("x", 60000, "w1:p1")
+    path = bridge.progress_file_path(task_id)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("working\n")
+
+    bridge.complete_task(task_id, "done")
+
+    # Otherwise every finished task leaves one behind, which is the leak
+    # the result-file sweep already had to be built for.
+    assert not os.path.exists(path)
+
+
+def test_sweep_also_collects_stale_progress_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "RESULT_RETENTION_DAYS", 7)
+
+    stale = tmp_path / "progress-bbbb.txt"
+    stale.write_text("orphaned mid-task", encoding="utf-8")
+    _age_file(stale, 8)
+
+    assert bridge.purge_stale_result_files() == 1
+    assert not stale.exists()
