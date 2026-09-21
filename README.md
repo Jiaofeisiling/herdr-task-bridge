@@ -107,7 +107,7 @@ Not yet. Below is the acceptance checklist from v4 to that point. Only once ever
 - [ ] **Windows Gateway** — lift the shared client, SSH tunnel lifecycle, reconnection, subscriptions, and ChatGPT/Claude/Cursor adapters out of a single-shot CLI.
 - [ ] **Active notification** — notify only on completion, failure, an authorisation request, `orphaned`, or important new evidence; deduplicate, stay quiet while nothing changes, and stop automatically at a terminal state.
 - [ ] **Independent monitoring worker** — track bridge tasks, Herdr agents, Slurm jobs, and artifacts separately without occupying an execution agent.
-- [x] **Slurm safety gate** — a per-task policy (`dry_run_only` / `test_only` / `authorised_submit`) stated in the prompt and recorded against the task, job IDs requested in every result, and no automatic resubmission from an unknown state. Declared rather than enforced: the bridge is not in the execution path and cannot block an `sbatch`.
+- [x] **Slurm safety gate** — a per-task policy (`submit` / `test_only` / `dry_run_only`) stated in the prompt and recorded against the task, job IDs requested in every result, and no automatic resubmission from an unknown state. Declared rather than enforced: the bridge is not in the execution path and cannot block an `sbatch`.
 - [ ] **Structured remote reporting** — support progress, `needs_input`, artifact, metric, warning, and final report rather than relying on terminal text extraction.
 - [ ] **Controlled concurrency and write isolation** — execute asynchronous tasks concurrently per agent, with single-writer or branch/worktree isolation and explicit handover for writes to the same project.
 - [ ] **Secure defaults** — token authentication on by default for production deployments, plus secret management, command/directory allowlists, per-task permissions, and audit records.
@@ -208,11 +208,13 @@ Every delegated task carries a Slurm policy, stated in the prompt before the age
 
 | Policy | The agent is told it may |
 |---|---|
+| `submit` *(default)* | Submit freely, at any scale. Do not resubmit repeatedly on failure — report it. Do not overwrite or delete existing checkpoints, results or datasets. |
+| `test_only` | Debug/short-limit jobs only, not full scale. Same rules on resubmission and existing data. |
 | `dry_run_only` | Static checks and `sbatch --test-only`. No real submission. |
-| `test_only` *(default)* | Submit debug/short-limit jobs to prove a script runs. Full-scale submission is not authorised — prepare the command, report it, and stop. |
-| `authorised_submit` | Submit **one** production job. Do not resubmit after a failure; report it instead. |
 
 Every policy asks for the job ID in the result, which is the part that makes a submission auditable and cancellable afterwards.
+
+The default does not restrict submission. An earlier version withheld full-scale runs, which cost an extra round trip on every real job — a restriction chosen on an assumed risk rather than an observed one. Submitting is reversible: `scancel` it and resubmit, and the only cost is queue time. Not submitting is the expensive outcome. What is genuinely irreversible is not the submission but a job destroying work that already exists, so that is where every policy draws its line — along with not resubmitting on failure, which is how one bad script quietly burns an allocation.
 
 **This is a declared policy, not an enforced one, and the difference matters.** The bridge is not in the execution path: it sends text through `herdr agent prompt`, and the agent decides what to run. Nothing here can see or block an `sbatch`. What the gate changes is that submitting production work becomes something the agent was *told* it may do rather than something it decided on its own, and that widening the policy is a deliberate act by the caller — present in the request and recorded against the task, so an audit can tell what the agent was permitted to do and not only what it did.
 
@@ -250,7 +252,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_BRIDGE_TOKEN` | unset | Optional shared-secret authentication token. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |
-| `SENTINEL_SLURM_POLICY` | `test_only` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
+| `SENTINEL_SLURM_POLICY` | `submit` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
 | `SENTINEL_AGENT_PRIORITY` | unset | Ordered cost preference, cheapest first, matched on agent name or runtime family. Only orders agents that can take work now. |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | How long a quota circuit stays open before expiring by itself. `0` keeps it open until cleared by hand. |
 
