@@ -1245,7 +1245,14 @@ def test_read_accepts_lines_query(live_server, monkeypatch):
 
     assert status == 200
     assert body["ok"] is True
-    assert calls == [("agent", "read", "agent-a", "--source", "recent-unwrapped", "--lines", "37")]
+    assert ("agent", "read", "agent-a", "--source", "recent-unwrapped", "--lines", "37") in calls
+
+    # /read also fetches the agent's status now -- a second herdr call
+    # this endpoint did not used to make. Justified rather than excused:
+    # a terminal snapshot on its own was read as live activity by a real
+    # caller, and /read is a diagnostic endpoint rather than something
+    # polled in a loop, where the extra call would be worth avoiding.
+    assert [call[1] for call in calls] == ["read", "get"]
 
 
 def test_read_rejects_lines_out_of_range_without_touching_herdr(live_server, monkeypatch):
@@ -2564,3 +2571,45 @@ def test_worker_uses_the_policy_recorded_on_the_task(tmp_path, monkeypatch):
     # the stored value a comforting fiction: the agent would have been
     # told it could submit while the audit trail says otherwise.
     assert prompts and "--test-only" in prompts[0]
+
+
+# --- terminal reads are a snapshot, not a live status ------------------
+#
+# A TUI does not clear itself when a task finishes, so /read routinely
+# returns the leftover picture of a completed session: a finished report,
+# a "new task?" hint, and whatever text was sitting unsent in the input
+# box. A caller read that as two agents being stuck and told the operator
+# to go and clear the windows by hand -- in a tool whose whole point is
+# not having to touch the remote terminal. Both agents were idle.
+
+
+def test_read_reports_the_agent_status_alongside_the_snapshot(live_server, monkeypatch):
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "done 3:32 pm\n> append the addendum", "stderr": "",
+    })
+
+    status, body = _get(live_server, "/read?agent=w1:p3")
+
+    # Without this the response is a wall of text with nothing to weigh it
+    # against, and leftover input reads exactly like work in progress.
+    assert status == 200
+    assert body["agent_status"] == "idle"
+
+
+def test_read_still_answers_when_the_status_lookup_fails(live_server, monkeypatch):
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: (None, {"ok": False}))
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "terminal text", "stderr": "",
+    })
+
+    status, body = _get(live_server, "/read?agent=w1:p3")
+
+    # /read exists to diagnose a sick agent. Refusing to return the
+    # terminal because the status call also failed would withhold the
+    # evidence exactly when it is most wanted.
+    assert status == 200
+    assert body["stdout"] == "terminal text"
+    assert body["agent_status"] is None

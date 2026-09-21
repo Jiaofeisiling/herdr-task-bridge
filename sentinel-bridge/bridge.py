@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 15
+BRIDGE_VERSION = 16
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -1760,6 +1760,29 @@ class Handler(BaseHTTPRequestHandler):
                 "--lines",
                 str(read_lines),
             )
+
+            # A TUI does not clear itself when a task finishes, so this
+            # is routinely the leftover picture of a completed session:
+            # a finished report, a "new task?" hint, and a line of
+            # predicted input after the prompt that nobody ever typed.
+            # Returned on its own it reads exactly like work in progress,
+            # and a caller acted on that -- reporting two idle agents as
+            # stuck, on the strength of an autocomplete suggestion, and
+            # telling the operator to clear the windows by hand. The
+            # status is what settles it, so it travels with the snapshot
+            # rather than being a second call the caller must think to
+            # make.
+            try:
+                agent_status, _ = get_agent_status(agent_name)
+            except Exception:
+                # /read exists to diagnose a sick agent; withholding the
+                # terminal because the status call also failed would hide
+                # the evidence exactly when it is most wanted.
+                agent_status = None
+
+            result = dict(result)
+            result["agent"] = agent_name
+            result["agent_status"] = agent_status
 
             self.send_json(
                 result,
