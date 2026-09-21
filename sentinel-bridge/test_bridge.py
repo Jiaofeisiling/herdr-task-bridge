@@ -2429,3 +2429,138 @@ def test_resolve_reports_clearly_when_no_agent_is_addressable(monkeypatch):
 
     with pytest.raises(bridge.AgentNotFoundError):
         bridge.resolve_agent(None)
+
+
+# --- slurm safety gate -------------------------------------------------
+#
+# The bridge is not in the execution path: it sends text through `herdr
+# agent prompt` and the agent decides what to run, so it can neither see
+# nor block an sbatch. What it can do is state the policy in the prompt
+# and make widening it a deliberate act, which is the difference between
+# an agent submitting production work on its own judgement and an agent
+# having been told it may. Calling that a hard block would be a lie.
+
+
+def test_delegation_prompt_states_the_slurm_policy(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompt = bridge.build_delegation_prompt(
+        "跑一下训练", "aaaaaaaa-1111-2222-3333-444444444444"
+    )
+
+    assert "Slurm" in prompt
+
+
+def test_default_policy_allows_test_scale_but_not_production(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompt = bridge.build_delegation_prompt(
+        "跑一下训练", "aaaaaaaa-1111-2222-3333-444444444444"
+    )
+
+    # Matches the two-step rhythm the client prompt already recommends:
+    # prove the script at debug scale, then ask before full scale.
+    assert "debug" in prompt
+    assert "完整规模" in prompt
+
+
+def test_dry_run_policy_forbids_submitting_at_all(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompt = bridge.build_delegation_prompt(
+        "检查脚本", "aaaaaaaa-1111-2222-3333-444444444444",
+        slurm_policy="dry_run_only",
+    )
+
+    assert "--test-only" in prompt
+    assert "不得" in prompt
+
+
+def test_authorised_policy_is_explicit_about_being_one_submission(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompt = bridge.build_delegation_prompt(
+        "提交训练", "aaaaaaaa-1111-2222-3333-444444444444",
+        slurm_policy="authorised_submit",
+    )
+
+    # "You may submit" without a count is how one authorisation turns into
+    # a resubmission loop after something fails.
+    assert "一次" in prompt
+
+
+def test_every_policy_asks_for_the_job_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    for policy in ("dry_run_only", "test_only", "authorised_submit"):
+        prompt = bridge.build_delegation_prompt(
+            "x", "aaaaaaaa-1111-2222-3333-444444444444", slurm_policy=policy
+        )
+        # The job id is the only part of this that is mechanical: it is
+        # what makes a submission auditable and cancellable afterwards.
+        assert "job ID" in prompt, policy
+
+
+def test_unknown_policy_is_refused_rather_than_silently_downgraded(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    # Silently falling back to the default would turn a typo in the
+    # strictest setting into the loosest one the deployment allows.
+    with pytest.raises(ValueError):
+        bridge.validate_slurm_policy("dry-run")
+
+
+def test_delegate_rejects_an_unknown_policy(live_server):
+    status, body = _post(live_server, "/delegate", {
+        "task": "x", "slurm_policy": "whatever",
+    })
+
+    assert status == 400
+    assert "slurm_policy" in body["error"]
+
+
+def test_delegate_records_the_policy_it_ran_under(live_server):
+    status, body = _post(live_server, "/delegate", {
+        "task": "x", "slurm_policy": "authorised_submit",
+    })
+
+    # Stored so an audit can tell what the agent was permitted to do,
+    # not just what it did.
+    task = bridge.get_task(body["task_id"])
+    assert task["slurm_policy"] == "authorised_submit"
+
+
+def test_worker_uses_the_policy_recorded_on_the_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompts = []
+    writes_result = compliant_agent("done")
+
+    def fake_run_herdr(*args, **kwargs):
+        if args[1] == "get":
+            return {"ok": True, "stdout": json_module.dumps(
+                {"result": {"agent": {"agent_status": "idle"}}}
+            ), "stderr": ""}
+        if args[1] == "prompt":
+            prompts.append(args[3])
+        return writes_result(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
+
+    task_id = bridge.create_task("跑训练", 60000, "w1:p1",
+                                 slurm_policy="dry_run_only")
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    for _ in range(100):
+        if bridge.get_task(task_id)["status"] == "done":
+            break
+        time.sleep(0.05)
+    stop.set()
+    worker.join(timeout=5)
+
+    # Recording the policy but dispatching under the default would make
+    # the stored value a comforting fiction: the agent would have been
+    # told it could submit while the audit trail says otherwise.
+    assert prompts and "--test-only" in prompts[0]

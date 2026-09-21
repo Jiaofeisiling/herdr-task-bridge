@@ -28,7 +28,14 @@ param(
     # Which herdr agent to target. Omit to use the bridge's own
     # SENTINEL_AGENT default -- see `agents` for the full list of what's
     # actually available on the remote host right now.
-    [string]$Agent
+    [string]$Agent,
+
+    # What the task is permitted to do with Slurm. Omit to use the
+    # deployment's default, which allows debug-scale jobs but not a
+    # full-scale submission. Widening it is meant to be deliberate:
+    # authorising production work should be something you typed.
+    [ValidateSet("dry_run_only", "test_only", "authorised_submit")]
+    [string]$SlurmPolicy
 )
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -214,6 +221,10 @@ switch ($Command) {
             $payload["agent"] = $Agent
         }
 
+        if ($PSBoundParameters.ContainsKey("SlurmPolicy")) {
+            $payload["slurm_policy"] = $SlurmPolicy
+        }
+
         $body = $payload | ConvertTo-Json -Compress
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body
@@ -242,6 +253,10 @@ switch ($Command) {
             $payload["agent"] = $Agent
         }
 
+        if ($PSBoundParameters.ContainsKey("SlurmPolicy")) {
+            $payload["slurm_policy"] = $SlurmPolicy
+        }
+
         $body = $payload | ConvertTo-Json -Compress
 
         $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
@@ -268,6 +283,10 @@ switch ($Command) {
 
         if ($PSBoundParameters.ContainsKey("Agent")) {
             $payload["agent"] = $Agent
+        }
+
+        if ($PSBoundParameters.ContainsKey("SlurmPolicy")) {
+            $payload["slurm_policy"] = $SlurmPolicy
         }
 
         $body = $payload | ConvertTo-Json -Compress
