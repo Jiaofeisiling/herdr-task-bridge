@@ -90,6 +90,26 @@ Never block waiting for a job. Submit through /delegate, take the job ID,
 and come back later with a separate task that checks sacct or reads the
 output files.
 
+## A terminal read is a snapshot, not a live status
+
+Judge whether an agent is busy from `agent_status`, never from the text on
+its terminal.
+
+A TUI does not clear itself when a task finishes, so `read` routinely
+returns the leftover picture of a completed session: a finished report, a
+"new task?" hint, and a line of **predicted input** after the prompt.
+
+That last one especially: the greyed text after `❯` is a completion the
+agent generated for itself. Nobody typed it. It is not a pending
+instruction, not a queued task, and not something waiting on anyone. It
+looks identical to a real prompt line, and reading it as "the agent is
+stuck on this" is simply wrong.
+
+The `read` response carries `agent_status` alongside the snapshot. If that
+says idle or done, the agent is free no matter what the terminal shows --
+do not ask the user to clear the window or press enter by hand, which is
+the very thing this tool exists to avoid.
+
 ## Writing task descriptions
 
 Say what needs doing. Do not prescribe which tool or shell construct the

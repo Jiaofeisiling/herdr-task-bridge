@@ -169,7 +169,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `agents` | GET | `/agents` | 列出 Herdr 管理的 agent 及其状态。 |
 | `ready` | GET | `/ready` | 检查所选 agent 是否可接收任务（`idle` 或 `done`）。 |
 | `status` | GET | `/status` | 返回原始 `herdr agent get` 响应。 |
-| `read` | GET | `/read` | 读取最近的 agent 终端输出，供诊断使用。 |
+| `read` | GET | `/read` | 读取最近的 agent 终端画面，并附带 `agent_status`，供诊断使用。终端是快照，任务完成后仍显示旧画面；忙闲一律以 `agent_status` 为准。 |
 | `quota` | GET | `/quota` | 列出因模型提供商额度或余额错误而被临时阻断的 agent。 |
 | `quota-reset` | POST | `/quota/reset` | 使用 `-Agent` 清除一个 agent 的额度熔断；刻意不传时清除全部熔断。 |
 | `delegate <task>` | POST | `/delegate` | 将任务加入队列并返回 `task_id`；服务端默认超时为 6 小时。 |
