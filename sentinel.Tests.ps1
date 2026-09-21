@@ -321,6 +321,73 @@ Describe "wait" {
         }
     }
 
+    It "shows only newly appended progress while the task is still running" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("wait", "t1")
+
+            $req1 = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req1.Context -Status 200 -Payload @{
+                ok = $true; task = @{ status = "running"; progress = "submitted job 9213894" }
+            }
+
+            $req2 = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req2.Context -Status 200 -Payload @{
+                ok = $true
+                task = @{ status = "running"; progress = "submitted job 9213894`nnow RUNNING" }
+            }
+
+            $req3 = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req3.Context -Status 200 -Payload @{
+                ok = $true; task = @{ status = "done"; result_text = "finished" }
+            }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+
+            $result.ExitCode | Should -Be 0
+            # Progress goes to the host, not stdout: stdout carries the
+            # result and may be piped somewhere.
+            $result.StdOut.Trim() | Should -Be "finished"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "survives a progress file that was rewritten rather than appended to" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("wait", "t1")
+
+            $req1 = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req1.Context -Status 200 -Payload @{
+                ok = $true; task = @{ status = "running"; progress = "step one" }
+            }
+
+            # Not a superset of what came before. Assuming append-only
+            # would take Substring past the end here, and guessing the
+            # shape of data the client does not produce is how several
+            # bugs in this repo started.
+            $req2 = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req2.Context -Status 200 -Payload @{
+                ok = $true; task = @{ status = "running"; progress = "x" }
+            }
+
+            $req3 = Receive-StubRequest -Listener $stub.Listener
+            Send-StubResponse -Context $req3.Context -Status 200 -Payload @{
+                ok = $true; task = @{ status = "done"; result_text = "finished" }
+            }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+
+            $result.ExitCode | Should -Be 0
+            $result.StdOut.Trim() | Should -Be "finished"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
     It "exits 2 and warns when the task lands in orphaned state" {
         $stub = Start-StubListener
         try {

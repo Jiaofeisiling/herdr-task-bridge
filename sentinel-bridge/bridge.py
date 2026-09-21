@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 17
+BRIDGE_VERSION = 18
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -155,15 +155,13 @@ SLURM_POLICIES = {
         "**不得真正提交任何作业**。"
     ),
     "test_only": (
-        "Slurm：只提交 debug/短时限的小规模作业来验证脚本，不要提交完整规模。"
-        "失败不要反复重投，把原因写进结果。"
-        "不要覆盖或删除已有的 checkpoint、结果和数据集。"
+        "Slurm：只提交 debug/短时限作业，不要完整规模。失败别反复重投，"
+        "写清原因。不要覆盖或删除已有的 checkpoint、结果和数据集。"
     ),
     "submit": (
-        "Slurm：**自由提交**作业，包括完整规模——提交是可逆的，写错了 scancel "
-        "掉重来即可，不要为此犹豫或先来请示。但失败不要反复重投，把原因写进"
-        "结果交回。**不要覆盖或删除已有的 checkpoint、结果和数据集**，"
-        "那才是不可逆的。"
+        "Slurm：**自由提交**，不限规模，不必先请示——写错了 scancel 重来即可。"
+        "失败别反复重投，写清原因。**不要覆盖或删除已有的 checkpoint、"
+        "结果和数据集**。"
     ),
 }
 
@@ -511,6 +509,11 @@ def requeue_task(task_id):
 
 
 def complete_task(task_id, result_text):
+    # The task is over, so its progress no longer describes anything.
+    # Left in place, every finished task would leak one -- the same leak
+    # the result sweep had to be built for.
+    discard_progress_file(task_id)
+
     with db_session() as conn:
         conn.execute("""
             UPDATE tasks
@@ -520,6 +523,8 @@ def complete_task(task_id, result_text):
 
 
 def fail_task(task_id, error_text):
+    discard_progress_file(task_id)
+
     with db_session() as conn:
         conn.execute("""
             UPDATE tasks
@@ -529,6 +534,8 @@ def fail_task(task_id, error_text):
 
 
 def orphan_task(task_id, error_text):
+    discard_progress_file(task_id)
+
     with db_session() as conn:
         conn.execute("""
             UPDATE tasks
@@ -893,6 +900,41 @@ def result_file_path(task_id):
     return os.path.join(RESULT_DIR, f"result-{token}.txt")
 
 
+def progress_file_path(task_id):
+    token = task_id.replace("-", "")
+    return os.path.join(RESULT_DIR, f"progress-{token}.txt")
+
+
+def read_progress_file(task_id):
+    """Whatever the agent has reported so far, or None.
+
+    Separate from the result and never removed on read: this is polled
+    repeatedly while the task runs, whereas a result is collected once.
+    A missing file means the agent had nothing to say, not that anything
+    failed -- progress is a convenience for the operator rather than a
+    second contract the agent has to satisfy.
+    """
+    try:
+        with open(progress_file_path(task_id), encoding="utf-8", errors="replace") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        print(f"[progress] unreadable progress file for {task_id}: {e}")
+        return None
+
+    return content or None
+
+
+def discard_progress_file(task_id):
+    try:
+        os.remove(progress_file_path(task_id))
+    except OSError:
+        # Never created, or already gone. The startup sweep is the
+        # backstop for whatever this misses.
+        pass
+
+
 def purge_stale_result_files():
     """Delete result files nobody came back for. Returns how many went.
 
@@ -919,7 +961,9 @@ def purge_stale_result_files():
     for name in names:
         # Only files this bridge created. An operator's own notes, or
         # anything else sharing the directory, is not ours to delete.
-        if not (name.startswith("result-") and name.endswith(".txt")):
+        # Progress files are swept too: a task killed mid-flight leaves
+        # one behind exactly as a failed delivery leaves a result.
+        if not (name.startswith(("result-", "progress-")) and name.endswith(".txt")):
             continue
 
         path = os.path.join(RESULT_DIR, name)
@@ -1519,6 +1563,7 @@ def run_herdr(*args, timeout=None):
 
 def build_delegation_prompt(task, task_id, slurm_policy=None):
     path = result_file_path(task_id)
+    progress = progress_file_path(task_id)
     policy = SLURM_POLICIES[validate_slurm_policy(slurm_policy)]
 
     # The policy line is always present, even for tasks that have nothing
@@ -1533,7 +1578,10 @@ def build_delegation_prompt(task, task_id, slurm_policy=None):
 {task}
 ===== 任务结束 =====
 
-{policy}提交或检查了作业就把 job ID 写进结果。
+{policy}动了作业就把 job ID 写进结果。
+
+想让远端看到进展（拿到 job ID、卡在哪步）可追加一行到此，**可选**：
+{progress}
 
 做完后把结果写入：
 {path}
@@ -1821,6 +1869,13 @@ class Handler(BaseHTTPRequestHandler):
                     404,
                 )
                 return
+
+            # Read here rather than in get_task(): the worker calls that
+            # on every poll and has no use for progress, so it should not
+            # pay a file read per dispatch. A finished task has had its
+            # progress file discarded, so this is None for terminal
+            # states without needing a status check.
+            task["progress"] = read_progress_file(task_id)
 
             self.send_json({
                 "ok": True,

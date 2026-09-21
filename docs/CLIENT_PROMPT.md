@@ -44,7 +44,7 @@ used.
 
 GET  /health              bridge version and liveness
 GET  /agents              every agent: name, pane_id, agent_status, cwd
-GET  /tasks/<task_id>     one task's status and result
+GET  /tasks/<task_id>     one task's status, result, and progress so far
 GET  /quota               agents currently circuit-broken on quota
 POST /ask                 synchronous; blocks until there is a result
 POST /delegate            asynchronous; returns a task_id immediately
