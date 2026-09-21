@@ -107,7 +107,7 @@ Not yet. Below is the acceptance checklist from v4 to that point. Only once ever
 - [ ] **Windows Gateway** — lift the shared client, SSH tunnel lifecycle, reconnection, subscriptions, and ChatGPT/Claude/Cursor adapters out of a single-shot CLI.
 - [ ] **Active notification** — notify only on completion, failure, an authorisation request, `orphaned`, or important new evidence; deduplicate, stay quiet while nothing changes, and stop automatically at a terminal state.
 - [ ] **Independent monitoring worker** — track bridge tasks, Herdr agents, Slurm jobs, and artifacts separately without occupying an execution agent.
-- [ ] **Slurm safety gate** — built-in static check → dry run → `TEST_ONLY` → a single authorised real submission; record job IDs and never auto-resubmit from an unknown state.
+- [x] **Slurm safety gate** — a per-task policy (`dry_run_only` / `test_only` / `authorised_submit`) stated in the prompt and recorded against the task, job IDs requested in every result, and no automatic resubmission from an unknown state. Declared rather than enforced: the bridge is not in the execution path and cannot block an `sbatch`.
 - [ ] **Structured remote reporting** — support progress, `needs_input`, artifact, metric, warning, and final report rather than relying on terminal text extraction.
 - [ ] **Controlled concurrency and write isolation** — execute asynchronous tasks concurrently per agent, with single-writer or branch/worktree isolation and explicit handover for writes to the same project.
 - [ ] **Secure defaults** — token authentication on by default for production deployments, plus secret management, command/directory allowlists, per-task permissions, and audit records.
@@ -202,6 +202,24 @@ The result directory must be writable by both the bridge process and the selecte
 
 [`docs/CLIENT_PROMPT.md`](docs/CLIENT_PROMPT.md) is a ready-made system prompt for the AI session on the calling side — endpoints, task states, when to use `/ask` versus `/delegate`, and the operational rules that are not discoverable from the API alone. It deliberately hard-codes no cluster configuration: partition names, QoS limits and quotas are the executing agent's job to determine at run time, not the client's to assert from a machine it cannot see.
 
+### Slurm safety gate
+
+Every delegated task carries a Slurm policy, stated in the prompt before the agent acts. Set it per request with `slurm_policy`, or change the deployment default with `SENTINEL_SLURM_POLICY`.
+
+| Policy | The agent is told it may |
+|---|---|
+| `dry_run_only` | Static checks and `sbatch --test-only`. No real submission. |
+| `test_only` *(default)* | Submit debug/short-limit jobs to prove a script runs. Full-scale submission is not authorised — prepare the command, report it, and stop. |
+| `authorised_submit` | Submit **one** production job. Do not resubmit after a failure; report it instead. |
+
+Every policy asks for the job ID in the result, which is the part that makes a submission auditable and cancellable afterwards.
+
+**This is a declared policy, not an enforced one, and the difference matters.** The bridge is not in the execution path: it sends text through `herdr agent prompt`, and the agent decides what to run. Nothing here can see or block an `sbatch`. What the gate changes is that submitting production work becomes something the agent was *told* it may do rather than something it decided on its own, and that widening the policy is a deliberate act by the caller — present in the request and recorded against the task, so an audit can tell what the agent was permitted to do and not only what it did.
+
+An unrecognised policy is rejected rather than quietly replaced by the default, because a typo in the strictest setting would otherwise become the loosest one the deployment allows. A task queued under one policy runs under that one, not under whatever the default happens to be when the worker reaches it.
+
+The bridge never re-runs a task by itself. A task interrupted by a restart becomes `orphaned` and stays there, so an unknown Slurm state is never resolved by resubmitting.
+
 ### Active quota failover
 
 The bridge recognises common provider signals such as Claude 5-hour/weekly usage limits, HTTP `429`, OpenCode API `402`, and insufficient API credit or balance. On detection it opens a durable circuit for the failed agent, skips the otherwise normal result-file reminder, and actively tries an eligible alternate agent.
@@ -232,6 +250,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_BRIDGE_TOKEN` | unset | Optional shared-secret authentication token. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |
+| `SENTINEL_SLURM_POLICY` | `test_only` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
 | `SENTINEL_AGENT_PRIORITY` | unset | Ordered cost preference, cheapest first, matched on agent name or runtime family. Only orders agents that can take work now. |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | How long a quota circuit stays open before expiring by itself. `0` keeps it open until cleared by hand. |
 

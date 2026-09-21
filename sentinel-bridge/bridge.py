@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 14
+BRIDGE_VERSION = 15
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -120,6 +120,57 @@ AGENT_PRIORITY = tuple(
     for name in os.environ.get("SENTINEL_AGENT_PRIORITY", "").split(",")
     if name.strip()
 )
+
+# What a delegated task is permitted to do with Slurm, stated in the
+# prompt so the agent knows before it acts.
+#
+# This is a declared policy, not an enforced one, and the distinction
+# matters: the bridge is not in the execution path. It sends text through
+# `herdr agent prompt` and the agent decides what to run, so nothing here
+# can see or stop an sbatch. What it changes is that submitting
+# production work becomes something the agent was told it may do, rather
+# than something it decided on its own -- and that widening the policy is
+# a deliberate act by the caller, visible in the request and recorded
+# against the task.
+#
+# The default allows debug-scale work because proving a script cheaply is
+# the step that should never need permission, and matches the two-step
+# rhythm docs/CLIENT_PROMPT.md already recommends. Full-scale submission
+# is the part worth stopping to ask about.
+SLURM_POLICIES = {
+    "dry_run_only": (
+        "Slurm：本任务只允许静态检查和 `sbatch --test-only`，"
+        "**不得真正提交任何作业**。"
+    ),
+    "test_only": (
+        "Slurm：可以提交 debug/短时限的小规模作业来验证脚本能跑通。"
+        "**完整规模的提交未获授权**——需要时先把准备好的提交命令和资源申请"
+        "写进结果并停下，不要自行提交。"
+    ),
+    "authorised_submit": (
+        "Slurm：已授权提交**一次**正式作业。失败不要自行重投，"
+        "把失败原因写进结果交回。"
+    ),
+}
+
+DEFAULT_SLURM_POLICY = os.environ.get("SENTINEL_SLURM_POLICY", "test_only")
+
+
+def validate_slurm_policy(policy):
+    if policy is None:
+        return DEFAULT_SLURM_POLICY
+
+    if policy not in SLURM_POLICIES:
+        # Never fall back to the default on an unrecognised value: a typo
+        # in the strictest setting would silently become the loosest one
+        # the deployment allows, which is the opposite of what the caller
+        # was reaching for.
+        raise ValueError(
+            f"slurm_policy must be one of {', '.join(sorted(SLURM_POLICIES))}, "
+            f"got {policy!r}"
+        )
+
+    return policy
 
 # Deliberately biased towards missing a real quota failure rather than
 # inventing one. A match opens a durable circuit that only an operator can
@@ -271,7 +322,9 @@ def init_db():
                 timeout_ms INTEGER NOT NULL,
 
                 result_text TEXT,
-                error_text TEXT
+                error_text TEXT,
+
+                slurm_policy TEXT
             )
         """)
 
@@ -289,6 +342,12 @@ def init_db():
         existing_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
         }
+
+        if "slurm_policy" not in existing_cols:
+            # Rows created before the gate existed ran with no policy at
+            # all. Recording that honestly beats back-filling a default
+            # they were never actually told about.
+            conn.execute("ALTER TABLE tasks ADD COLUMN slurm_policy TEXT")
 
         if "agent" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN agent TEXT")
@@ -321,25 +380,28 @@ class QueueFullError(RuntimeError):
         )
 
 
-def _insert_task(conn, task_id, task, timeout_ms, agent_name):
+def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None):
     conn.execute("""
         INSERT INTO tasks (
-            task_id, task, agent, status, created_at, timeout_ms
+            task_id, task, agent, status, created_at, timeout_ms, slurm_policy
         )
-        VALUES (?, ?, ?, 'queued', ?, ?)
-    """, (task_id, task, agent_name, now_iso(), timeout_ms))
+        VALUES (?, ?, ?, 'queued', ?, ?, ?)
+    """, (
+        task_id, task, agent_name, now_iso(), timeout_ms,
+        validate_slurm_policy(slurm_policy),
+    ))
 
 
-def create_task(task, timeout_ms, agent_name):
+def create_task(task, timeout_ms, agent_name, slurm_policy=None):
     task_id = str(uuid.uuid4())
 
     with db_session() as conn:
-        _insert_task(conn, task_id, task, timeout_ms, agent_name)
+        _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy)
 
     return task_id
 
 
-def create_task_if_queue_available(task, timeout_ms, agent_name):
+def create_task_if_queue_available(task, timeout_ms, agent_name, slurm_policy=None):
     """Atomically enforce the queue cap and enqueue one task.
 
     ThreadingHTTPServer can process several /delegate requests concurrently.
@@ -358,7 +420,7 @@ def create_task_if_queue_available(task, timeout_ms, agent_name):
         if queued >= MAX_QUEUE_DEPTH:
             raise QueueFullError(queued, MAX_QUEUE_DEPTH)
 
-        _insert_task(conn, task_id, task, timeout_ms, agent_name)
+        _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy)
 
     return task_id
 
@@ -1102,8 +1164,8 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False)
     return result
 
 
-def run_prompt_only(agent_name, task_id, task, timeout_ms):
-    delegated_prompt = build_delegation_prompt(task, task_id)
+def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+    delegated_prompt = build_delegation_prompt(task, task_id, slurm_policy)
     return _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
 
 
@@ -1130,11 +1192,14 @@ def _read_terminal_tail(agent_name, read_lines):
     return result["stdout"][-4000:]
 
 
-def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500):
+def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
+                          slurm_policy=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
 
     _run_herdr_prompt(
-        agent_name, build_delegation_prompt(task, task_id), timeout_ms
+        agent_name,
+        build_delegation_prompt(task, task_id, slurm_policy),
+        timeout_ms,
     )
 
     response = read_result_file(task_id)
@@ -1339,6 +1404,10 @@ def task_worker(stop_event=None):
                     task_id=task_id,
                     task=task_row["task"],
                     timeout_ms=task_row["timeout_ms"],
+                    # From the row, not the current default: a task queued
+                    # under one policy must run under that one, or the
+                    # recorded value becomes a comforting fiction.
+                    slurm_policy=task_row["slurm_policy"],
                 )
 
                 if get_agent_quota_block(agent_name):
@@ -1434,15 +1503,23 @@ def run_herdr(*args, timeout=None):
     }
 
 
-def build_delegation_prompt(task, task_id):
+def build_delegation_prompt(task, task_id, slurm_policy=None):
     path = result_file_path(task_id)
+    policy = SLURM_POLICIES[validate_slurm_policy(slurm_policy)]
 
+    # The policy line is always present, even for tasks that have nothing
+    # to do with Slurm. A gate the caller has to remember to attach is not
+    # a gate, and this is a safety control rather than a rationale -- the
+    # same reason the credentials warning stayed when the prompt's
+    # self-justifying sentences were cut.
     return f"""
 以下是一条远程委派的任务。
 
 ===== 任务开始 =====
 {task}
 ===== 任务结束 =====
+
+{policy}提交或检查了作业就把 job ID 写进结果。
 
 做完后把结果写入：
 {path}
@@ -1751,6 +1828,8 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("agent", DEFAULT_AGENT)
                 )
 
+                slurm_policy = validate_slurm_policy(body.get("slurm_policy"))
+
                 timeout_ms = validate_timeout_ms(int(
                     body.get(
                         "timeout_ms",
@@ -1782,7 +1861,7 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 task_id = create_task_if_queue_available(
-                    task, timeout_ms, agent_name
+                    task, timeout_ms, agent_name, slurm_policy
                 )
             except QueueFullError as e:
                 self.send_json(
@@ -1845,6 +1924,8 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("timeout_ms", 120000)
             ))
 
+            slurm_policy = validate_slurm_policy(body.get("slurm_policy"))
+
             read_lines = validate_read_lines(int(
                 body.get("lines", 500)
             ))
@@ -1878,7 +1959,7 @@ class Handler(BaseHTTPRequestHandler):
                 prompt_result, used_agent = run_with_quota_failover(
                     agent_name,
                     lambda target: run_prompt_only(
-                        target, task_id, task, timeout_ms
+                        target, task_id, task, timeout_ms, slurm_policy
                     ),
                 )
 
@@ -1893,7 +1974,7 @@ class Handler(BaseHTTPRequestHandler):
             result_text, used_agent = run_with_quota_failover(
                 agent_name,
                 lambda target: execute_sentinel_task(
-                    target, task_id, task, timeout_ms, read_lines
+                    target, task_id, task, timeout_ms, read_lines, slurm_policy
                 ),
             )
 
