@@ -2458,17 +2458,45 @@ def test_delegation_prompt_states_the_slurm_policy(tmp_path, monkeypatch):
     assert "Slurm" in prompt
 
 
-def test_default_policy_allows_test_scale_but_not_production(tmp_path, monkeypatch):
+def test_default_policy_does_not_restrict_submission(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
 
     prompt = bridge.build_delegation_prompt(
         "跑一下训练", "aaaaaaaa-1111-2222-3333-444444444444"
     )
 
-    # Matches the two-step rhythm the client prompt already recommends:
-    # prove the script at debug scale, then ask before full scale.
-    assert "debug" in prompt
-    assert "完整规模" in prompt
+    # The default used to withhold full-scale submission, which made every
+    # real run cost an extra round trip -- a restriction chosen on an
+    # assumed risk rather than an observed one, which is the same mistake
+    # as the prompt's deleted self-justifications. Submitting is
+    # reversible: scancel it and resubmit, and the only cost is queue
+    # time. Not submitting is the expensive outcome.
+    assert "自由提交" in prompt
+    assert "未获授权" not in prompt
+
+
+def test_default_policy_still_protects_what_is_irreversible(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    prompt = bridge.build_delegation_prompt(
+        "跑一下训练", "aaaaaaaa-1111-2222-3333-444444444444"
+    )
+
+    # The line worth drawing is not around submitting, which is undoable,
+    # but around a job destroying work that already exists.
+    assert "覆盖" in prompt
+    assert "checkpoint" in prompt
+
+
+def test_restrictive_policies_remain_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    task_id = "aaaaaaaa-1111-2222-3333-444444444444"
+
+    # Tightening stays possible; it is just no longer what happens to
+    # everyone who did not ask for it.
+    assert "debug" in bridge.build_delegation_prompt("x", task_id, "test_only")
+    assert "--test-only" in bridge.build_delegation_prompt("x", task_id, "dry_run_only")
 
 
 def test_dry_run_policy_forbids_submitting_at_all(tmp_path, monkeypatch):
@@ -2483,23 +2511,23 @@ def test_dry_run_policy_forbids_submitting_at_all(tmp_path, monkeypatch):
     assert "不得" in prompt
 
 
-def test_authorised_policy_is_explicit_about_being_one_submission(tmp_path, monkeypatch):
+def test_no_policy_invites_an_unbounded_resubmission_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
 
-    prompt = bridge.build_delegation_prompt(
-        "提交训练", "aaaaaaaa-1111-2222-3333-444444444444",
-        slurm_policy="authorised_submit",
-    )
+    task_id = "aaaaaaaa-1111-2222-3333-444444444444"
 
-    # "You may submit" without a count is how one authorisation turns into
-    # a resubmission loop after something fails.
-    assert "一次" in prompt
+    # Freedom to submit is not freedom to submit repeatedly on failure:
+    # that is how one bad script quietly burns an allocation. Reporting
+    # the failure costs one round trip; a retry loop costs core-hours.
+    for policy in ("submit", "test_only"):
+        prompt = bridge.build_delegation_prompt("x", task_id, policy)
+        assert "重投" in prompt
 
 
 def test_every_policy_asks_for_the_job_id(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
 
-    for policy in ("dry_run_only", "test_only", "authorised_submit"):
+    for policy in ("dry_run_only", "test_only", "submit"):
         prompt = bridge.build_delegation_prompt(
             "x", "aaaaaaaa-1111-2222-3333-444444444444", slurm_policy=policy
         )
@@ -2528,13 +2556,13 @@ def test_delegate_rejects_an_unknown_policy(live_server):
 
 def test_delegate_records_the_policy_it_ran_under(live_server):
     status, body = _post(live_server, "/delegate", {
-        "task": "x", "slurm_policy": "authorised_submit",
+        "task": "x", "slurm_policy": "dry_run_only",
     })
 
     # Stored so an audit can tell what the agent was permitted to do,
     # not just what it did.
     task = bridge.get_task(body["task_id"])
-    assert task["slurm_policy"] == "authorised_submit"
+    assert task["slurm_policy"] == "dry_run_only"
 
 
 def test_worker_uses_the_policy_recorded_on_the_task(tmp_path, monkeypatch):

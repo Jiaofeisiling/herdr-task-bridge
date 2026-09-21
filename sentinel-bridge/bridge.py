@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 16
+BRIDGE_VERSION = 17
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -133,27 +133,41 @@ AGENT_PRIORITY = tuple(
 # a deliberate act by the caller, visible in the request and recorded
 # against the task.
 #
-# The default allows debug-scale work because proving a script cheaply is
-# the step that should never need permission, and matches the two-step
-# rhythm docs/CLIENT_PROMPT.md already recommends. Full-scale submission
-# is the part worth stopping to ask about.
+# The default does not restrict submission, and that is a correction. It
+# previously withheld full-scale runs, costing an extra round trip on
+# every real job -- a restriction chosen on an assumed risk rather than an
+# observed one, which is the same mistake as the self-justifying sentences
+# this prompt has already had cut out of it.
+#
+# Submitting is reversible: scancel it and resubmit, and the only cost is
+# queue time. Not submitting is the expensive outcome, and every genuine
+# blockage on this deployment has come from a guardrail firing where none
+# was needed, not from an agent doing something rash.
+#
+# What is genuinely irreversible is not the submission but a job
+# destroying work that already exists, so that is where the line is drawn
+# in every policy. Unbounded resubmission is the other real hazard -- it
+# is how one bad script quietly burns an allocation -- so reporting a
+# failure rather than retrying is asked for throughout.
 SLURM_POLICIES = {
     "dry_run_only": (
         "Slurm：本任务只允许静态检查和 `sbatch --test-only`，"
         "**不得真正提交任何作业**。"
     ),
     "test_only": (
-        "Slurm：可以提交 debug/短时限的小规模作业来验证脚本能跑通。"
-        "**完整规模的提交未获授权**——需要时先把准备好的提交命令和资源申请"
-        "写进结果并停下，不要自行提交。"
+        "Slurm：只提交 debug/短时限的小规模作业来验证脚本，不要提交完整规模。"
+        "失败不要反复重投，把原因写进结果。"
+        "不要覆盖或删除已有的 checkpoint、结果和数据集。"
     ),
-    "authorised_submit": (
-        "Slurm：已授权提交**一次**正式作业。失败不要自行重投，"
-        "把失败原因写进结果交回。"
+    "submit": (
+        "Slurm：**自由提交**作业，包括完整规模——提交是可逆的，写错了 scancel "
+        "掉重来即可，不要为此犹豫或先来请示。但失败不要反复重投，把原因写进"
+        "结果交回。**不要覆盖或删除已有的 checkpoint、结果和数据集**，"
+        "那才是不可逆的。"
     ),
 }
 
-DEFAULT_SLURM_POLICY = os.environ.get("SENTINEL_SLURM_POLICY", "test_only")
+DEFAULT_SLURM_POLICY = os.environ.get("SENTINEL_SLURM_POLICY", "submit")
 
 
 def validate_slurm_policy(policy):

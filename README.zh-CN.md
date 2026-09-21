@@ -107,7 +107,7 @@ workflow_id → task_id → command_run_id → slurm_job_id → artifact_id
 - [ ] **Windows Gateway**：把共享客户端、SSH 隧道生命周期、重连、订阅和 ChatGPT/Claude/Cursor 适配从单次 CLI 中抽出。
 - [ ] **主动通知**：仅在完成、失败、需授权、`orphaned` 或有关键新证据时通知；支持去重、静默未变化状态和终态自动停止。
 - [ ] **独立监控 worker**：分别跟踪 bridge task、Herdr agent、Slurm job 和 artifacts，且不长期占用执行 agent。
-- [x] **Slurm 安全门控**：逐任务策略（`dry_run_only` / `test_only` / `authorised_submit`）写进 prompt 并记录在任务上，每种策略都要求回报 job ID，不明状态下绝不自动重投。属声明式而非强制——bridge 不在执行路径上，无法拦截 `sbatch`。
+- [x] **Slurm 安全门控**：逐任务策略（`submit` / `test_only` / `dry_run_only`）写进 prompt 并记录在任务上，每种策略都要求回报 job ID，不明状态下绝不自动重投。属声明式而非强制——bridge 不在执行路径上，无法拦截 `sbatch`。
 - [ ] **结构化远端报告**：支持 progress、`needs_input`、artifact、metric、warning 和 final report，而不只依赖终端文本抽取。
 - [ ] **受控并发与写入隔离**：按 agent 并发执行异步任务，并对同项目写操作实施 single-writer 或 branch/worktree 隔离与显式交接。
 - [ ] **安全默认值**：生产部署 token 默认开启，增加 secret 管理、命令/目录 allowlist、任务级权限和审计记录。
@@ -208,11 +208,13 @@ agent 会把结果写入 `SENTINEL_RESULT_DIR` 下的一任务一文件；bridge
 
 | 策略 | 告知 agent 可以做什么 |
 |---|---|
+| `submit`（默认） | 自由提交，不限规模。失败不要反复重投，把原因写进结果。不要覆盖或删除已有的 checkpoint、结果和数据集 |
+| `test_only` | 只提交 debug/短时限作业，不提交完整规模；重投与已有数据的规则同上 |
 | `dry_run_only` | 静态检查与 `sbatch --test-only`，不得真正提交 |
-| `test_only`（默认） | 可提交 debug/短时限作业验证脚本；完整规模未获授权——准备好提交命令、写进结果、停下 |
-| `authorised_submit` | 授权提交**一次**正式作业；失败不得自行重投，把原因交回 |
 
 三种策略都要求把 job ID 写进结果——这是整套机制里唯一机械可靠的部分，它让一次提交事后可审计、可取消。
+
+默认不限制提交。早先的版本把完整规模扣住，导致每个真实作业都多付一个来回——那是基于**假设的**风险而非观测到的风险所做的限制。提交是可逆的：`scancel` 掉重来，代价只有排队时间；不提交才是昂贵的结果。真正不可逆的从来不是提交这个动作，而是作业毁掉了已经存在的成果——所以每一档策略的红线都画在那里，外加"失败不要反复重投"，因为那是一个坏脚本悄悄烧光配额的方式。
 
 **这是声明式策略，不是强制拦截，这个区别很重要。** bridge 不在执行路径上：它通过 `herdr agent prompt` 发送文字，由 agent 决定运行什么命令，这里没有任何东西能看到或阻止一次 `sbatch`。门控改变的是：提交正式作业从"agent 自行判断"变成"agent 被明确告知可以"，而放宽策略成为调用方的一次**刻意动作**——它出现在请求里、记录在任务上，所以事后审计能看出 agent 当时**被允许**做什么，而不只是它做了什么。
 
@@ -250,7 +252,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_BRIDGE_TOKEN` | 未设置 | 可选的共享密钥鉴权令牌。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
-| `SENTINEL_SLURM_POLICY` | `test_only` | 部署级默认 Slurm 策略；请求里的 `slurm_policy` 可覆盖。 |
+| `SENTINEL_SLURM_POLICY` | `submit` | 部署级默认 Slurm 策略；请求里的 `slurm_policy` 可覆盖。 |
 | `SENTINEL_AGENT_PRIORITY` | 未设置 | 成本偏好顺序，便宜的在前；按 agent 名或运行时家族匹配。只对当前能接活的 agent 排序。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 

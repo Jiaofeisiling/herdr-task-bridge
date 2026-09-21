@@ -31,10 +31,10 @@ param(
     [string]$Agent,
 
     # What the task is permitted to do with Slurm. Omit to use the
-    # deployment's default, which allows debug-scale jobs but not a
-    # full-scale submission. Widening it is meant to be deliberate:
-    # authorising production work should be something you typed.
-    [ValidateSet("dry_run_only", "test_only", "authorised_submit")]
+    # deployment's default, which does not restrict submission -- an
+    # sbatch is reversible and holding one back costs more than it saves.
+    # Pass a narrower value when a task genuinely should not submit.
+    [ValidateSet("dry_run_only", "test_only", "submit")]
     [string]$SlurmPolicy
 )
 
