@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 18
+BRIDGE_VERSION = 19
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -924,6 +924,60 @@ def read_progress_file(task_id):
         return None
 
     return content or None
+
+
+def explain_queued(agent_name):
+    """Why a queued task has not started yet, in one line.
+
+    The worker already establishes this on every pass -- it checks the
+    target agent and skips the task when that agent cannot take work --
+    but it never surfaced anywhere. A caller watching `queued` with
+    started_at null had twelve fields and not one of them said the agent
+    was simply busy with something else, which is ordinary and looks
+    identical to a stuck queue.
+
+    Advisory only: this is a convenience, so a herdr that cannot be
+    reached returns None rather than turning a task query into a 500.
+    """
+    try:
+        agents, _ = list_agents()
+    except Exception:
+        return None
+
+    if agents is None:
+        return None
+
+    live = [a for a in agents if isinstance(a, dict)]
+    match = next(
+        (a for a in live if agent_name in agent_identifiers(a)),
+        None,
+    )
+
+    if match is None:
+        return (
+            f"'{agent_name}' is not among the running agents "
+            f"({describe_live_agents(live)}), so nothing will pick this up. "
+            "Delegate again without naming an agent to let the bridge choose."
+        )
+
+    try:
+        status, _ = get_agent_status(agent_name)
+    except Exception:
+        status = None
+
+    status = status or match.get("agent_status")
+
+    if status not in AVAILABLE_STATES:
+        return (
+            f"agent {agent_name} is {status}, so the worker is skipping this "
+            "task until it frees up. Nothing is wrong -- it is someone "
+            "else's turn."
+        )
+
+    return (
+        f"agent {agent_name} is {status}; waiting for the worker to reach "
+        "this task."
+    )
 
 
 def discard_progress_file(task_id):
@@ -1876,6 +1930,14 @@ class Handler(BaseHTTPRequestHandler):
             # progress file discarded, so this is None for terminal
             # states without needing a status check.
             task["progress"] = read_progress_file(task_id)
+
+            # Only while queued. A running task's reason would be stale
+            # the moment it was read, and asking herdr on every poll of
+            # every task would cost a call for nothing.
+            task["queued_reason"] = (
+                explain_queued(task["agent"])
+                if task["status"] == "queued" else None
+            )
 
             self.send_json({
                 "ok": True,

@@ -2733,3 +2733,83 @@ def test_sweep_also_collects_stale_progress_files(tmp_path, monkeypatch):
 
     assert bridge.purge_stale_result_files() == 1
     assert not stale.exists()
+
+
+# --- a queued task explains why it is queued ---------------------------
+#
+# A caller watched a task sit at queued with started_at null and could
+# not tell why. Nothing in the twelve fields said so, yet the bridge knew
+# the whole time: the worker checks the target agent on every pass and
+# skips it when it cannot take work. The agent in that case was simply
+# busy with something else, which is ordinary, but indistinguishable from
+# a stuck queue when nothing says it out loud.
+
+
+def test_queued_task_says_the_target_agent_is_busy(tmp_path, monkeypatch, live_server):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "working"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("working", {"ok": True}))
+
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    assert body["task"]["queued_reason"]
+    assert "working" in body["task"]["queued_reason"]
+
+
+def test_queued_task_says_when_the_agent_is_not_running(tmp_path, monkeypatch, live_server):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}])
+
+    # Queued against an agent that has since gone away. Without this the
+    # task waits forever with no hint that it never can run.
+    task_id = bridge.create_task("audit", 60000, "w1:p9")
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    reason = body["task"]["queued_reason"]
+    assert "w1:p9" in reason
+    assert "w1:p3" in reason
+
+
+def test_queued_task_says_so_when_the_agent_is_free(tmp_path, monkeypatch, live_server):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    # Distinguishes "waiting its turn" from "waiting on something that
+    # will never free up", which want different reactions.
+    assert "worker" in body["task"]["queued_reason"].lower()
+
+
+def test_only_queued_tasks_carry_a_reason(tmp_path, monkeypatch, live_server):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}])
+
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    bridge.claim_task(task_id)
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    # A running task's reason would be stale the moment it was read, and
+    # asking herdr for it would cost a call per poll for nothing.
+    assert body["task"]["queued_reason"] is None
+
+
+def test_queued_reason_survives_herdr_being_unreachable(tmp_path, monkeypatch, live_server):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "list_agents", lambda: (None, {"ok": False}))
+
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    # Explaining the queue is a convenience; it must not turn a task
+    # query into a 500 when herdr happens to be unavailable.
+    assert status == 200
+    assert body["task"]["status"] == "queued"

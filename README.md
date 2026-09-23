@@ -173,7 +173,7 @@ If the host has more than one Herdr agent, inspect them and select one explicitl
 | `quota` | GET | `/quota` | Lists agents temporarily blocked after a provider quota or balance failure. |
 | `quota-reset` | POST | `/quota/reset` | Clears one agent's quota circuit with `-Agent`, or all circuits when deliberately called without it. |
 | `delegate <task>` | POST | `/delegate` | Queues a task and returns a `task_id`; default server timeout is six hours. |
-| `task <task_id>` | GET | `/tasks/<id>` | Gets task state: `queued`, `running`, `done`, `error`, `orphaned`, or `quota_exhausted`. |
+| `task <task_id>` | GET | `/tasks/<id>` | Task state, in-flight `progress`, and — while `queued` — a `queued_reason` explaining what it is waiting on. |
 | `wait <task_id>` | GET | `/tasks/<id>` | Polls every three seconds until a terminal state, then prints the result or error. |
 | `tasks` | GET | `/tasks` | Lists the 20 most recent tasks. |
 | `ask <task>` | POST | `/ask` | Runs synchronously and returns the agent result; returns `409` if that agent is busy. |
