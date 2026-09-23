@@ -546,3 +546,43 @@ Describe "-Agent parameter" {
         }
     }
 }
+
+Describe "channel failures" {
+    # A caller reported the remote as "not recovered" while the bridge was
+    # answering fine. Chasing that found the client's side of it: a
+    # connection failure printed a raw Invoke-RestMethod stack trace and
+    # still exited 0, so there was nothing to act on and nothing for a
+    # script to branch on either.
+
+    It "exits 4 rather than 0 when nothing is listening" {
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:9" -ScriptArgs @("health")
+        $result = Wait-SentinelExit -Process $proc -TimeoutMs 30000
+
+        # Exiting 0 on a failed connection tells every caller it worked.
+        $result.ExitCode | Should -Be 4
+    }
+
+    It "says what to do instead of printing a PowerShell stack trace" {
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:9" -ScriptArgs @("health")
+        $result = Wait-SentinelExit -Process $proc -TimeoutMs 30000
+
+        $output = "$($result.StdOut)$($result.StdErr)"
+
+        # The forward is the thing that breaks, and reconnecting is the
+        # fix; a stack trace pointing at Invoke-RestMethod is neither.
+        $output | Should -Match "VS Code|forward|tunnel"
+        $output | Should -Not -Match "Invoke-RestMethod -Uri"
+    }
+
+    It "does not blame the bridge for a channel that is down" {
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:9" -ScriptArgs @("health")
+        $result = Wait-SentinelExit -Process $proc -TimeoutMs 30000
+
+        $output = "$($result.StdOut)$($result.StdErr)"
+
+        # Nothing was listening, so the bridge process was never reached
+        # and its health is simply unknown. Saying otherwise is what sent
+        # the caller off reporting a remote outage that had not happened.
+        $output | Should -Match "not reached|unknown|未到达"
+    }
+}

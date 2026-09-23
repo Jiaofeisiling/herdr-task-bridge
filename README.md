@@ -181,6 +181,22 @@ If the host has more than one Herdr agent, inspect them and select one explicitl
 
 Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask`, `prompt`, and `delegate`), and `-Lines <count>` (for `read`). Agent names are trimmed, must be non-empty, and are limited to 200 characters. Request timeouts must be between 1 second and 6 hours.
 
+### Exit codes and channel failures
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | The request failed, or a task ended in `error` |
+| `2` | A task ended `orphaned` |
+| `3` | A task ended `quota_exhausted` |
+| `4` | **The bridge was never reached** — the channel is down, and nothing is known about the bridge itself |
+
+Code `4` is deliberately distinct. When the SSH forward is not in place, the bridge is usually running perfectly well on the remote side and simply cannot be talked to; reporting that as a bridge failure sends the reader to the wrong machine. The message names which of the two channel states applies — nothing listening, or connected but never replying — because they need different fixes, and says plainly that the bridge's state is unknown rather than bad.
+
+Connection failures previously printed a raw `Invoke-RestMethod` stack trace **and exited 0**, so a caller had nothing to act on and nothing to branch on.
+
+Note that `pwsh -Command "& sentinel.ps1 ..."` collapses any non-zero code to `1`. Use `pwsh -File`, or append `; exit $LASTEXITCODE`, to get the exact code.
+
 ## Task lifecycle and results
 
 ```

@@ -66,6 +66,85 @@ function Join-TaskText {
 }
 
 
+# Classify a connection-layer failure without reading the exception text.
+# That text is localised -- on a Chinese Windows it reads 由于目标计算机积极
+# 拒绝 -- so matching on it would work on one machine and quietly fail on
+# the next. SocketError and WebExceptionStatus are stable and language
+# independent, and PowerShell 5.1 and 7 wrap them differently, so both
+# shapes are unwrapped here.
+function Get-ChannelFailureKind {
+    param($ErrorRecord)
+
+    $ex = $ErrorRecord.Exception
+
+    while ($ex) {
+        if ($ex -is [System.Net.Sockets.SocketException]) {
+            if ($ex.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused) {
+                return "refused"
+            }
+            if ($ex.SocketErrorCode -eq [System.Net.Sockets.SocketError]::TimedOut) {
+                return "timeout"
+            }
+        }
+
+        if ($ex -is [System.Net.WebException]) {
+            if ($ex.Status -eq [System.Net.WebExceptionStatus]::ConnectFailure) { return "refused" }
+            if ($ex.Status -eq [System.Net.WebExceptionStatus]::Timeout) { return "timeout" }
+        }
+
+        if ($ex -is [System.TimeoutException]) { return "timeout" }
+        if ($ex -is [System.Threading.Tasks.TaskCanceledException]) { return "timeout" }
+
+        $ex = $ex.InnerException
+    }
+
+    return "unknown"
+}
+
+# Exit 4 -- distinct from 1 (a request failed), 2 (orphaned) and 3 (quota),
+# because none of those happened: the bridge was never reached, so nothing
+# is known about it either way. A caller once reported a remote outage on
+# the strength of a failure that was entirely on this side of the tunnel.
+function Exit-ChannelDown {
+    param($ErrorRecord, [string]$Uri)
+
+    $kind = Get-ChannelFailureKind -ErrorRecord $ErrorRecord
+
+    $lines = switch ($kind) {
+        "refused" {
+            @(
+                "CHANNEL DOWN: nothing is listening on $Uri.",
+                "  The SSH port forward is not in place. Reconnect VS Code to the host,",
+                "  then try again. The bridge was not reached, so its state is unknown --",
+                "  it is most likely still running fine on the remote side."
+            )
+        }
+        "timeout" {
+            @(
+                "CHANNEL DOWN: connected to $Uri but it never replied.",
+                "  The local port is still forwarded, but the forward's path to the host",
+                "  is dead. Disconnect and reconnect VS Code -- reloading the window",
+                "  usually does not rebuild the forward. The bridge was not reached, so",
+                "  its state is unknown; it is probably fine."
+            )
+        }
+        default {
+            @(
+                "CHANNEL DOWN: could not reach $Uri.",
+                "  $($ErrorRecord.Exception.Message)",
+                "  The bridge was not reached, so its state is unknown. Check that VS Code",
+                "  is connected to the host and the port forward is in place."
+            )
+        }
+    }
+
+    foreach ($line in $lines) {
+        [Console]::Error.WriteLine($line)
+    }
+
+    exit 4
+}
+
 function Invoke-SentinelApi {
     param(
         [Parameter(Mandatory=$true)][string]$Uri,
@@ -106,7 +185,11 @@ function Invoke-SentinelApi {
         }
 
         if ($null -eq $errResponse) {
-            throw $caughtError
+            # No response object at all means the request never completed:
+            # a connection-layer failure, not an HTTP error. Rethrowing
+            # here printed a raw Invoke-RestMethod stack trace *and* left
+            # the exit code at 0, so callers saw success on a dead channel.
+            Exit-ChannelDown -ErrorRecord $caughtError -Uri $Uri
         }
 
         $rawBody = $null
