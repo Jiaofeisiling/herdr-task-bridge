@@ -31,6 +31,12 @@ That port exists because of VS Code's SSH port forwarding. If you cannot
 reach it, the SSH session has dropped -- the bridge itself is not the
 problem. Ask the user to reconnect; do not try to restart anything.
 
+The client prints CHANNEL DOWN and exits 4, naming which state applies --
+nothing listening, or connected but never replying -- and what fixes it.
+**The bridge's state is unknown at that point, not bad**: it is usually
+running fine on the remote side. Do not conclude that the remote has not
+recovered; try again once the user has reconnected, which often succeeds.
+
 ## You cannot see that machine
 
 You have no direct view of the cluster. Never hard-code partition names,
