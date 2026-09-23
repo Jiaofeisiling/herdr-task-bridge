@@ -56,12 +56,21 @@ POST /ask                 synchronous; blocks until there is a result
 POST /delegate            asynchronous; returns a task_id immediately
      body: {"task": "...", "agent": "...", "timeout_ms": N}
 
-Address an agent by the `name` from /agents; for an agent with no name,
-use its `pane_id`. Omit `agent` to get the default. Anything that might
-run longer than a couple of minutes goes through /delegate plus polling.
+**Prefer not to name an agent.** Omit it and the bridge picks one that
+can take work now. Naming one ties the task to that agent, so it waits
+even while others sit idle; name one only when you genuinely need its
+session context. To name one, use the `name` from /agents, or the
+`pane_id` for an agent that has none.
+
+Anything that might run longer than a couple of minutes goes through
+/delegate plus polling.
 
 ## Task states
 
+queued            not started yet. The `queued_reason` field says why --
+                  usually the target agent is busy. That is not a fault;
+                  wait. If it says the agent is not running at all,
+                  delegate again without naming an agent
 done              finished; result_text holds the answer
 error             execution or result collection failed; see error_text
 orphaned          the bridge restarted mid-task. It may have run partly
@@ -127,9 +136,13 @@ system more likely to stop it, where its native tools would not be.
 - The agent's answer leaves that host as a complete, untruncated file. Do
   not delegate tasks whose output would be credentials, keys or private
   data.
-- When an agent refuses an operation, do not rephrase and retry, and do
-  not route around it via a different agent. Report the refusal verbatim
-  to the user.
+- When an agent **refuses** an operation -- on permissions, policy, or its
+  own judgement -- do not rephrase and retry, and do not route around it
+  via a different agent. Report the refusal verbatim to the user.
+  Being busy is not a refusal: an agent_status of working, a blocked
+  reply, or a task sitting at queued all mean it has no hands free right
+  now. Waiting, or using a free agent instead, is ordinary and is not
+  routing around anything.
 - Restarting the bridge orphans whatever task is running. That is
   expected, not a fault.
 - Ask the user before anything irreversible: deleting data, overwriting

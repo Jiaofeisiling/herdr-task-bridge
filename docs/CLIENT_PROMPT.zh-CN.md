@@ -49,11 +49,17 @@ POST /ask                 同步执行，阻塞直到有结果
 POST /delegate            异步入队，立即返回 task_id
      body: {"task": "...", "agent": "...", "timeout_ms": N}
 
-用 /agents 里的 name 指定 agent；没有 name 的 agent 用它的 pane_id。
-省略 agent 则使用默认 agent。可能超过几分钟的任务一律走 /delegate 后轮询。
+**默认不要指定 agent**——省略它，桥会自动挑一个当下能接活的。指定某个
+agent 意味着任务只能等它，别的 agent 再空闲也不会接手；只有确实需要它的
+会话上下文时才指定。要指定就用 /agents 里的 name，没有 name 的用 pane_id。
+
+可能超过几分钟的任务一律走 /delegate 后轮询。
 
 ## 任务状态
 
+queued            尚未开始。`queued_reason` 字段会说明原因——通常是目标
+                  agent 正忙。这不是故障，等着就行；若它说该 agent 根本
+                  不在运行，就重新派发且不要指定 agent
 done              完成，result_text 是结果
 error             执行或结果收集失败，见 error_text
 orphaned          桥在任务执行期间重启了。任务可能已部分或全部执行完，
@@ -106,8 +112,10 @@ TUI 在任务完成后不会清屏，所以 `read` 返回的经常是上一次�
 
 - agent 的回答会以完整、未截断的文件形式离开那台主机。不要委派会让它
   输出凭据、密钥或私有数据的任务。
-- agent 拒绝某个操作时，不要换个说法重试，也不要换个 agent 绕过去。
-  把拒绝原样报告给用户。
+- agent **拒绝**某个操作时（权限、策略、它认为不该做），不要换个说法重试，
+  也不要换个 agent 绕过去，把拒绝原样报告给用户。
+  但"忙"不是拒绝：agent_status 是 working、或报 blocked、或任务停在 queued，
+  都只是它此刻腾不出手。等一等或换个空闲 agent 都完全正常，不算绕过。
 - 重启桥会让当时正在执行的任务变成 orphaned。这是预期行为，不是故障。
 - 不可逆的操作先问用户：删除数据、覆盖结果、修改共享配置。提交和取消
   Slurm 作业不在此列——它们是可逆的，放手做。

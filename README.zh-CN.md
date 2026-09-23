@@ -173,7 +173,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `quota` | GET | `/quota` | 列出因模型提供商额度或余额错误而被临时阻断的 agent。 |
 | `quota-reset` | POST | `/quota/reset` | 使用 `-Agent` 清除一个 agent 的额度熔断；刻意不传时清除全部熔断。 |
 | `delegate <task>` | POST | `/delegate` | 将任务加入队列并返回 `task_id`；服务端默认超时为 6 小时。 |
-| `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态：`queued`、`running`、`done`、`error`、`orphaned` 或 `quota_exhausted`。 |
+| `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态，附带执行中的 `progress`；处于 `queued` 时还会给出 `queued_reason`，说明它在等什么。 |
 | `wait <task_id>` | GET | `/tasks/<id>` | 每 3 秒轮询至终态，再输出结果或错误。 |
 | `tasks` | GET | `/tasks` | 列出最近 20 个任务。 |
 | `ask <task>` | POST | `/ask` | 同步执行并返回 agent 结果；目标 agent 忙时返回 `409`。 |
