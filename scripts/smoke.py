@@ -85,6 +85,17 @@ def check_channel(base, token):
             "  The bridge process on the host is probably fine."
         )
 
+    if body.get("reason") == "worker_dead":
+        # Named rather than left as a generic 503: this is the state that
+        # looks fine from outside, because the bridge still accepts
+        # /delegate and returns a task_id for work that will never run.
+        raise ChannelDown(
+            f"{base}/health reports the task worker is dead.\n"
+            "  The channel is fine and the bridge answers, but queued tasks\n"
+            "  will never run. Restart the bridge on the host. No functional\n"
+            "  checks were run: they would queue work that goes nowhere."
+        )
+
     if status != 200 or not body.get("ok"):
         raise ChannelDown(
             f"{base}/health answered {status}: {json.dumps(body)[:200]}\n"

@@ -889,3 +889,35 @@ Describe "wait rides out a transient channel failure" {
         finally { $stub.Listener.Stop() }
     }
 }
+
+Describe "a bridge that answers with an error is still a bridge that answers" {
+    # /health now returns 503 when the bridge's worker thread has died. The
+    # liveness probe treated every exception as "no answer", so a bridge that
+    # was up but unhealthy would have been reported as a dead channel -- and
+    # the reader sent to reconnect a tunnel that was working perfectly.
+
+    It "does not call it a dead channel when the probe gets a 503" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("ready") `
+                -Env @{ SENTINEL_CLIENT_TIMEOUT_SEC = "2" }
+
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000      # stalls
+            $probe = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000     # /health
+            Send-StubResponse -Context $probe.Context -Status 503 -Payload @{
+                ok = $false; reason = "worker_dead"; worker_alive = $false
+            }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+            $output = "$($result.StdOut)$($result.StdErr)"
+
+            # Exit 5: the bridge was reached. Not 4, which says it was not.
+            $result.ExitCode | Should -Be 5
+            $output | Should -Not -Match "CHANNEL DOWN"
+            # And it says what is actually wrong, rather than guessing a herdr call.
+            $output | Should -Match "worker_dead"
+            $output | Should -Match "restart"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}

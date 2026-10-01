@@ -94,6 +94,11 @@ queued            not started yet. The `queued_reason` field says why --
                   delegate again without naming an agent
 done              finished; result_text holds the answer
 error             execution or result collection failed; see error_text
+error / orphaned  not always final. If the agent delivers after the bridge
+                  gave up, the task turns into done by itself, with
+                  `recovered_at` set. After a 504 from ask, or an orphaned
+                  task, query the task again later before concluding the
+                  work was lost.
 orphaned          the bridge restarted mid-task. It may have run partly
                   or completely -- do not assume it did not run
 quota_exhausted   every eligible fallback agent was quota-blocked; the

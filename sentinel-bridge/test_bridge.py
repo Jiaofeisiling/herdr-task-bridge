@@ -3082,3 +3082,443 @@ def test_a_hung_herdr_is_a_504_not_a_500(live_server, monkeypatch, path):
     assert status == 504
     assert body["reason"] == "herdr_timeout"
     assert "herdr" in body["error"]
+
+
+# --- a result that arrives after the bridge stopped waiting ------------
+#
+# Measured on the live host: 189 result files sitting uncollected, of which
+# 76 belonged to tasks the bridge had marked error, 2 to orphaned ones, and
+# 111 to no task at all. None belonged to a done task -- normal collection
+# deletes the file, so every one of these was a result the agent delivered
+# and the bridge threw away. The 111 are synchronous asks: /ask never wrote
+# a row, so when its result arrived after the timeout the caller held a
+# task_id that returned 404 and the answer had nowhere to go.
+
+
+def _result_for(task_id, text="the late answer"):
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _make_task(tmp_path, monkeypatch, status, error_text="boom"):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    with bridge.db_session() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ?, error_text = ? WHERE task_id = ?",
+            (status, error_text, task_id),
+        )
+    return task_id
+
+
+@pytest.mark.parametrize("status", ["error", "orphaned"])
+def test_a_late_result_is_adopted(tmp_path, monkeypatch, status):
+    task_id = _make_task(tmp_path, monkeypatch, status, "gave up waiting")
+    _result_for(task_id)
+
+    task = bridge.adopt_late_result(task_id)
+
+    assert task["status"] == "done"
+    assert task["result_text"] == "the late answer"
+    assert task["recovered_at"]
+    # History is kept rather than rewritten: what went wrong is still true.
+    assert "gave up waiting" in task["error_text"]
+    assert "late" in task["error_text"].lower()
+    # Taken, so it is not adopted twice and does not linger.
+    assert not os.path.exists(bridge.result_file_path(task_id))
+
+
+@pytest.mark.parametrize("status", ["done", "queued", "running", "quota_exhausted"])
+def test_only_failed_or_orphaned_tasks_adopt(tmp_path, monkeypatch, status):
+    task_id = _make_task(tmp_path, monkeypatch, status)
+    _result_for(task_id)
+
+    # A running task's file is about to be read by the worker; adopting it
+    # here would race the normal path. A queued one has no result to speak of.
+    assert bridge.adopt_late_result(task_id) is None
+    assert bridge.get_task(task_id)["status"] == status
+
+
+def test_nothing_to_adopt_without_a_file_or_with_an_empty_one(tmp_path, monkeypatch):
+    task_id = _make_task(tmp_path, monkeypatch, "error")
+
+    assert bridge.adopt_late_result(task_id) is None
+
+    _result_for(task_id, "   \n")
+    # Whitespace is not an answer, and treating it as one would turn a
+    # failure into a blank success.
+    assert bridge.adopt_late_result(task_id) is None
+    assert bridge.get_task(task_id)["status"] == "error"
+
+
+def test_concurrent_adoptions_take_the_result_once(tmp_path, monkeypatch):
+    task_id = _make_task(tmp_path, monkeypatch, "error")
+    _result_for(task_id)
+    outcomes = []
+
+    threads = [
+        threading_module.Thread(target=lambda: outcomes.append(bridge.adopt_late_result(task_id)))
+        for _ in range(6)
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    adopted = [o for o in outcomes if o]
+    assert len(adopted) == 1
+    assert bridge.get_task(task_id)["result_text"] == "the late answer"
+
+
+def test_querying_a_task_adopts_its_late_result(tmp_path, monkeypatch, live_server):
+    task_id = _make_task(tmp_path, monkeypatch, "orphaned")
+    _result_for(task_id)
+
+    status, body = _get(live_server, f"/tasks/{task_id}")
+
+    assert body["task"]["status"] == "done"
+    assert body["task"]["result_text"] == "the late answer"
+
+
+def test_listing_tasks_adopts_late_results_too(tmp_path, monkeypatch, live_server):
+    task_id = _make_task(tmp_path, monkeypatch, "error")
+    _result_for(task_id)
+
+    status, body = _get(live_server, "/tasks")
+
+    assert [t["status"] for t in body["tasks"] if t["task_id"] == task_id] == ["done"]
+
+
+def test_startup_adopts_the_backlog(tmp_path, monkeypatch):
+    first = _make_task(tmp_path, monkeypatch, "error")
+    second = bridge.create_task("other", 60000, "w1:p1")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'orphaned' WHERE task_id = ?", (second,))
+    _result_for(first)
+    _result_for(second, "second answer")
+
+    assert bridge.adopt_all_late_results() == 2
+    assert bridge.get_task(second)["result_text"] == "second answer"
+
+
+# --- synchronous ask leaves a row when a late result is possible -------
+
+
+def _ask_failing_with(live_server, monkeypatch, error):
+    monkeypatch.setattr(
+        bridge, "run_with_quota_failover",
+        lambda *a, **k: (_ for _ in ()).throw(error),
+    )
+    return _post(live_server, "/ask", {"task": "audit", "agent": "w1:p1", "timeout_ms": 5000})
+
+
+def test_an_ask_that_times_out_leaves_a_recoverable_task(tmp_path, monkeypatch, live_server):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+
+    status, body = _ask_failing_with(live_server, monkeypatch, TimeoutError("gave up"))
+
+    assert status == 504
+    task_id = body["task_id"]
+    # The caller holds this id. It used to 404, which is where the answer
+    # went to die.
+    assert bridge.get_task(task_id)["status"] == "orphaned"
+    assert "recover" in body["hint"].lower()
+
+    _result_for(task_id)
+    _, later = _get(live_server, f"/tasks/{task_id}")
+    assert later["task"]["status"] == "done"
+    assert later["task"]["result_text"] == "the late answer"
+
+
+def test_an_ask_with_no_result_after_a_reminder_is_recoverable_too(tmp_path, monkeypatch, live_server):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+
+    status, body = _ask_failing_with(
+        live_server, monkeypatch, bridge.SentinelResultMissingError("never wrote it", raw_output="tail")
+    )
+
+    assert status == 502
+    assert bridge.get_task(body["task_id"])["status"] == "error"
+
+
+def test_a_successful_ask_still_writes_no_row(tmp_path, monkeypatch, live_server):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("done"))
+
+    status, body = _post(live_server, "/ask", {"task": "audit", "agent": "w1:p1", "timeout_ms": 5000})
+
+    # The success path is untouched: no new write, no new place to go wrong.
+    assert status == 200
+    assert bridge.get_task(body["task_id"]) is None
+
+
+def test_a_refused_ask_writes_no_row(tmp_path, monkeypatch, live_server):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "working"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("working", {"ok": True}))
+
+    status, body = _post(live_server, "/ask", {"task": "audit", "agent": "w1:p1", "timeout_ms": 5000})
+
+    # Nothing ran, so there is nothing that could arrive late.
+    assert status == 409
+    assert bridge.list_tasks() == []
+
+
+# --- /health must not say ok while the worker is dead ------------------
+#
+# A bridge whose worker thread has died still accepts /delegate and returns
+# a task_id, and the task never runs. /health used to report that state as
+# {"ok": true, "worker_alive": false} -- a response that contradicts
+# itself, and one every check that looks only at ok would pass.
+
+
+class _DeadThread:
+    def is_alive(self):
+        return False
+
+
+class _LiveThread:
+    def is_alive(self):
+        return True
+
+
+def test_health_is_503_when_the_worker_is_dead(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "_worker_thread", _DeadThread())
+
+    status, body = _get(live_server, "/health")
+
+    assert status == 503
+    assert body["ok"] is False
+    assert body["reason"] == "worker_dead"
+    assert body["worker_alive"] is False
+    # Names the consequence, since the queue accepting work is what makes
+    # this state look fine from outside.
+    assert "never run" in body["error"]
+
+
+def test_health_is_unchanged_with_a_live_worker(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "_worker_thread", _LiveThread())
+
+    status, body = _get(live_server, "/health")
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["worker_alive"] is True
+
+
+def test_health_is_unchanged_when_no_worker_was_started(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "_worker_thread", None)
+
+    status, body = _get(live_server, "/health")
+
+    # Not started is not dead: the test harness and any embedding that
+    # drives the queue itself must not be reported unhealthy for it.
+    assert status == 200
+    assert body["worker_alive"] is None
+
+
+# --- orderly shutdown --------------------------------------------------
+#
+# bridge-restart stops the bridge with a signal, and the default action for
+# one is to die on the spot: no log line, in-flight requests cut off, and a
+# running task left to be marked orphaned later with a message that says
+# nothing about why. The listener also stayed bound until the process was
+# gone, which matters when a new one is started two seconds after.
+
+
+class _FakeServer:
+    def __init__(self):
+        self.calls = []
+
+    def shutdown(self):
+        self.calls.append("shutdown")
+
+    def server_close(self):
+        self.calls.append("close")
+
+
+@pytest.fixture
+def _fresh_shutdown(monkeypatch):
+    monkeypatch.setattr(bridge, "_shutting_down", False)
+    monkeypatch.setattr(bridge, "_inflight", 0)
+
+
+def test_requests_in_flight_are_counted(_fresh_shutdown):
+    assert bridge._inflight == 0
+
+    with bridge.track_inflight():
+        assert bridge._inflight == 1
+        with bridge.track_inflight():
+            assert bridge._inflight == 2
+
+    assert bridge._inflight == 0
+
+
+def test_the_in_flight_count_is_released_when_a_handler_raises(_fresh_shutdown):
+    with pytest.raises(RuntimeError):
+        with bridge.track_inflight():
+            raise RuntimeError("handler blew up")
+
+    # A leaked count would make every later shutdown wait out its full
+    # grace period for a request that ended long ago.
+    assert bridge._inflight == 0
+
+
+def test_the_listener_closes_before_draining(tmp_path, monkeypatch, _fresh_shutdown):
+    _fresh_db(tmp_path, monkeypatch)
+    server = _FakeServer()
+    monkeypatch.setattr(bridge, "_inflight", 1)
+
+    worker = threading_module.Thread(
+        target=lambda: bridge.graceful_shutdown(server, grace_sec=5, signame="SIGTERM")
+    )
+    worker.start()
+    time.sleep(0.3)
+
+    # Still waiting on the in-flight request, yet the port is already free.
+    # Closing last would leave it bound while a new process, started a couple
+    # of seconds later, tried to take it.
+    assert server.calls == ["shutdown", "close"]
+    assert worker.is_alive()
+
+    monkeypatch.setattr(bridge, "_inflight", 0)
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+def test_draining_gives_up_after_the_grace_period(tmp_path, monkeypatch, _fresh_shutdown):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "_inflight", 3)
+
+    started = time.monotonic()
+    drained = bridge.graceful_shutdown(_FakeServer(), grace_sec=0.4, signame="SIGTERM")
+
+    # A synchronous ask can run for minutes; waiting for it would turn
+    # every restart into a hang.
+    assert drained is False
+    assert time.monotonic() - started < 3
+
+
+def test_a_running_task_is_orphaned_with_the_real_reason(tmp_path, monkeypatch, _fresh_shutdown):
+    _fresh_db(tmp_path, monkeypatch)
+    running = bridge.create_task("audit", 60000, "w1:p1")
+    queued = bridge.create_task("later", 60000, "w1:p1")
+    bridge.claim_task(running)
+
+    bridge.graceful_shutdown(_FakeServer(), grace_sec=0, signame="SIGTERM")
+
+    task = bridge.get_task(running)
+    assert task["status"] == "orphaned"
+    assert "SIGTERM" in task["error_text"]
+    # Says what happens next instead of leaving the reader to wonder.
+    assert "recover" in task["error_text"].lower()
+    # A task that never started has nothing to be orphaned about.
+    assert bridge.get_task(queued)["status"] == "queued"
+
+
+def test_a_second_signal_does_nothing(tmp_path, monkeypatch, _fresh_shutdown):
+    _fresh_db(tmp_path, monkeypatch)
+    server = _FakeServer()
+
+    bridge.graceful_shutdown(server, grace_sec=0, signame="SIGHUP")
+    bridge.graceful_shutdown(server, grace_sec=0, signame="SIGTERM")
+
+    # bridge-restart sends two in quick succession (the screen session being
+    # quit, then the kill), so the second must not repeat the first.
+    assert server.calls == ["shutdown", "close"]
+
+
+# --- the real thing: a signal to a real process ------------------------
+#
+# The tests above drive graceful_shutdown() directly. What they cannot cover
+# is the wiring: that the handler is registered, that it does not deadlock by
+# calling server.shutdown() on the thread that is inside serve_forever(), and
+# that the process actually exits. This starts a real bridge and signals it.
+#
+# POSIX only: Windows cannot deliver SIGTERM or SIGHUP to another process, so
+# on a Windows machine this is skipped and CI (ubuntu) is what runs it.
+
+
+def _wait_until_up(port, proc, seconds=15):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError("bridge exited early:\n" + proc.stdout.read())
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+            conn.request("GET", "/health")
+            conn.getresponse().read()
+            conn.close()
+            return
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError("bridge never came up")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot deliver POSIX signals")
+@pytest.mark.parametrize("sig_name", ["SIGTERM", "SIGHUP"])
+def test_a_real_signal_stops_the_bridge_in_an_orderly_way(tmp_path, sig_name):
+    import signal as signal_module
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    db = tmp_path / "tasks.db"
+    env = dict(
+        os.environ,
+        SENTINEL_BRIDGE_PORT=str(port),
+        SENTINEL_DB=str(db),
+        SENTINEL_RESULT_DIR=str(tmp_path / "results"),
+        SENTINEL_SHUTDOWN_GRACE_SEC="1",
+        HERDR_BIN="/bin/false",
+    )
+    proc = subprocess_module.Popen(
+        [sys.executable, "-u", "bridge.py"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env=env,
+        stdout=subprocess_module.PIPE,
+        stderr=subprocess_module.STDOUT,
+        text=True,
+    )
+
+    try:
+        _wait_until_up(port, proc)
+
+        # A task the bridge believes is running, planted once it is up so the
+        # startup orphaning does not already claim it.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO tasks (task_id, task, agent, status, created_at, timeout_ms)"
+            " VALUES ('running-1', 'audit', 'w1:p1', 'running', 'now', 60000)"
+        )
+        conn.commit()
+        conn.close()
+
+        proc.send_signal(getattr(signal_module, sig_name))
+        exit_code = proc.wait(timeout=15)
+        output = proc.stdout.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    # It exits, rather than dying on the spot or hanging on its own handler.
+    assert exit_code == 0, output
+    assert f"[shutdown] {sig_name} received" in output
+
+    # The listener was released, which is what lets a new process take the
+    # port a couple of seconds later.
+    with socket.socket() as again:
+        again.bind(("127.0.0.1", port))
+
+    conn = sqlite3.connect(db)
+    status, error_text = conn.execute(
+        "SELECT status, error_text FROM tasks WHERE task_id = 'running-1'"
+    ).fetchone()
+    conn.close()
+
+    assert status == "orphaned"
+    assert sig_name in error_text
