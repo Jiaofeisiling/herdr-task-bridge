@@ -147,11 +147,26 @@ function Get-ChannelFailureKind {
 # is known about it either way. A caller once reported a remote outage on
 # the strength of a failure that was entirely on this side of the tunnel.
 function Test-BridgeAnswers {
+    $Script:ProbeNote = $null
+
     try {
         $null = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get -TimeoutSec $ProbeTimeoutSec
         return $true
     }
     catch {
+        # Any HTTP response at all -- even a 503 -- means the bridge is there
+        # and answering. Treating every exception as "no answer" would report
+        # a bridge that is up but unhealthy (its worker thread dead, say) as a
+        # dead channel, and send the reader to reconnect a tunnel that works.
+        if ($null -ne $_.Exception.Response) {
+            $reason = $null
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                try { $reason = ($_.ErrorDetails.Message | ConvertFrom-Json).reason } catch { }
+            }
+            $Script:ProbeNote = if ($reason) { $reason } else { "an HTTP error" }
+            return $true
+        }
+
         return $false
     }
 }
@@ -208,6 +223,11 @@ function Exit-ChannelDown {
             "  most often a herdr call on the host that is slow or hung. Do NOT reconnect",
             "  VS Code."
         )
+        if ($Script:ProbeNote) {
+            $lines += "  Note: /health answered, but reports the bridge itself unhealthy ($Script:ProbeNote)."
+            $lines += "  The channel is fine; the bridge needs attention on the host (restart it)."
+        }
+
         $advice = Get-RetryAdvice
         if ($advice.Count -eq 0) {
             # Only for a read, where repeating it cannot do any harm.

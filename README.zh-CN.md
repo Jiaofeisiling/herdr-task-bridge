@@ -216,6 +216,8 @@ queued → running → done
 
 - `orphaned` 表示 bridge 没有等到任务完成信号，**不等于**远程任务一定失败。不要直接重试；应先检查该任务是否已经产生实际影响。
 - `error` 表示 bridge 已确认执行或结果收集失败。
+- **`orphaned` 和 `error` 并不总是终态。** 如果 agent 在 bridge 停止等待之后才交付结果文件，该任务会被采纳：变为 `done`，`result_text` 被填入，`recovered_at` 被记录，原来的错误说明保留并追加一条注释，而不是被改写。这发生在启动时，以及每次查询该任务时（`task`、`wait`、`tasks`）。在这个机制出现之前，我在线上主机上量到的是：189 个已交付却未被采集的结果——76 个属于被标成 `error` 的任务，2 个属于 `orphaned`，111 个根本没有对应任务。没有一个属于 `done` 任务，这正是关键：正常采集会删除文件，所以这些全是 agent 给出了、bridge 却丢掉的答案。
+- **同步 `ask` 超时（504）或提醒后仍无结果（502）时，现在会留下一条任务记录**，并在 `hint` 中告知。此前那个响应里的 `task_id` 查询会返回 404，所以一分钟后才到的结果无处可去——这就是上面的 111 个。成功的 ask 和被拒绝的 ask（忙、不可用、额度）不写任何东西：前者不需要记录，后者什么都没发生，所以成功路径保持不变。
 - `quota_exhausted` 表示所有合资格备用 agent 也被额度熔断或报告了额度/余额失败；任务到此为止，不会继续重试。
 - bridge 重启时，所有仍为 `running` 的任务会被标记为 `orphaned`，绝不会被自动重跑。
 
@@ -286,6 +288,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_CLIENT_TIMEOUT_SEC` | `5` | 客户端（`sentinel.ps1`）侧：任何快速调用的时间上限。应明显小于你的调用方放弃等待的时间。 |
 | `SENTINEL_WAIT_TOLERANCE_SEC` | `60` | 客户端：`wait` 在通道持续中断时继续轮询多久，超过则以退出码 4 放弃。 |
 | `SENTINEL_ASK_GRACE_SEC` | `30` | 客户端：在 `ask`/`prompt` 自己的 `-TimeoutMs` 之外追加的宽限，超过才放弃。 |
+| `SENTINEL_SHUTDOWN_GRACE_SEC` | `5` | bridge 端：有序停机时等待已在处理中的请求多久，超时即放弃。 |
 | `SENTINEL_HERDR_TIMEOUT_SEC` | `30` | bridge 端：任何没自带超时的 herdr 调用的上限。herdr 卡住时表现为 504，而不是让请求线程无限阻塞。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 

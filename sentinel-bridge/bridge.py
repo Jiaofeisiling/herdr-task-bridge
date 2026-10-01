@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -18,9 +19,15 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 21
+BRIDGE_VERSION = 22
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
+
+# How long an orderly shutdown waits for requests already in flight. Short on
+# purpose: the listener is closed first, so nothing new arrives, and a
+# synchronous ask can run for minutes -- waiting for one would turn every
+# restart into a hang.
+SHUTDOWN_GRACE_SEC = float(os.environ.get("SENTINEL_SHUTDOWN_GRACE_SEC", "5"))
 
 # Upper bound on any single herdr call that did not name its own. The
 # default used to be None -- wait forever -- so a herdr that hung left the
@@ -389,7 +396,9 @@ def init_db():
                 slurm_policy TEXT,
 
                 idempotency_key TEXT,
-                request_fingerprint TEXT
+                request_fingerprint TEXT,
+
+                recovered_at TEXT
             )
         """)
 
@@ -407,6 +416,9 @@ def init_db():
         existing_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
         }
+
+        if "recovered_at" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN recovered_at TEXT")
 
         if "idempotency_key" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
@@ -470,6 +482,124 @@ def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None,
         validate_slurm_policy(slurm_policy),
         idempotency_key, fingerprint,
     ))
+
+
+# Task states in which a delivered result can still turn up. A queued or
+# running task is on the normal path -- the worker is about to read its file --
+# and quota_exhausted never reached an agent that could have written one.
+LATE_RESULT_STATUSES = ("error", "orphaned")
+
+
+def adopt_late_result(task_id):
+    """Take a result that arrived after the bridge had stopped waiting.
+
+    Measured on the live host: 189 result files sitting uncollected, of which
+    76 belonged to tasks marked error and 2 to orphaned ones. Every one was a
+    result the agent delivered and the bridge discarded, because nothing ever
+    looked at a result file once a task was no longer being waited on.
+
+    The task becomes done, with the original error text kept and a note added
+    rather than the history rewritten: what went wrong is still true, it
+    just was not the end of the story. The UPDATE is conditional on the task
+    still being failed, so concurrent callers adopt it once.
+    """
+    task = get_task(task_id)
+
+    if task is None or task["status"] not in LATE_RESULT_STATUSES:
+        return None
+
+    # Left in place until it is safely in the database: deleting first would
+    # lose the answer if the write failed.
+    content = read_result_file(task_id, cleanup=False)
+
+    if content is None:
+        return None
+
+    note = (
+        "Late delivery: the result arrived after the bridge had stopped "
+        f"waiting, and was recovered at {now_iso()}."
+    )
+
+    with db_session() as conn:
+        cursor = conn.execute("""
+            UPDATE tasks
+            SET status = 'done',
+                result_text = ?,
+                recovered_at = ?,
+                error_text = CASE
+                    WHEN error_text IS NULL OR error_text = '' THEN ?
+                    ELSE error_text || char(10) || ?
+                END
+            WHERE task_id = ? AND status IN ('error', 'orphaned')
+        """, (content, now_iso(), note, note, task_id))
+        adopted = cursor.rowcount == 1
+
+    if not adopted:
+        return None   # another caller got there first
+
+    try:
+        os.remove(result_file_path(task_id))
+    except OSError:
+        pass
+
+    discard_progress_file(task_id)
+    return get_task(task_id)
+
+
+def adopt_all_late_results():
+    """Sweep the backlog, at startup. Returns how many were adopted."""
+    with db_session() as conn:
+        ids = [
+            row["task_id"] for row in conn.execute(
+                "SELECT task_id FROM tasks WHERE status IN ('error', 'orphaned')"
+            )
+        ]
+
+    return sum(
+        1 for task_id in ids
+        if os.path.exists(result_file_path(task_id)) and adopt_late_result(task_id)
+    )
+
+
+def record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
+                        status, error_text):
+    """Leave a row behind for a synchronous ask that failed in a way a result
+    could still follow.
+
+    /ask never wrote a row. When its answer arrived after the timeout, the
+    caller held a task_id that returned 404 and the answer had nowhere to go:
+    111 of the 189 discarded results on the live host were exactly this.
+    Only the failures after which a result is possible get one -- success
+    needs no record, and a refusal (busy, unavailable, quota) means nothing
+    ran -- so the success path is untouched.
+
+    Best effort: failing to record must never replace the error being
+    reported with a database one.
+    """
+    try:
+        now = now_iso()
+        with db_session() as conn:
+            conn.execute("""
+                INSERT INTO tasks (
+                    task_id, task, agent, status, created_at, started_at,
+                    finished_at, timeout_ms, error_text, slurm_policy
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                task_id, task, agent_name, status, now, now, now, timeout_ms,
+                error_text, validate_slurm_policy(slurm_policy),
+            ))
+        return True
+    except Exception as e:
+        print(f"[ask {task_id}] could not record the failure: {e}")
+        return False
+
+
+SYNC_RECOVERY_HINT = (
+    "The agent may still finish. If it delivers a result after this response "
+    "it is recovered automatically: query this task_id later "
+    "(GET /tasks/<id>, or `sentinel.ps1 task <id>`)."
+)
 
 
 def find_task_by_idempotency_key(key):
@@ -1798,6 +1928,104 @@ def build_delegation_prompt(task, task_id, slurm_policy=None):
 写清楚做了什么、结论是什么、有没有卡住或改动了什么。文件会被整份取走，别写凭据。
 """.strip()
 
+_inflight = 0
+_inflight_lock = threading.Lock()
+_shutting_down = False
+_shutdown_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def track_inflight():
+    """Count requests being handled, so a shutdown can tell when it is quiet.
+
+    The decrement is in a finally: a leaked count would make every later
+    shutdown wait out its whole grace period for a request long gone.
+    """
+    global _inflight
+
+    with _inflight_lock:
+        _inflight += 1
+
+    try:
+        yield
+    finally:
+        with _inflight_lock:
+            _inflight -= 1
+
+
+def wait_for_inflight(grace_sec):
+    deadline = time.monotonic() + grace_sec
+
+    while True:
+        with _inflight_lock:
+            if _inflight == 0:
+                return True
+
+        if time.monotonic() >= deadline:
+            return False
+
+        time.sleep(0.05)
+
+
+def orphan_running_tasks(reason):
+    with db_session() as conn:
+        cursor = conn.execute("""
+            UPDATE tasks
+            SET status = 'orphaned', finished_at = ?,
+                error_text = COALESCE(error_text, ?)
+            WHERE status = 'running'
+        """, (now_iso(), reason))
+
+    return cursor.rowcount
+
+
+def graceful_shutdown(server, grace_sec=None, signame="signal"):
+    """Stop in an order that does not leave anything worse behind.
+
+    The default action for these signals is to die on the spot: no log line,
+    in-flight requests cut off, a running task left to be marked orphaned
+    later with a message that says nothing about why, and the listener bound
+    until the process is gone -- which matters when a new one is started two
+    seconds after, as bridge-restart does.
+
+    So: close the listener first, which frees the port at once and stops new
+    work arriving; then give requests already in flight a short, bounded
+    time; then say plainly why the running task is being orphaned. Returns
+    whether the drain finished within the grace period.
+
+    A second call is a no-op. bridge-restart sends two signals in quick
+    succession (the screen session is quit, then the process is killed), and
+    the second must not repeat what the first did.
+    """
+    global _shutting_down
+
+    with _shutdown_guard:
+        if _shutting_down:
+            return True
+        _shutting_down = True
+
+    grace = SHUTDOWN_GRACE_SEC if grace_sec is None else grace_sec
+
+    print(f"[shutdown] {signame} received; closing the listener")
+    server.shutdown()
+    server.server_close()
+
+    drained = wait_for_inflight(grace)
+
+    orphaned = orphan_running_tasks(
+        f"Bridge was stopped ({signame}) while this task was running. The "
+        "agent may still finish it; if it delivers a result, that result is "
+        "recovered automatically."
+    )
+
+    print(
+        f"[shutdown] {'drained' if drained else 'gave up draining'} in-flight "
+        f"requests; {orphaned} running task(s) marked orphaned"
+    )
+
+    return drained
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -1867,6 +2095,10 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def do_GET(self):
+        with track_inflight():
+            self._do_GET_guarded()
+
+    def _do_GET_guarded(self):
         try:
             self._do_GET()
         except subprocess.TimeoutExpired as e:
@@ -1906,7 +2138,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            self.send_json({
+            worker_alive = (
+                _worker_thread.is_alive() if _worker_thread else None
+            )
+
+            payload = {
                 "ok": True,
                 "service": "nesi-sentinel-bridge",
                 "version": BRIDGE_VERSION,
@@ -1914,10 +2150,25 @@ class Handler(BaseHTTPRequestHandler):
                 # should prefer default_agent, which better describes v4.
                 "agent": DEFAULT_AGENT,
                 "default_agent": DEFAULT_AGENT,
-                "worker_alive": (
-                    _worker_thread.is_alive() if _worker_thread else None
-                ),
-            })
+                "worker_alive": worker_alive,
+            }
+
+            if worker_alive is False:
+                # A bridge whose worker has died still accepts /delegate and
+                # hands back a task_id, so from outside it looks perfectly
+                # well. This used to answer ok:true next to worker_alive:false
+                # -- a response that contradicts itself, and one that every
+                # check looking only at ok would pass.
+                payload["ok"] = False
+                payload["reason"] = "worker_dead"
+                payload["error"] = (
+                    "The task worker thread has died. The bridge still accepts "
+                    "requests, but queued tasks will never run. Restart it."
+                )
+                self.send_json(payload, 503)
+                return
+
+            self.send_json(payload)
             return
 
         if path == "/agents":
@@ -2086,9 +2337,16 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/tasks":
+            # A late result may have arrived since anyone last looked.
+            tasks = [
+                (adopt_late_result(t["task_id"]) or t)
+                if t["status"] in LATE_RESULT_STATUSES else t
+                for t in list_tasks()
+            ]
+
             self.send_json({
                 "ok": True,
-                "tasks": list_tasks(),
+                "tasks": tasks,
             })
             return
 
@@ -2102,6 +2360,9 @@ class Handler(BaseHTTPRequestHandler):
                     404,
                 )
                 return
+
+            if task["status"] in LATE_RESULT_STATUSES:
+                task = adopt_late_result(task_id) or task
 
             # Read here rather than in get_task(): the worker calls that
             # on every poll and has no use for progress, so it should not
@@ -2130,6 +2391,10 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        with track_inflight():
+            self._do_POST_guarded()
+
+    def _do_POST_guarded(self):
         try:
             self._do_POST()
         except subprocess.TimeoutExpired as e:
@@ -2424,26 +2689,38 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         except TimeoutError as e:
-            self.send_json(
-                {
-                    "ok": False,
-                    "task_id": task_id,
-                    "error": str(e),
-                },
-                504,
-            )
+            payload = {
+                "ok": False,
+                "task_id": task_id,
+                "error": str(e),
+            }
+
+            # Orphaned, as the async worker does for the same failure: the
+            # bridge lost track, and the agent may still be working.
+            if path == "/ask" and record_sync_failure(
+                task_id, task, timeout_ms, agent_name, slurm_policy,
+                "orphaned", str(e),
+            ):
+                payload["hint"] = SYNC_RECOVERY_HINT
+
+            self.send_json(payload, 504)
             return
 
         except SentinelResultMissingError as e:
-            self.send_json(
-                {
-                    "ok": False,
-                    "task_id": task_id,
-                    "error": str(e),
-                    "raw_output": e.raw_output,
-                },
-                502,
-            )
+            payload = {
+                "ok": False,
+                "task_id": task_id,
+                "error": str(e),
+                "raw_output": e.raw_output,
+            }
+
+            if path == "/ask" and record_sync_failure(
+                task_id, task, timeout_ms, agent_name, slurm_policy,
+                "error", str(e),
+            ):
+                payload["hint"] = SYNC_RECOVERY_HINT
+
+            self.send_json(payload, 502)
             return
 
         except SentinelPromptError as e:
@@ -2474,6 +2751,12 @@ if __name__ == "__main__":
     print(f"Database: {DB_PATH}")
     print(f"Listening: http://{HOST}:{PORT}")
 
+    # Before the sweep, which would otherwise delete a result that is still
+    # wanted: adopt what a task is owed, then discard what nobody is.
+    recovered = adopt_all_late_results()
+    if recovered:
+        print(f"Recovered {recovered} late result(s) for failed or orphaned tasks")
+
     swept = purge_stale_result_files()
     if swept:
         print(f"Swept {swept} result file(s) older than {RESULT_RETENTION_DAYS}d")
@@ -2487,8 +2770,31 @@ if __name__ == "__main__":
         Handler,
     )
 
+    shutdown_done = threading.Event()
+    signalled = threading.Event()
+
+    def on_signal(signum, frame):
+        # server.shutdown() waits for serve_forever() to return, and this
+        # handler runs on the thread that is inside it, so it has to be called
+        # from another thread or it would wait on itself.
+        signalled.set()
+        name = signal.Signals(signum).name
+
+        def run():
+            graceful_shutdown(server, signame=name)
+            shutdown_done.set()
+
+        threading.Thread(target=run, daemon=True, name="sentinel-shutdown").start()
+
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, on_signal)
+
     try:
         server.serve_forever()
 
     except KeyboardInterrupt:
         print("\nStopping.")
+
+    if signalled.is_set():
+        shutdown_done.wait(timeout=SHUTDOWN_GRACE_SEC + 5)

@@ -78,6 +78,10 @@ queued            尚未开始。`queued_reason` 字段会说明原因——通�
                   不在运行，就重新派发且不要指定 agent
 done              完成，result_text 是结果
 error             执行或结果收集失败，见 error_text
+error / orphaned  不一定是终态。如果 agent 在桥放弃等待之后才交付结果，该
+                  任务会自己变成 done，并带上 `recovered_at`。ask 返回 504
+                  之后、或遇到 orphaned 任务时，先过一会儿再查一次那个任务，
+                  不要立刻断定工作丢了。
 orphaned          桥在任务执行期间重启了。任务可能已部分或全部执行完，
                   不要假定它没跑过
 quota_exhausted   所有合资格备用 agent 都被额度熔断，任务不会再重试

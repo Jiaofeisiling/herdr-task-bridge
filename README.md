@@ -216,6 +216,8 @@ queued → running → done
 
 - `orphaned` means the bridge lost the completion signal, not that the remote task necessarily failed. Do **not** blindly retry it; inspect the task's real effects first.
 - `error` means the bridge confirmed an execution or result-collection failure.
+- **`orphaned` and `error` are not always final.** If the agent delivers its result file after the bridge stopped waiting, the task is adopted: it becomes `done`, `result_text` is filled in, `recovered_at` is set, and the original error text is kept with a note rather than rewritten. This happens at startup, and whenever the task is queried (`task`, `wait`, `tasks`). Measured on the live host before this existed: 189 delivered results sitting uncollected — 76 on tasks marked `error`, 2 on `orphaned`, and 111 on no task at all. None belonged to a `done` task, which is the point: normal collection deletes the file, so every one of those was an answer the agent gave and the bridge threw away.
+- **A synchronous `ask` that times out (504) or finds no result after the reminder (502) now leaves a task row behind**, and says so in a `hint`. Before, the `task_id` in that response returned 404, so a result that arrived a minute later had nowhere to go — the 111 above. Successful asks and refused ones (busy, unavailable, quota) write nothing: the first needs no record and in the second nothing ran, so the success path is unchanged.
 - `quota_exhausted` means every eligible fallback was also quota-blocked or reported a quota/balance failure. The task was not retried after that result.
 - On restart, a task that was `running` becomes `orphaned`. The bridge never reruns it automatically.
 
@@ -286,6 +288,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_CLIENT_TIMEOUT_SEC` | `5` | Client-side (`sentinel.ps1`): upper bound on any quick call. Keep it comfortably under the time your caller waits before giving up. |
 | `SENTINEL_WAIT_TOLERANCE_SEC` | `60` | Client-side: how long `wait` polls through a continuous channel outage before giving up with exit 4. |
 | `SENTINEL_ASK_GRACE_SEC` | `30` | Client-side: slack added to an `ask`/`prompt`'s own `-TimeoutMs` before the client abandons it. |
+| `SENTINEL_SHUTDOWN_GRACE_SEC` | `5` | Bridge-side: how long an orderly shutdown waits for requests already in flight before giving up on them. |
 | `SENTINEL_HERDR_TIMEOUT_SEC` | `30` | Bridge-side: bound on any herdr call that did not name its own. A hung herdr surfaces as a 504 instead of blocking a request thread indefinitely. |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | How long a quota circuit stays open before expiring by itself. `0` keeps it open until cleared by hand. |
 
