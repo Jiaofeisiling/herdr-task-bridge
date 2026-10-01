@@ -177,7 +177,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `wait <task_id>` | GET | `/tasks/<id>` | 每 3 秒轮询至终态，再输出结果或错误。 |
 | `tasks` | GET | `/tasks` | 列出最近 20 个任务。 |
 | `ask <task>` | POST | `/ask` | 同步执行并返回 agent 结果；目标 agent 忙时返回 `409`。 |
-| `prompt <task>` | POST | `/prompt` | 同步发送任务，但不提取结果。 |
+| `prompt <task>` | POST | `/prompt` | 同步发送任务，但不提取结果。文本会被包进委派信封，所以它是一个任务而不是一次按键：用它发 `/compact` 并不是斜杠命令。带 `-Agent` 时只会发给那个 agent，绝不会被转给备用 agent。 |
 
 通用客户端参数为 `-Agent <name>`、`-TimeoutMs <milliseconds>`（用于 `ask`、`prompt` 和 `delegate`）以及 `-Lines <count>`（用于 `read`）。agent 名称会去除首尾空白，不能为空，最长 200 个字符。请求超时必须在 1 秒至 6 小时之间。
 
@@ -269,6 +269,18 @@ sentinel quota-reset -Agent "your-agent-name"
 
 不要仅仅因为 agent 显示 `idle` 就清除熔断：模型提供商额度未恢复时，agent 仍然可能显示为空闲。
 
+#### 不是额度的拒绝
+
+提供商还可能因为 agent 的**会话已经超过单次请求的大小上限**而拒绝它，例如 OpenRouter 的 `Prompt tokens limit exceeded: 334110 > 185528`。在 bridge 看来这和成功一模一样：herdr 把这个 agent 报告为 `done`（任何一轮结束都是这样），拒绝信息只以文字形式出现在 agent 自己的终端里。在这类情况被识别之前：任务会失败成"从未写出结果文件——请检查权限"，`prompt` 会返回 `ok: true`，`ready` 还一直说 agent 就绪。
+
+现在它按额度的方式处理——熔断加故障转移——但因为治法不同，有几处差别：
+
+- 熔断在 `/quota` 和 `/ready` 里标为 `kind: context_limit`（额度是 `kind: quota`），`/ready` 还会给出 `hint`：这个会话必须在它自己的终端里压缩或重启，再给它发任务只会以同样方式失败。
+- 它在 `SENTINEL_CONTEXT_BLOCK_TTL_SECONDS`（默认 10 分钟）后失效，而不是额度的一小时：治法是有人动手，比这更久的熔断会让已经恢复的 agent 继续被挡在外面。
+- 发生故障转移的任务会记录它实际在别处运行：任务行里保留的是被请求的 agent，另有一条备注说明由哪个 agent 完成。
+- `/prompt` 会比较 prompt 发送前后 agent 终端的内容。**新出现**的拒绝会被报告为 `ok: false`、`reason: provider_rejected`（HTTP 502）；屏幕上本来就有的旧错误不算：它说明不了这一次 prompt 的任何事，把它当成证据会给一个健康的 agent 开熔断。发送前读不到终端时，不下任何结论。
+- 一轮在 `SENTINEL_QUICK_END_SEC`（默认 15 秒）内结束且没有结果文件，不可能真的执行过任务。此时会报告 `reason: ended_quickly` 并如实说明，而不是把人引向权限问题。这个判断不依赖提供商的措辞，所以也覆盖 bridge 没有对应模式的拒绝。只匹配实际见过的措辞：往里加猜测的措辞，会给健康的 agent 开熔断。
+
 ## 配置与安全
 
 远程服务读取以下环境变量：
@@ -293,6 +305,8 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_NOT_STARTED_GRACE_SEC` | `8` | 同样的中止之后，等待多久还没有任何活动迹象，就报告"送达情况未知"。 |
 | `SENTINEL_SHUTDOWN_GRACE_SEC` | `5` | bridge 端：有序停机时等待已在处理中的请求多久，超时即放弃。 |
 | `SENTINEL_HERDR_TIMEOUT_SEC` | `30` | bridge 端：任何没自带超时的 herdr 调用的上限。herdr 卡住时表现为 504，而不是让请求线程无限阻塞。 |
+| `SENTINEL_CONTEXT_BLOCK_TTL_SECONDS` | `600` | 因会话过大被拒而开启的熔断保持多久。比额度的短，因为治法是有人去压缩或重启会话。 |
+| `SENTINEL_QUICK_END_SEC` | `15` | 一轮结束得比这更快且没有结果文件，就报告为 `ended_quickly`：快到不可能执行过任务。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 
 将 [`remote/bridge.env.example`](remote/bridge.env.example) 复制为未追踪的 `remote/bridge.env`，再填写部署专用配置。绝不要提交真实主机名、项目标识、路径、用户名、任务提示词或令牌；项目的敏感信息规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。

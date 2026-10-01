@@ -177,7 +177,7 @@ If the host has more than one Herdr agent, inspect them and select one explicitl
 | `wait <task_id>` | GET | `/tasks/<id>` | Polls every three seconds until a terminal state, then prints the result or error. |
 | `tasks` | GET | `/tasks` | Lists the 20 most recent tasks. |
 | `ask <task>` | POST | `/ask` | Runs synchronously and returns the agent result; returns `409` if that agent is busy. |
-| `prompt <task>` | POST | `/prompt` | Runs synchronously but does not extract a result. |
+| `prompt <task>` | POST | `/prompt` | Runs synchronously but does not extract a result. The text is wrapped in the delegation envelope, so it is a task, not a keystroke: `/compact` sent this way is not a slash command. With `-Agent` it goes to exactly that agent -- never to a fallback. |
 
 Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask`, `prompt`, and `delegate`), and `-Lines <count>` (for `read`). Agent names are trimmed, must be non-empty, and are limited to 200 characters. Request timeouts must be between 1 second and 6 hours.
 
@@ -269,6 +269,18 @@ sentinel quota-reset -Agent "your-agent-name"
 
 Do not clear a circuit merely because an agent is `idle`: provider limits can leave an agent idle while its account remains unavailable.
 
+#### A refusal that is not quota
+
+A provider can also refuse an agent because its **session has outgrown a per-request size limit** — for example OpenRouter's `Prompt tokens limit exceeded: 334110 > 185528`. From the bridge's side this looks exactly like success: herdr reports the agent `done`, as it does after any turn, and the refusal exists only as text in the agent's terminal. Before this was recognised, a task failed as "never wrote its result file — check permissions", a `prompt` returned `ok: true`, and `ready` kept saying the agent was ready.
+
+It is now handled like a quota — a circuit, a failover — with differences that follow from the cure being different:
+
+- The circuit is labelled `kind: context_limit` (a quota is `kind: quota`) in `/quota` and `/ready`, and `/ready` carries a `hint`: the session has to be compacted or restarted in its own terminal, and sending it more work fails the same way.
+- It expires after `SENTINEL_CONTEXT_BLOCK_TTL_SECONDS` (default 10 minutes), not the quota's hour: the fix is a person acting, and a circuit that outlived it would keep a recovered agent out of service.
+- A task that fails over is recorded as having run elsewhere: the row keeps the agent that was asked for, and a note says which one did the work.
+- `/prompt` compares the agent's terminal from just before and just after the prompt. A refusal that is **new** is reported as `ok: false`, `reason: provider_rejected` (HTTP 502). An old error still on screen is not: it proves nothing about this prompt, and accusing a healthy agent opens a circuit on it. If the terminal cannot be read beforehand, nothing is claimed.
+- A turn that ends within `SENTINEL_QUICK_END_SEC` (default 15 s) with no result file cannot have run the task. That is reported as `reason: ended_quickly` and says so, instead of pointing at permissions. This needs no knowledge of the provider's wording, so it also covers refusals the bridge has no pattern for. Only wording actually observed is matched; adding a guess would open a circuit on a healthy agent.
+
 ## Configuration and security
 
 The remote service reads the following environment variables:
@@ -293,6 +305,8 @@ The remote service reads the following environment variables:
 | `SENTINEL_NOT_STARTED_GRACE_SEC` | `8` | After such an abort, how long to wait for any sign of activity before reporting that delivery is unknown. |
 | `SENTINEL_SHUTDOWN_GRACE_SEC` | `5` | Bridge-side: how long an orderly shutdown waits for requests already in flight before giving up on them. |
 | `SENTINEL_HERDR_TIMEOUT_SEC` | `30` | Bridge-side: bound on any herdr call that did not name its own. A hung herdr surfaces as a 504 instead of blocking a request thread indefinitely. |
+| `SENTINEL_CONTEXT_BLOCK_TTL_SECONDS` | `600` | How long a circuit opened by a session-size refusal stays open. Shorter than the quota's, because the cure is someone compacting or restarting the session. |
+| `SENTINEL_QUICK_END_SEC` | `15` | A turn that ends sooner than this with no result file is reported as `ended_quickly`: too fast to have run the task. |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | How long a quota circuit stays open before expiring by itself. `0` keeps it open until cleared by hand. |
 
 Copy [`remote/bridge.env.example`](remote/bridge.env.example) to the untracked `remote/bridge.env` for deployment-specific values. Never commit real hostnames, project identifiers, paths, usernames, prompts, or tokens; see [CONTRIBUTING.md](CONTRIBUTING.md) for the project's sensitive-data rules.
