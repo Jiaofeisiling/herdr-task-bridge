@@ -196,6 +196,10 @@ Code `4` is deliberately distinct. When the SSH forward is not in place, the bri
 
 Every quick command is bounded (5 s by default, `SENTINEL_CLIENT_TIMEOUT_SEC`). That bound exists because a caller typically gives a command 10–30 s before it hands back an empty result and reports it blocked; measured over 3,400 recorded calls, `health` took 1.9 s at the median and every empty result took exactly the caller's own wait. PowerShell 7's `Invoke-RestMethod` has **no timeout by default**, so a forward that still accepted connections but no longer reached the host used to hang the client indefinitely, and the explanation below could never arrive in time to be read. `ask` and `prompt` are bounded by the `-TimeoutMs` you gave them plus 30 s, so a legitimately slow one is not cut off.
 
+**Retrying is not always safe, and the client says so.** A request that gets no reply may already have taken effect: the reply was lost, not necessarily the request. `delegate` therefore carries an idempotency key (generated if you do not pass one, printed if the reply is lost), and retrying with the same `-IdempotencyKey` returns the original task instead of queueing a second copy — which, with Slurm submission allowed by default, would otherwise be a duplicate job. The bridge claims the key atomically inside the enqueue transaction (a check-then-insert would lose the race under concurrent retries), serves a replay before anything that could refuse it (a full queue, an agent that has since gone), and answers `422` if a key is reused with different parameters rather than hand back a result for something you did not ask for. `ask` and `prompt` have no such key; on a lost reply they say the request may already have run and point at `ready`/`read`.
+
+`wait` rides out transient failures: a single unanswered poll does not end it, and it gives up with exit `4` only after `SENTINEL_WAIT_TOLERANCE_SEC` (60 s) of continuous failure, telling you the task is untouched.
+
 When a request times out, the client probes `/health` before saying anything, because a timeout looks identical whether the forward is dead or the bridge is up and one call behind it is stuck — and the two want opposite reactions. Answering is exit `5`; silence is exit `4`.
 
 Connection failures previously printed a raw `Invoke-RestMethod` stack trace **and exited 0**, so a caller had nothing to act on and nothing to branch on.
@@ -280,6 +284,9 @@ The remote service reads the following environment variables:
 | `SENTINEL_SLURM_POLICY` | `submit` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
 | `SENTINEL_AGENT_PRIORITY` | unset | Ordered cost preference, cheapest first, matched on agent name or runtime family. Only orders agents that can take work now. |
 | `SENTINEL_CLIENT_TIMEOUT_SEC` | `5` | Client-side (`sentinel.ps1`): upper bound on any quick call. Keep it comfortably under the time your caller waits before giving up. |
+| `SENTINEL_WAIT_TOLERANCE_SEC` | `60` | Client-side: how long `wait` polls through a continuous channel outage before giving up with exit 4. |
+| `SENTINEL_ASK_GRACE_SEC` | `30` | Client-side: slack added to an `ask`/`prompt`'s own `-TimeoutMs` before the client abandons it. |
+| `SENTINEL_HERDR_TIMEOUT_SEC` | `30` | Bridge-side: bound on any herdr call that did not name its own. A hung herdr surfaces as a 504 instead of blocking a request thread indefinitely. |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | How long a quota circuit stays open before expiring by itself. `0` keeps it open until cleared by hand. |
 
 Copy [`remote/bridge.env.example`](remote/bridge.env.example) to the untracked `remote/bridge.env` for deployment-specific values. Never commit real hostnames, project identifiers, paths, usernames, prompts, or tokens; see [CONTRIBUTING.md](CONTRIBUTING.md) for the project's sensitive-data rules.

@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import hmac
 import json
 import os
@@ -17,9 +18,16 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 20
+BRIDGE_VERSION = 21
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
+
+# Upper bound on any single herdr call that did not name its own. The
+# default used to be None -- wait forever -- so a herdr that hung left the
+# calling request thread blocked indefinitely. Callers with a legitimate
+# reason to wait longer (a prompt that runs as long as the task allows) pass
+# their own timeout; this only catches the ones that forgot.
+HERDR_DEFAULT_TIMEOUT_SEC = int(os.environ.get("SENTINEL_HERDR_TIMEOUT_SEC", "30"))
 
 # Fallback when a request doesn't name an agent explicitly. Not "the"
 # agent any more -- herdr can host several concurrent agent sessions on
@@ -272,6 +280,48 @@ def validate_agent_name(agent_name):
     return agent_name
 
 
+class IdempotencyConflictError(RuntimeError):
+    pass
+
+
+def validate_idempotency_key(key):
+    """A caller-chosen key naming one logical operation across its retries."""
+    if key is None:
+        return None
+
+    if not isinstance(key, str):
+        raise ValueError("idempotency_key must be a string")
+
+    key = key.strip()
+
+    if not key:
+        raise ValueError("idempotency_key cannot be empty")
+
+    if len(key) > 255:
+        raise ValueError("idempotency_key cannot exceed 255 characters")
+
+    if any(ord(char) < 32 or ord(char) == 127 for char in key):
+        raise ValueError("idempotency_key cannot contain control characters")
+
+    return key
+
+
+def request_fingerprint(task, agent, slurm_policy, timeout_ms):
+    """What makes two requests 'the same' for idempotency purposes.
+
+    Built from what the caller *asked for*, not what the bridge resolved it
+    to: the agent as named (or left unnamed), and the policy as given. A
+    retry has to match even if the live agent set changed in between, or a
+    harmless retry would be refused as a different request.
+    """
+    canonical = json.dumps(
+        [task, agent, slurm_policy, timeout_ms],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def auth_token_warning():
     if not AUTH_TOKEN:
         return (
@@ -336,7 +386,10 @@ def init_db():
                 result_text TEXT,
                 error_text TEXT,
 
-                slurm_policy TEXT
+                slurm_policy TEXT,
+
+                idempotency_key TEXT,
+                request_fingerprint TEXT
             )
         """)
 
@@ -354,6 +407,18 @@ def init_db():
         existing_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
         }
+
+        if "idempotency_key" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN request_fingerprint TEXT")
+
+        # Partial, so the many tasks created without a key do not collide on
+        # NULL. This is the backstop; the claim itself is made atomically
+        # inside the enqueue transaction.
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_key
+            ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL
+        """)
 
         if "slurm_policy" not in existing_cols:
             # Rows created before the gate existed ran with no policy at
@@ -392,16 +457,45 @@ class QueueFullError(RuntimeError):
         )
 
 
-def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None):
+def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None,
+                 idempotency_key=None, fingerprint=None):
     conn.execute("""
         INSERT INTO tasks (
-            task_id, task, agent, status, created_at, timeout_ms, slurm_policy
+            task_id, task, agent, status, created_at, timeout_ms, slurm_policy,
+            idempotency_key, request_fingerprint
         )
-        VALUES (?, ?, ?, 'queued', ?, ?, ?)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
     """, (
         task_id, task, agent_name, now_iso(), timeout_ms,
         validate_slurm_policy(slurm_policy),
+        idempotency_key, fingerprint,
     ))
+
+
+def find_task_by_idempotency_key(key):
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def check_replay(existing, fingerprint):
+    """Return the original task for a matching retry, or refuse a mismatch.
+
+    Returning the first task for a request that differs would hand the
+    caller a result for something it did not ask for, so reuse of a key with
+    changed parameters is refused loudly: it is a bug on the caller's side.
+    """
+    if fingerprint is not None and existing["request_fingerprint"] != fingerprint:
+        raise IdempotencyConflictError(
+            "this idempotency key was already used for a different request "
+            "(task, agent, slurm_policy or timeout differ). Use a new key "
+            "for a new operation."
+        )
+
+    return existing
 
 
 def create_task(task, timeout_ms, agent_name, slurm_policy=None):
@@ -413,17 +507,42 @@ def create_task(task, timeout_ms, agent_name, slurm_policy=None):
     return task_id
 
 
-def create_task_if_queue_available(task, timeout_ms, agent_name, slurm_policy=None):
+def create_task_if_queue_available(task, timeout_ms, agent_name, slurm_policy=None,
+                                  idempotency_key=None, fingerprint=None):
+    return enqueue_task(
+        task, timeout_ms, agent_name, slurm_policy, idempotency_key, fingerprint
+    )[0]
+
+
+def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
+                 idempotency_key=None, fingerprint=None):
     """Atomically enforce the queue cap and enqueue one task.
+
+    Returns (task_id, replayed).
 
     ThreadingHTTPServer can process several /delegate requests concurrently.
     BEGIN IMMEDIATE serializes the count-and-insert section so two callers
-    cannot both observe the same free queue slot and overfill the queue.
+    cannot both observe the same free queue slot and overfill the queue --
+    and, for the same reason, cannot both find a key unclaimed and each
+    insert a task for it. The key is checked inside this transaction rather
+    than before it, which is the whole point: check-then-insert is the race
+    that makes an idempotency key worthless under concurrent retries.
     """
     task_id = str(uuid.uuid4())
 
     with db_session() as conn:
         conn.execute("BEGIN IMMEDIATE")
+
+        # Before the queue cap: a replay creates nothing, so a full queue
+        # has no business refusing it.
+        if idempotency_key:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row:
+                return check_replay(dict(row), fingerprint)["task_id"], True
+
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM tasks WHERE status = 'queued'"
         ).fetchone()
@@ -432,9 +551,12 @@ def create_task_if_queue_available(task, timeout_ms, agent_name, slurm_policy=No
         if queued >= MAX_QUEUE_DEPTH:
             raise QueueFullError(queued, MAX_QUEUE_DEPTH)
 
-        _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy)
+        _insert_task(
+            conn, task_id, task, timeout_ms, agent_name, slurm_policy,
+            idempotency_key, fingerprint,
+        )
 
-    return task_id
+    return task_id, False
 
 
 def get_task(task_id):
@@ -1637,7 +1759,7 @@ def run_herdr(*args, timeout=None):
         [HERDR, *args],
         text=True,
         capture_output=True,
-        timeout=timeout,
+        timeout=timeout if timeout is not None else HERDR_DEFAULT_TIMEOUT_SEC,
     )
 
     return {
@@ -1747,6 +1869,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             self._do_GET()
+        except subprocess.TimeoutExpired as e:
+            # Not a 500: the bridge did not break. It is up, and one call
+            # behind it is stuck -- the same distinction the client draws
+            # between a dead channel and a stalled request.
+            self.send_json(
+                {
+                    "ok": False,
+                    "reason": "herdr_timeout",
+                    "error": (
+                        f"herdr did not answer within {e.timeout:g}s. The "
+                        "bridge itself is up; the herdr call behind this "
+                        "endpoint is slow or hung on the host."
+                    ),
+                },
+                504,
+            )
         except AgentNotFoundError as e:
             # Not a server fault: the caller named something that is not
             # running. Say which, so they can correct it in one step.
@@ -1828,6 +1966,7 @@ class Handler(BaseHTTPRequestHandler):
                 "agent",
                 "get",
                 agent_name,
+                timeout=10,
             )
 
             self.send_json(
@@ -1914,6 +2053,7 @@ class Handler(BaseHTTPRequestHandler):
                 "recent-unwrapped",
                 "--lines",
                 str(read_lines),
+                timeout=10,
             )
 
             # A TUI does not clear itself when a task finishes, so this
@@ -1992,6 +2132,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self._do_POST()
+        except subprocess.TimeoutExpired as e:
+            # Not a 500: the bridge did not break. It is up, and one call
+            # behind it is stuck -- the same distinction the client draws
+            # between a dead channel and a stalled request.
+            self.send_json(
+                {
+                    "ok": False,
+                    "reason": "herdr_timeout",
+                    "error": (
+                        f"herdr did not answer within {e.timeout:g}s. The "
+                        "bridge itself is up; the herdr call behind this "
+                        "endpoint is slow or hung on the host."
+                    ),
+                },
+                504,
+            )
         except AgentNotFoundError as e:
             # Not a server fault: the caller named something that is not
             # running. Say which, so they can correct it in one step.
@@ -2022,6 +2178,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 slurm_policy = validate_slurm_policy(body.get("slurm_policy"))
+                idempotency_key = validate_idempotency_key(
+                    body.get("idempotency_key")
+                )
 
                 timeout_ms = validate_timeout_ms(int(
                     body.get(
@@ -2043,6 +2202,36 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
+            fingerprint = None
+            if idempotency_key:
+                # Built from the request as the caller made it -- before the
+                # agent is resolved -- so a retry matches even if the live
+                # agent set changed in between.
+                fingerprint = request_fingerprint(
+                    task, agent_name, body.get("slurm_policy"), timeout_ms
+                )
+
+                # A replay is served before anything else can refuse it. The
+                # original is already queued, so re-resolving its agent
+                # would turn a harmless retry into a 404 for work that
+                # exists, and a full queue would reject a request that
+                # creates nothing.
+                existing = find_task_by_idempotency_key(idempotency_key)
+                if existing:
+                    try:
+                        check_replay(existing, fingerprint)
+                    except IdempotencyConflictError as e:
+                        self.send_json({"ok": False, "error": str(e)}, 422)
+                        return
+
+                    self.send_json({
+                        "ok": True,
+                        "task_id": existing["task_id"],
+                        "status": existing["status"],
+                        "replayed": True,
+                    }, 202)
+                    return
+
             try:
                 agent_name = agent_or_auto(agent_name)
             except AgentNotFoundError as e:
@@ -2053,8 +2242,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             try:
-                task_id = create_task_if_queue_available(
-                    task, timeout_ms, agent_name, slurm_policy
+                task_id, replayed = enqueue_task(
+                    task, timeout_ms, agent_name, slurm_policy,
+                    idempotency_key, fingerprint,
                 )
             except QueueFullError as e:
                 self.send_json(
@@ -2064,6 +2254,20 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     429,
                 )
+                return
+            except IdempotencyConflictError as e:
+                self.send_json({"ok": False, "error": str(e)}, 422)
+                return
+
+            if replayed:
+                # Lost the race to a concurrent request carrying the same
+                # key; that one's task is the answer.
+                self.send_json({
+                    "ok": True,
+                    "task_id": task_id,
+                    "status": get_task(task_id)["status"],
+                    "replayed": True,
+                }, 202)
                 return
 
             self.send_json(

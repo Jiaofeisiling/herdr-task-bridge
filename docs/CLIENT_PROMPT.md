@@ -39,7 +39,20 @@ recovered; try again once the user has reconnected, which often succeeds.
 
 Exit 5 (NO REPLY) is the opposite case: the bridge answers /health but one
 request stalled. The channel is fine -- do not ask the user to reconnect
-anything. Retry once.
+anything. Whether to retry depends on what the request was:
+
+- A read (health, agents, ready, task, read, quota): retry once.
+- delegate: it MAY ALREADY BE QUEUED -- the reply was lost, not necessarily
+  the request. Never just run it again. Retry with the same key the client
+  printed (`-IdempotencyKey <key>`); the bridge then returns the original
+  task instead of queueing a second copy. Without that, a retry can submit a
+  duplicate Slurm job.
+- ask / prompt: it MAY ALREADY HAVE RUN. Check the agent (ready, read) before
+  doing anything else.
+
+`wait` rides out a brief outage by itself and only gives up after a minute
+of continuous failure; the task is unaffected either way, so run `wait`
+again with the same task id.
 
 `ready` returning false is not a fault. Its `hint` field says what that
 particular state means; for a busy agent the answer is to omit the agent,

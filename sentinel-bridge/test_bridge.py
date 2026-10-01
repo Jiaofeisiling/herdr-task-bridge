@@ -667,7 +667,9 @@ def test_do_post_returns_500_instead_of_crashing_on_unexpected_error(live_server
     def boom(*args, **kwargs):
         raise RuntimeError("simulated unexpected failure")
 
-    monkeypatch.setattr(bridge, "create_task_if_queue_available", boom)
+    # The handler enqueues through enqueue_task (which also reports whether
+    # the request was a replay); this stubs whatever it actually calls.
+    monkeypatch.setattr(bridge, "enqueue_task", boom)
 
     status, body = _post(live_server, "/delegate", {"task": "trigger the boom"})
 
@@ -2899,3 +2901,184 @@ def test_powershell_sources_are_pure_ascii():
         "non-ASCII in BOM-less PowerShell source breaks Windows PowerShell 5.1 "
         f"under a non-UTF-8 code page: {offenders}"
     )
+
+
+# --- delegate is safe to retry -----------------------------------------
+#
+# A client that times out waiting for /delegate cannot tell whether the
+# task was queued: the request may have landed and only the reply been
+# lost. Retrying then enqueues it twice, and with Slurm submission allowed
+# by default that is a duplicate job. The client had just been told to
+# "retry once" on exactly that timeout, so the hazard was shipped with the
+# advice to walk into it.
+#
+# The standard fix is a caller-supplied idempotency key: the caller picks
+# one per logical operation and reuses it across retries, and the server
+# collapses repeats into the original task.
+
+
+def _delegate(live_server, **extra):
+    body = {"task": "check disk"}
+    body.update(extra)
+    return _post(live_server, "/delegate", body)
+
+
+def test_same_key_returns_the_original_task_not_a_second_one(live_server):
+    s1, first = _delegate(live_server, idempotency_key="op-1")
+    s2, second = _delegate(live_server, idempotency_key="op-1")
+
+    assert s1 == 202 and s2 == 202
+    assert second["task_id"] == first["task_id"]
+    assert second["replayed"] is True
+    assert "replayed" not in first or first["replayed"] is False
+    assert len(bridge.list_tasks()) == 1
+
+
+def test_no_key_keeps_the_old_behaviour(live_server):
+    _, first = _delegate(live_server)
+    _, second = _delegate(live_server)
+
+    # Two deliberate, identical submissions are legitimate without a key.
+    assert first["task_id"] != second["task_id"]
+    assert len(bridge.list_tasks()) == 2
+
+
+def test_same_key_with_different_parameters_is_refused(live_server):
+    _delegate(live_server, idempotency_key="op-1")
+
+    status, body = _post(live_server, "/delegate", {
+        "task": "a different task", "idempotency_key": "op-1",
+    })
+
+    # Silently returning the first task would hand the caller a result for
+    # something it did not ask for. Reuse with changed parameters is a bug
+    # on the caller's side and should be loud.
+    assert status == 422
+    assert "idempotency" in body["error"].lower()
+    assert len(bridge.list_tasks()) == 1
+
+
+def test_a_replay_is_served_even_when_the_queue_is_full(live_server, monkeypatch):
+    _, first = _delegate(live_server, idempotency_key="op-1")
+    monkeypatch.setattr(bridge, "MAX_QUEUE_DEPTH", 1)
+
+    status, body = _delegate(live_server, idempotency_key="op-1")
+
+    # A replay creates nothing, so the queue cap has no business refusing it.
+    assert status == 202
+    assert body["task_id"] == first["task_id"]
+
+
+def test_a_replay_does_not_need_the_agent_to_still_exist(live_server, monkeypatch):
+    _, first = _delegate(live_server, idempotency_key="op-1")
+    monkeypatch.setattr(bridge, "list_agents", lambda: ([], {"ok": True}))
+
+    status, body = _delegate(live_server, idempotency_key="op-1")
+
+    # The original is already queued. Re-resolving the agent for a replay
+    # would turn a harmless retry into a 404 for work that exists.
+    assert status == 202
+    assert body["task_id"] == first["task_id"]
+
+
+def test_concurrent_requests_with_one_key_create_one_task(live_server):
+    results = []
+
+    def fire():
+        results.append(_delegate(live_server, idempotency_key="race"))
+
+    threads = [threading_module.Thread(target=fire) for _ in range(8)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    # The race is the whole reason the key is claimed atomically rather
+    # than checked and then inserted.
+    assert len({body["task_id"] for _, body in results}) == 1
+    assert len(bridge.list_tasks()) == 1
+
+
+@pytest.mark.parametrize("key", ["", "   ", "x" * 256, "bad\nkey", 123])
+def test_malformed_keys_are_rejected(live_server, key):
+    status, body = _delegate(live_server, idempotency_key=key)
+
+    assert status == 400
+    assert "idempotency_key" in body["error"]
+
+
+def test_the_key_survives_a_restart(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task_if_queue_available(
+        "x", 60000, "w1:p1", None, idempotency_key="op-1", fingerprint="f"
+    )
+
+    bridge.init_db()   # what a restart does
+
+    again = bridge.find_task_by_idempotency_key("op-1")
+    # A retry that arrives after a bridge restart -- the likeliest time for
+    # a timed-out request to be retried -- must still be recognised.
+    assert again["task_id"] == first
+
+
+# --- no herdr call waits forever ---------------------------------------
+#
+# run_herdr() defaulted to timeout=None and two handlers -- /status and
+# /read -- passed nothing, so a herdr that hung left the request thread
+# blocked indefinitely. The client is bounded now (and reports a stalled
+# request distinctly), which makes this visible rather than harmless: every
+# stalled request ties up a thread until herdr answers, which may be never.
+
+
+def _recording_run(monkeypatch, behaviour="ok"):
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        if behaviour == "hang":
+            raise subprocess_module.TimeoutExpired(cmd, kwargs.get("timeout"))
+        return subprocess_module.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+    return seen
+
+
+def test_run_herdr_always_passes_a_timeout(monkeypatch):
+    seen = _recording_run(monkeypatch)
+
+    bridge.run_herdr("agent", "list")   # caller named no timeout
+
+    assert seen == [bridge.HERDR_DEFAULT_TIMEOUT_SEC]
+    assert bridge.HERDR_DEFAULT_TIMEOUT_SEC > 0
+
+
+def test_an_explicit_timeout_is_not_overridden(monkeypatch):
+    seen = _recording_run(monkeypatch)
+
+    bridge.run_herdr("agent", "list", timeout=7)
+
+    assert seen == [7]
+
+
+@pytest.mark.parametrize("path", ["/status?agent=w1:p1", "/read?agent=w1:p1"])
+def test_status_and_read_bound_their_herdr_calls(live_server, monkeypatch, path):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    seen = _recording_run(monkeypatch)
+
+    _get(live_server, path)
+
+    assert seen, "expected the endpoint to call herdr"
+    assert all(t is not None for t in seen)
+
+
+@pytest.mark.parametrize("path", ["/status?agent=w1:p1", "/read?agent=w1:p1"])
+def test_a_hung_herdr_is_a_504_not_a_500(live_server, monkeypatch, path):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    _recording_run(monkeypatch, behaviour="hang")
+
+    status, body = _get(live_server, path)
+
+    # A 500 says the bridge broke. It did not: it is up, and one thing
+    # behind it is stuck. The distinction is the same one the client now
+    # draws between a dead channel and a stalled request.
+    assert status == 504
+    assert body["reason"] == "herdr_timeout"
+    assert "herdr" in body["error"]
