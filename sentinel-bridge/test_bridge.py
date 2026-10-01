@@ -3509,9 +3509,17 @@ def test_a_real_signal_stops_the_bridge_in_an_orderly_way(tmp_path, sig_name):
     assert exit_code == 0, output
     assert f"[shutdown] {sig_name} received" in output
 
-    # The listener was released, which is what lets a new process take the
-    # port a couple of seconds later.
+    # A replacement process can take the port straight away. SO_REUSEADDR
+    # because the server sets it (HTTPServer.allow_reuse_address) and a
+    # just-closed port keeps TIME_WAIT connections from the health polling;
+    # without it this fails with "Address already in use" on Linux, which is
+    # exactly how it first failed in CI -- a flaw in this test, not the bridge.
+    #
+    # Note what this does NOT show: the process has exited, so the OS would
+    # release the port regardless. That the listener closes *before* draining
+    # begins is what test_the_listener_closes_before_draining covers.
     with socket.socket() as again:
+        again.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         again.bind(("127.0.0.1", port))
 
     conn = sqlite3.connect(db)
