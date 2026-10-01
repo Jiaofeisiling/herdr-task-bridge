@@ -171,6 +171,26 @@ prompt does not clear itself in a second. So:
   `error`/`orphaned` task turns into `done` by itself when the result
   arrives.
 
+## An agent's provider can refuse it
+
+herdr reports an agent whose provider refused a request as `done`, exactly as
+it does after any finished turn -- the refusal is only text in the agent's
+terminal. So "done" and "ok" do not mean the work happened. What to look for:
+
+- A failure whose `reason` is `provider_rejected`, or an `ended_quickly`
+  failure, means the agent never ran the task. Read the evidence it carries;
+  do not wait, and do not send the same prompt again.
+- `ready` returning `reason: quota_blocked` has a `kind`. `quota` waits for a
+  reset. `context_limit` means that agent's session has outgrown what its
+  model or provider accepts: it is cured by compacting or restarting the session in its
+  own terminal, never by waiting. Tell the user that -- it is something they
+  can fix in a minute -- and use the other agent meanwhile.
+- A finished task's `error_text` may say it ran on a different agent than the
+  one asked for. Report which agent did the work.
+- `prompt` wraps its text in the delegation envelope, so it cannot send a
+  slash command. Do not try `/compact` through it: it fails, and each failed
+  attempt makes the session larger.
+
 ## Writing task descriptions
 
 Say what needs doing. Do not prescribe which tool or shell construct the

@@ -139,6 +139,24 @@ herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocke
 - 在断定工作丢了之前，先再查一次任务：`error`/`orphaned` 的任务在结果到达后
   会自己变成 `done`。
 
+## agent 的模型提供商可能拒绝它
+
+提供商拒绝了某个请求时，herdr 照样把这个 agent 报告为 `done`，和任何一轮
+正常结束一模一样——拒绝信息只是 agent 终端里的一段文字。所以"done"和"ok"
+并不代表活真的干了。要看的是：
+
+- 失败的 `reason` 是 `provider_rejected`，或者是 `ended_quickly`，都意味着
+  agent 根本没有执行任务。读它附带的证据；不要等，也不要把同一个 prompt
+  再发一遍。
+- `ready` 返回 `reason: quota_blocked` 时还带有 `kind`。`quota` 要等额度
+  重置。`context_limit` 表示该 agent 的会话已经超出它的模型或提供商能接受的大小：
+  治法是在它自己的终端里压缩或重启会话，永远不是等待。把这一点告诉用户——
+  他们一分钟就能处理——同时先用另一个 agent。
+- 已完成任务的 `error_text` 可能说明它实际由另一个 agent 执行。汇报时说明
+  是哪个 agent 干的活。
+- `prompt` 会把文本包进委派信封，所以发不了斜杠命令。不要通过它发
+  `/compact`：它会失败，而且每次失败都会让会话更大。
+
 ## 写任务描述
 
 直接写要做什么。不要规定 agent 该用什么工具或什么 shell 写法——指定具体

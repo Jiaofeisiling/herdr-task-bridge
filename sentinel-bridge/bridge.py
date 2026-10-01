@@ -19,7 +19,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 23
+BRIDGE_VERSION = 24
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -123,6 +123,27 @@ MAX_QUEUE_DEPTH = int(os.environ.get("SENTINEL_MAX_QUEUE_DEPTH", "50"))
 QUOTA_BLOCK_TTL_SECONDS = int(
     os.environ.get("SENTINEL_QUOTA_BLOCK_TTL_SECONDS", "3600")
 )
+
+# A provider can also refuse an agent for a reason that is not credit: its
+# session has grown past the per-request size its model or provider accepts. From here
+# it looks the same -- herdr reports the agent done, and the refusal is only
+# text in its terminal -- and the right response is the same: stop sending it
+# work and use another agent. It clears sooner than a quota, though, because
+# the cure is a person compacting or restarting the session, which takes
+# minutes rather than waiting out a reset. A circuit that lingered for the
+# quota's hour would keep a recovered agent out of service, which is the
+# failure the TTL above exists to prevent.
+CONTEXT_BLOCK_TTL_SECONDS = int(
+    os.environ.get("SENTINEL_CONTEXT_BLOCK_TTL_SECONDS", "600")
+)
+
+# A turn that ends this quickly, with no result file, cannot have run the
+# task. Observed: an agent whose provider refused every prompt ended its turn
+# in about a second, and the bridge reported it as a missing file and sent the
+# caller to check permissions. The timing is the one signal that does not
+# depend on knowing the provider's wording.
+QUICK_END_SEC = float(os.environ.get("SENTINEL_QUICK_END_SEC", "15"))
+
 QUOTA_FAILOVER_AGENTS = tuple(
     name.strip()
     for name in os.environ.get("SENTINEL_QUOTA_FAILOVER_AGENTS", "").split(",")
@@ -213,6 +234,18 @@ def validate_slurm_policy(policy):
 
     return policy
 
+# Wordings of "this request is over a size its model or provider accepts". Kept apart
+# from the quota wordings because the remedy differs: a quota waits for a
+# reset, a size limit is cured by shrinking the session, and waiting never
+# helps. Only wording actually seen is listed -- a guess here would open a
+# circuit on a healthy agent.
+CONTEXT_LIMIT_WORDING = [
+    # OpenRouter, from a live refusal: "Prompt tokens limit exceeded: 334110 >
+    # 185528. To increase, visit .../settings/credits and upgrade ...".
+    r"prompt\s+tokens\s+limit\s+exceeded",
+]
+CONTEXT_LIMIT_PATTERN = re.compile("|".join(CONTEXT_LIMIT_WORDING), re.IGNORECASE)
+
 # Deliberately biased towards missing a real quota failure rather than
 # inventing one. A match opens a durable circuit that only an operator can
 # clear, so a false positive removes an agent from service until a human
@@ -247,6 +280,7 @@ QUOTA_ERROR_PATTERN = re.compile(
         # said "Usage limit reached"; this wording on its own was invisible.
         # "hit your" is required so the bare word "session" cannot match.
         r"hit your (?:session|usage|weekly|daily|5[ -]?hour) limit",
+        *CONTEXT_LIMIT_WORDING,
         # Chinese -- the reference deployment's proxy reports in Chinese
         r"额度不足", r"余额不足", r"余额不够", r"预扣费额度失败", r"欠费",
         r"配额(?:不足|已?用尽|超限|耗尽)",
@@ -254,6 +288,18 @@ QUOTA_ERROR_PATTERN = re.compile(
     ]),
     re.IGNORECASE,
 )
+
+
+def provider_failure_kind(detail):
+    """Which kind of provider refusal `detail` describes.
+
+    Derived from the stored text rather than kept in its own column, so a
+    circuit written before this existed classifies the same way.
+    """
+    if detail and CONTEXT_LIMIT_PATTERN.search(detail):
+        return "context_limit"
+
+    return "quota"
 
 
 def validate_timeout_ms(timeout_ms):
@@ -774,18 +820,41 @@ def requeue_task(task_id):
         return cursor.rowcount == 1
 
 
-def complete_task(task_id, result_text):
+def complete_task(task_id, result_text, note=None):
     # The task is over, so its progress no longer describes anything.
     # Left in place, every finished task would leak one -- the same leak
     # the result sweep had to be built for.
     discard_progress_file(task_id)
 
+    # `note` rides in error_text, as a late delivery's does: a finished task
+    # that still has something the reader should know.
     with db_session() as conn:
         conn.execute("""
             UPDATE tasks
-            SET status = 'done', result_text = ?, finished_at = ?
+            SET status = 'done', result_text = ?,
+                error_text = COALESCE(?, error_text), finished_at = ?
             WHERE task_id = ?
-        """, (result_text, now_iso(), task_id))
+        """, (result_text, note, now_iso(), task_id))
+
+
+def routing_note(requested, used):
+    """Say so when a task ran on a different agent than the one it asked for.
+
+    The row records the agent that was requested, so without this a result
+    from the fallback reads as the first agent's work.
+    """
+    if used == requested:
+        return None
+
+    block = get_agent_quota_block(requested)
+    why = ""
+    if block:
+        why = f" ({block['kind'].replace('_', ' ')}: {block['detail']})"
+
+    return (
+        f"Ran on {used}, not the requested {requested}, "
+        f"whose provider refused it{why}."
+    )
 
 
 def fail_task(task_id, error_text):
@@ -830,8 +899,17 @@ def mark_agent_quota_blocked(agent_name, detail):
         """, (agent_name, now_iso(), detail))
 
 
+def _quota_block_ttl(block):
+    if provider_failure_kind(block.get("detail")) == "context_limit":
+        return CONTEXT_BLOCK_TTL_SECONDS
+
+    return QUOTA_BLOCK_TTL_SECONDS
+
+
 def _quota_block_expired(block):
-    if QUOTA_BLOCK_TTL_SECONDS <= 0:
+    ttl = _quota_block_ttl(block)
+
+    if ttl <= 0:
         return False
 
     try:
@@ -852,7 +930,7 @@ def _quota_block_expired(block):
         detected = detected.replace(tzinfo=timezone.utc)
 
     age = (datetime.now(timezone.utc) - detected).total_seconds()
-    return age >= QUOTA_BLOCK_TTL_SECONDS
+    return age >= ttl
 
 
 def get_agent_quota_block(agent_name):
@@ -872,6 +950,7 @@ def get_agent_quota_block(agent_name):
         clear_agent_quota_blocks(agent_name)
         return None
 
+    block["kind"] = provider_failure_kind(block.get("detail"))
     return block
 
 
@@ -887,6 +966,7 @@ def list_agent_quota_blocks():
         if _quota_block_expired(block):
             clear_agent_quota_blocks(block["agent"])
             continue
+        block["kind"] = provider_failure_kind(block.get("detail"))
         live.append(block)
 
     return live
@@ -1150,11 +1230,28 @@ class PromptWaitAborted(SentinelPromptError):
 
 
 class AgentQuotaExhaustedError(SentinelPromptError):
+    """The agent's provider refused it. `kind` says why: a quota, or a size
+    limit its session has outgrown."""
+
     def __init__(self, agent_name, detail, raw_output=""):
         self.agent_name = agent_name
         self.detail = detail
-        self.raw_output = raw_output
-        super().__init__(f"Agent quota exhausted ({agent_name}): {detail}")
+        self.kind = provider_failure_kind(detail)
+
+        if self.kind == "context_limit":
+            message = (
+                f"Agent {agent_name} cannot take work: its provider refused "
+                f"the request as over a size limit ({detail}). Its session "
+                "has outgrown what its model or provider accepts, so sending it "
+                "anything fails the same way until the session is compacted "
+                "or restarted in its own terminal."
+            )
+        else:
+            message = f"Agent quota exhausted ({agent_name}): {detail}"
+
+        # raw_output goes through the base class: setting it here and then
+        # calling super().__init__() without it reset it to "".
+        super().__init__(message, raw_output=raw_output, reason="provider_rejected")
 
 
 class QuotaFailoverExhaustedError(AgentQuotaExhaustedError):
@@ -1171,8 +1268,10 @@ class QuotaFailoverExhaustedError(AgentQuotaExhaustedError):
 
 
 class SentinelResultMissingError(RuntimeError):
-    def __init__(self, message, raw_output=""):
+    def __init__(self, message, raw_output="", reason=None):
         self.raw_output = raw_output
+        # "ended_quickly" when the turn was too short to have done the work.
+        self.reason = reason
         super().__init__(message)
 
 
@@ -1205,6 +1304,29 @@ def read_progress_file(task_id):
         return None
 
     return content or None
+
+
+def circuit_hint(kind):
+    if kind != "context_limit":
+        return None
+
+    if CONTEXT_BLOCK_TTL_SECONDS > 0:
+        lifts = (
+            f"It lifts by itself after {CONTEXT_BLOCK_TTL_SECONDS // 60} min, "
+            "or with `quota-reset`."
+        )
+    else:
+        lifts = "It lifts with `quota-reset`."
+
+    return (
+        "The provider refused this agent's last request as over a size "
+        "limit: its session has outgrown what its model or provider accepts, so "
+        "sending it anything fails the same way. It has to be compacted or "
+        "restarted in its own terminal -- a `prompt` sent through the bridge "
+        "is wrapped in a delegation envelope, so `/compact` sent that way is "
+        "not a command. While this holds, tasks addressed to it are run on "
+        f"another agent instead. {lifts}"
+    )
 
 
 def ready_hint(agent_status):
@@ -1424,25 +1546,87 @@ def quota_error_detail(text, ignore=None):
     delegated task itself, which the terminal always contains. Without this,
     a task *about* rate limits reads as the agent having hit one.
     """
-    if not text:
-        return None
+    haystack, matches = _provider_error_hits(text, ignore)
 
-    haystack = text
-    if ignore:
-        haystack = haystack.replace(ignore, " ")
-
-    if not QUOTA_ERROR_PATTERN.search(haystack):
+    if not matches:
         return None
 
     # Keep the matched evidence and a little context around it, not a
     # trailing slab of the terminal. /quota surfaces this detail, and the
     # terminal always contains the delegated task -- paths, dataset names
     # -- which has no business in an endpoint that reports provider errors.
-    match = QUOTA_ERROR_PATTERN.search(haystack)
-    window = haystack[max(0, match.start() - 80):match.end() + 80]
-    compact = " ".join(window.split())
+    compact = _evidence_window(haystack, matches[0])
 
     return compact or "provider reported a quota or balance failure"
+
+
+# What a TUI draws between its columns.
+COLUMN_SEPARATORS = "┃│║"
+
+
+def _evidence_window(haystack, match):
+    """The matched text and a little context, kept to its own column.
+
+    An agent's terminal is two columns -- the conversation beside a sidebar --
+    so a flat window around a hit spills into whatever sits next to it. On a
+    real capture that was a path from the delegated task. The text is served
+    by /ready and /quota and quoted in task notes, so it is cut at the
+    separators. With none present, as in plain output, nothing changes.
+    """
+    start = max(0, match.start() - 80)
+    end = match.end() + 80
+
+    left = max(haystack.rfind(c, start, match.start()) for c in COLUMN_SEPARATORS)
+    if left != -1:
+        start = left + 1
+
+    rights = [
+        i for i in (haystack.find(c, match.end(), end) for c in COLUMN_SEPARATORS)
+        if i != -1
+    ]
+    if rights:
+        end = min(rights)
+
+    return " ".join(haystack[start:end].split())
+
+
+def _provider_error_hits(text, ignore=None):
+    if not text:
+        return "", []
+
+    haystack = text
+    if ignore:
+        haystack = haystack.replace(ignore, " ")
+
+    return haystack, list(QUOTA_ERROR_PATTERN.finditer(haystack))
+
+
+def fresh_provider_refusal(before, after, ignore=None):
+    """A provider refusal in `after` that was not already in `before`.
+
+    A terminal keeps old errors in view, so finding one after a prompt proves
+    nothing -- it may be last hour's. Each hit is keyed on the wording plus
+    the few characters after it, which is where the figures sit ("... exceeded:
+    334110 > 185528"): a repeat refusal carries different figures, while the
+    same old error scrolling about does not. The surrounding text is left out
+    of the key on purpose -- in a two-column TUI it is the sidebar, which
+    changes with every message.
+    """
+    def keys(text):
+        haystack, matches = _provider_error_hits(text, ignore)
+        return {
+            " ".join(haystack[m.start():m.end() + 24].split()): m
+            for m in matches
+        }, haystack
+
+    seen, _ = keys(before)
+    now, haystack = keys(after)
+
+    for key, match in now.items():
+        if key not in seen:
+            return _evidence_window(haystack, match)
+
+    return None
 
 
 def _agent_runtime_family(agent):
@@ -1726,12 +1910,31 @@ def deliver_prompt(agent_name, delegated_prompt, timeout_ms, task_id):
 
 def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
     delegated_prompt = build_delegation_prompt(task, task_id, slurm_policy)
-    return _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
+
+    # herdr reports an agent whose provider refused the prompt as done, just
+    # as for one that finished -- so a prompt "succeeds" in about a second and
+    # the caller waits for work that was never started. The refusal is only
+    # text in the terminal, so look: before and after, because a terminal
+    # keeps old errors in view and an old one proves nothing about this prompt.
+    # If the "before" cannot be read there is nothing to compare against, and
+    # accusing the agent of an error that may be hours old is worse than not
+    # checking.
+    before, _ = _terminal_read(agent_name, READ_LINES_DEFAULT)
+
+    result = _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
+
+    if before is not None:
+        after, _ = _terminal_read(agent_name, READ_LINES_DEFAULT)
+        detail = fresh_provider_refusal(before, after, ignore=task)
+
+        if detail:
+            raise AgentQuotaExhaustedError(agent_name, detail, raw_output=after[-4000:])
+
+    return result
 
 
-def _read_terminal_tail(agent_name, read_lines):
-    """Terminal text, for failure diagnostics only. Never on the happy path:
-    a broken/slow read here must not mask the error being diagnosed."""
+def _terminal_read(agent_name, read_lines):
+    """(text, None) if the terminal could be read, else (None, why)."""
     try:
         result = run_herdr(
             "agent",
@@ -1744,24 +1947,37 @@ def _read_terminal_tail(agent_name, read_lines):
             timeout=60,
         )
     except Exception as e:
-        return f"(unable to read terminal for diagnostics: {e})"
+        return None, f"unable to read terminal for diagnostics: {e}"
 
     if not result["ok"]:
-        return "(terminal read failed: " + result.get("stderr", "") + ")"
+        return None, "terminal read failed: " + result.get("stderr", "")
 
-    return result["stdout"][-4000:]
+    return result["stdout"], None
+
+
+def _read_terminal_tail(agent_name, read_lines):
+    """Terminal text, for failure diagnostics only. Never on the happy path:
+    a broken/slow read here must not mask the error being diagnosed."""
+    text, why = _terminal_read(agent_name, read_lines)
+
+    if why:
+        return f"({why})"
+
+    return text[-4000:]
 
 
 def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
                           slurm_policy=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
 
+    turn_began = time.monotonic()
     deliver_prompt(
         agent_name,
         build_delegation_prompt(task, task_id, slurm_policy),
         timeout_ms,
         task_id,
     )
+    turn_sec = time.monotonic() - turn_began
 
     response = read_result_file(task_id)
 
@@ -1800,6 +2016,20 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
         )
 
         response = read_result_file(task_id)
+
+    if response is None and turn_sec < QUICK_END_SEC:
+        # Too quick to have run anything. Say that, instead of sending the
+        # caller to check permissions on a directory the agent never reached.
+        raise SentinelResultMissingError(
+            f"Sentinel's turn ended after {turn_sec:.0f}s without a result "
+            "file -- too quickly to have run the task. It most likely "
+            "refused it or never started it: a provider error (a size "
+            "limit, a rejected key) or a refusal, which its terminal will "
+            "show. The tail below is the evidence; waiting longer, or "
+            "sending the same prompt again, will not change it.",
+            raw_output=_read_terminal_tail(agent_name, read_lines),
+            reason="ended_quickly",
+        )
 
     if response is None:
         raise SentinelResultMissingError(
@@ -1866,13 +2096,18 @@ def _run_quota_fallbacks(primary_agent, operation, first_error):
     raise QuotaFailoverExhaustedError(quota_errors)
 
 
-def run_with_quota_failover(primary_agent, operation, primary_locked=False):
+def run_with_quota_failover(primary_agent, operation, primary_locked=False,
+                            failover=True):
     """Run once on the requested agent, then actively switch providers.
 
     The caller receives both the operation result and the actual agent name.
     A persisted quota circuit avoids hitting a known-exhausted account again.
+
+    `failover=False` is for a request that only means something on the agent
+    it names: it neither consults the circuit nor moves elsewhere, though a
+    refusal it meets is still remembered.
     """
-    existing_block = get_agent_quota_block(primary_agent)
+    existing_block = get_agent_quota_block(primary_agent) if failover else None
     if existing_block:
         return _run_quota_fallbacks(
             primary_agent,
@@ -1891,6 +2126,10 @@ def run_with_quota_failover(primary_agent, operation, primary_locked=False):
             return operation(primary_agent), primary_agent
     except AgentQuotaExhaustedError as error:
         _remember_quota_error(error)
+
+        if not failover:
+            raise
+
         return _run_quota_fallbacks(primary_agent, operation, error)
 
 
@@ -1991,7 +2230,9 @@ def task_worker(stop_event=None):
                             agent_name, operation, primary_locked=True
                         )
 
-                complete_task(task_id, result)
+                complete_task(
+                    task_id, result, note=routing_note(agent_name, used_agent)
+                )
                 print(f"[task {task_id}] done (agent={used_agent})")
 
             except TimeoutError as e:
@@ -2399,13 +2640,20 @@ class Handler(BaseHTTPRequestHandler):
             quota_block = get_agent_quota_block(agent_name)
 
             if quota_block:
-                self.send_json({
+                payload = {
                     "ok": True,
                     "ready": False,
                     "reason": "quota_blocked",
+                    "kind": quota_block["kind"],
                     "detected_at": quota_block["detected_at"],
                     "detail": quota_block["detail"],
-                })
+                }
+
+                hint = circuit_hint(quota_block["kind"])
+                if hint:
+                    payload["hint"] = hint
+
+                self.send_json(payload)
                 return
 
             agent_status, status_result = get_agent_status(
@@ -2783,11 +3031,16 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if path == "/prompt":
+                # A caller who names the agent means that agent. Moving the
+                # prompt to another one acts on the wrong session -- and the
+                # usual reason to prompt a specific agent is to deal with the
+                # very condition that opened its circuit.
                 prompt_result, used_agent = run_with_quota_failover(
                     agent_name,
                     lambda target: run_prompt_only(
                         target, task_id, task, timeout_ms, slurm_policy
                     ),
+                    failover=body.get("agent") is None,
                 )
 
                 self.send_json({
@@ -2825,6 +3078,23 @@ class Handler(BaseHTTPRequestHandler):
                     "error": str(e),
                 },
                 429,
+            )
+            return
+
+        except AgentQuotaExhaustedError as e:
+            # Only a request that named its agent gets here: failover would
+            # have turned this into QuotaFailoverExhaustedError above.
+            self.send_json(
+                {
+                    "ok": False,
+                    "task_id": task_id,
+                    "agent": e.agent_name,
+                    "reason": e.reason,
+                    "kind": e.kind,
+                    "error": str(e),
+                    "raw_output": e.raw_output,
+                },
+                502,
             )
             return
 
@@ -2878,6 +3148,9 @@ class Handler(BaseHTTPRequestHandler):
                 "error": str(e),
                 "raw_output": e.raw_output,
             }
+
+            if e.reason:
+                payload["reason"] = e.reason
 
             if path == "/ask" and record_sync_failure(
                 task_id, task, timeout_ms, agent_name, slurm_policy,

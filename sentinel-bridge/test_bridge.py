@@ -498,7 +498,7 @@ def test_ask_happy_path(live_server, tmp_path, monkeypatch):
     assert body["result"]["text"] == "总结完成"
 
 
-def test_prompt_returns_prompt_result_without_reading(live_server, monkeypatch):
+def test_prompt_returns_prompt_result_without_extracting_one(live_server, monkeypatch):
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
     calls = []
@@ -512,8 +512,12 @@ def test_prompt_returns_prompt_result_without_reading(live_server, monkeypatch):
     status, body = _post(live_server, "/prompt", {"task": "do something"})
 
     assert status == 200
+    # What comes back is herdr's own output; /prompt does not go looking for
+    # a result in the terminal.
     assert body["prompt"]["stdout"] == "prompt output"
-    assert calls == ["prompt"]  # /prompt never calls "read"
+    # The two reads bracket the prompt and exist only to notice a provider
+    # refusal that arrived during it -- see run_prompt_only().
+    assert calls == ["read", "prompt", "read"]
 
 
 def test_ask_rejects_empty_task(live_server):
@@ -1565,6 +1569,10 @@ def test_prompts_do_not_prescribe_how_to_write_the_result(tmp_path, monkeypatch)
 
 def test_missing_result_error_leads_with_the_likeliest_cause(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    # This is the message for a turn that ran for a while and then lost its
+    # file. A fake that returns instantly would otherwise land in the
+    # "ended too quickly to have run" branch, which words it differently.
+    monkeypatch.setattr(bridge, "QUICK_END_SEC", 0)
     monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
         "ok": True, "stdout": "terminal tail", "stderr": "",
     })
@@ -3776,3 +3784,287 @@ def test_the_blocked_hint_does_not_claim_a_certainty_herdr_cannot_give():
     assert "will not free itself" not in hint
     assert "again" in hint.lower()
     assert "read" in hint
+
+
+# --- a provider can refuse an agent for a reason that is not quota -------
+#
+# Observed live: an OpenCode session had grown to 379k tokens, past the 185k
+# per-request cap its OpenRouter plan allows, so every prompt was refused
+# within a second. herdr's status went working -> done exactly as it does for
+# a success -- the only evidence was text in the agent's own terminal -- and
+# the bridge did not recognise that text. So:
+#
+#   * the task failed as "never wrote its result file ... check permissions",
+#     which sent the caller looking at the wrong thing;
+#   * a `prompt` came back ok:true, and the caller waited on a compaction that
+#     had been refused;
+#   * `ready` kept saying the agent was ready, and the circuit that exists for
+#     exactly "this agent's provider says no" never opened.
+
+SIZE_LIMIT = (
+    "Prompt tokens limit exceeded: 334110 > 185528. To increase, visit "
+    "https://openrouter.ai/settings/credits and upgrade to a paid account"
+)
+
+# As the bridge actually received it: the agent's TUI is two columns, so the
+# error is interleaved with the sidebar's text.
+SIZE_LIMIT_TAIL = (
+    "  ┃                                                              Context\n"
+    "  ┃  Prompt tokens limit exceeded: 334110 > 185528. To increase,  379,392 tokens\n"
+    "  ┃  visit https://openrouter.ai/settings/credits and upgrade     36% used\n"
+    "  ┃                                                              $0.35 spent\n"
+)
+
+
+def _two_agents(monkeypatch):
+    _live(monkeypatch, [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+    ])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+
+
+def _age_block(agent, seconds):
+    stale = (
+        datetime_module.now(datetime_module_tz.utc)
+        - datetime_module_delta(seconds=seconds)
+    ).isoformat()
+    with bridge.db_session() as conn:
+        conn.execute(
+            "UPDATE quota_blocks SET detected_at = ? WHERE agent = ?", (stale, agent)
+        )
+
+
+def test_a_provider_size_limit_is_recognised_as_a_refusal():
+    assert bridge.quota_error_detail(SIZE_LIMIT) is not None
+    # ... including through the interleaving.
+    assert bridge.quota_error_detail(SIZE_LIMIT_TAIL) is not None
+
+
+def test_a_size_limit_is_told_apart_from_a_quota():
+    # The remedy differs: a quota waits for a reset; a size limit is cured by
+    # compacting or restarting the agent's session, and waiting never helps.
+    assert bridge.provider_failure_kind(bridge.quota_error_detail(SIZE_LIMIT)) == "context_limit"
+    assert bridge.provider_failure_kind("You've hit your session limit - resets 4:20pm") == "quota"
+
+
+def test_talk_about_token_limits_is_not_a_provider_refusal():
+    # A false positive opens a circuit that takes an agent out of service.
+    assert bridge.quota_error_detail("batching is limited by the model's prompt token limit") is None
+
+    task = "explain why 'Prompt tokens limit exceeded' errors appear"
+    assert bridge.quota_error_detail(task + "\nok", ignore=task) is None
+
+
+def test_a_size_limit_is_reported_as_one_not_as_a_missing_file(tmp_path, monkeypatch):
+    prompts = []
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    def fake(*args, **kwargs):
+        if args[1] == "prompt":
+            prompts.append(args)
+        if args[1] == "read":
+            return {"ok": True, "stdout": SIZE_LIMIT_TAIL, "stderr": ""}
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake)
+
+    with pytest.raises(bridge.AgentQuotaExhaustedError) as exc_info:
+        bridge.execute_sentinel_task("w1:p1", "1", "audit", 1000)
+
+    error = exc_info.value
+    assert error.kind == "context_limit"
+    assert "size limit" in str(error)
+    # Not "quota exhausted": that sends a caller off to check credit.
+    assert "quota exhausted" not in str(error).lower()
+    # And not a second prompt into a session that refuses everything.
+    assert len(prompts) == 1
+
+
+def test_a_size_limit_fails_over_and_the_task_says_where_it_ran(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _two_agents(monkeypatch)
+
+    def fake_execute(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        if agent_name == "w1:p1":
+            raise bridge.AgentQuotaExhaustedError(agent_name, SIZE_LIMIT)
+        return "answered by the other agent"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", fake_execute)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    for _ in range(200):
+        if bridge.get_task(task_id)["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.05)
+    stop.set()
+    worker.join(timeout=5)
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "done"
+    assert row["result_text"] == "answered by the other agent"
+    # The row used to say only `w1:p1`, so a result from a different agent
+    # read as the first agent's work.
+    assert "w1:p3" in row["error_text"]
+    assert "w1:p1" in row["error_text"]
+    assert bridge.get_agent_quota_block("w1:p1") is not None
+
+
+def test_a_size_limit_circuit_clears_sooner_than_a_quota_one(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "QUOTA_BLOCK_TTL_SECONDS", 3600)
+    monkeypatch.setattr(bridge, "CONTEXT_BLOCK_TTL_SECONDS", 600)
+    bridge.mark_agent_quota_blocked("w1:p1", SIZE_LIMIT)
+    bridge.mark_agent_quota_blocked("w1:p3", "session limit")
+    _age_block("w1:p1", 1200)
+    _age_block("w1:p3", 1200)
+
+    # Someone fixes a bloated session in seconds. A circuit that lingered for
+    # the quota's hour would keep a recovered agent out of service -- the
+    # failure the quota TTL was added for.
+    assert bridge.get_agent_quota_block("w1:p1") is None
+    assert bridge.get_agent_quota_block("w1:p3") is not None
+
+
+def test_ready_and_quota_explain_a_size_limit_block(live_server, monkeypatch):
+    _two_agents(monkeypatch)
+    bridge.mark_agent_quota_blocked("w1:p1", SIZE_LIMIT)
+
+    status, body = _get(live_server, "/ready?agent=w1:p1")
+    assert body["ready"] is False
+    assert body["reason"] == "quota_blocked"          # unchanged for existing clients
+    assert body["kind"] == "context_limit"
+    hint = body["hint"].lower()
+    # Says what to do, and what not to: a retry fails identically.
+    assert "compact" in hint and "restart" in hint
+
+    status, body = _get(live_server, "/quota")
+    assert body["blocked_agents"][0]["kind"] == "context_limit"
+
+
+def test_a_turn_that_ends_in_seconds_with_no_result_says_nothing_was_done(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    # Wording no pattern knows: the signature is the timing, not the text.
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True,
+        "stdout": "gateway refused the request (E4711)" if a[1] == "read" else "",
+        "stderr": "",
+    })
+
+    with pytest.raises(bridge.SentinelResultMissingError) as exc_info:
+        bridge.execute_sentinel_task("w1:p1", "1", "audit", 1000)
+
+    error = exc_info.value
+    assert error.reason == "ended_quickly"
+    assert "never started" in str(error)
+    # The permission advice is the wrong lead when no work happened at all.
+    assert "permission" not in str(error)
+    assert "gateway refused" in error.raw_output
+
+
+def test_a_slow_turn_with_no_result_keeps_the_original_advice(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "QUICK_END_SEC", 0)
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": True, "stdout": "agent chatter" if a[1] == "read" else "", "stderr": "",
+    })
+
+    with pytest.raises(bridge.SentinelResultMissingError) as exc_info:
+        bridge.execute_sentinel_task("w1:p1", "1", "audit", 1000)
+
+    # Work that ran for a while and then lost its file really can be a
+    # permissions problem; only a turn too short to have done anything is not.
+    assert exc_info.value.reason is None
+    assert "permission system" in str(exc_info.value)
+
+
+def _prompt_world(monkeypatch, tmp_path, before, after, targets=None):
+    """A herdr whose terminal reads `before` first, then `after`."""
+    _two_agents(monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    reads = {"n": 0}
+
+    def fake(*args, **kwargs):
+        if args[1] == "read":
+            reads["n"] += 1
+            return {"ok": True, "stdout": before if reads["n"] == 1 else after, "stderr": ""}
+        if args[1] == "prompt" and targets is not None:
+            targets.append(args[2])
+        return {"ok": True, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake)
+
+
+def test_prompt_reports_a_refusal_that_appeared_while_it_ran(live_server, tmp_path, monkeypatch):
+    _prompt_world(monkeypatch, tmp_path, "an idle prompt\n", SIZE_LIMIT_TAIL)
+
+    status, body = _post(live_server, "/prompt", {"task": "do it", "agent": "w1:p1", "timeout_ms": 5000})
+
+    # herdr called this a success -- done, exactly as for a real one -- and
+    # the bridge relayed ok:true, so the caller waited on work that had been
+    # refused within a second.
+    assert body["ok"] is False
+    assert body["reason"] == "provider_rejected"
+    assert body["kind"] == "context_limit"
+    assert "334110" in body["error"]
+    assert bridge.get_agent_quota_block("w1:p1") is not None
+
+
+def test_prompt_does_not_blame_an_error_that_was_already_on_screen(live_server, tmp_path, monkeypatch):
+    # An old refusal still in view, and a prompt that went fine: the same
+    # evidence both before and after is not news about *this* prompt, and
+    # reading it as one would trip a circuit on a healthy agent.
+    _prompt_world(monkeypatch, tmp_path, SIZE_LIMIT_TAIL, SIZE_LIMIT_TAIL)
+
+    status, body = _post(live_server, "/prompt", {"task": "do it", "agent": "w1:p1", "timeout_ms": 5000})
+
+    assert body["ok"] is True
+    assert bridge.get_agent_quota_block("w1:p1") is None
+
+
+def test_a_pinned_prompt_goes_to_the_agent_it_names_even_past_an_open_circuit(
+    live_server, tmp_path, monkeypatch
+):
+    targets = []
+    _prompt_world(monkeypatch, tmp_path, "idle\n", "idle\n", targets)
+    bridge.mark_agent_quota_blocked("w1:p1", SIZE_LIMIT)
+
+    status, body = _post(live_server, "/prompt", {"task": "do it", "agent": "w1:p1", "timeout_ms": 5000})
+
+    # Failover is for work any agent can do. A prompt aimed at one agent --
+    # the way to act on a session that needs compacting -- means nothing
+    # elsewhere, and quietly sending it to the other agent acts on the wrong
+    # one.
+    assert body["ok"] is True
+    assert body["agent"] == "w1:p1"
+    assert targets == ["w1:p1"]
+
+
+def test_the_evidence_is_the_providers_column_not_its_neighbours():
+    # An agent's TUI is two columns. Taken as a flat window, the evidence
+    # around a hit spilled into whatever sat beside it -- measured on a real
+    # capture, a path from the delegated task. The detail is served by /ready
+    # and /quota and quoted in task notes, so what is in it matters.
+    two_columns = (
+        "  ┃  想让远端看到进展（拿到 job ID、卡在┃  Prompt tokens limit exceeded: 334110 > 185528. To  ┃    Context\n"
+        "  ┃  /srv/projects/secret-cohort/sent    ┃  increase, visit https://openrouter.ai/settings/   ┃    379,392 tokens\n"
+    )
+
+    detail = bridge.quota_error_detail(two_columns)
+
+    assert "334110 > 185528" in detail
+    assert "secret-cohort" not in detail
+    assert "379,392" not in detail
+    assert "想让远端" not in detail
+
+
+def test_evidence_in_a_single_column_still_keeps_its_context():
+    # No separators, no change: a provider message that wraps over lines
+    # keeps the line that carries the reset time.
+    detail = bridge.quota_error_detail("Usage limit reached\nresets 4:20pm\n")
+
+    assert "Usage limit reached" in detail
+    assert "resets 4:20pm" in detail
