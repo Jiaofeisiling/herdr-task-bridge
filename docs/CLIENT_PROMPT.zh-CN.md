@@ -123,6 +123,22 @@ TUI 在任务完成后不会清屏，所以 `read` 返回的经常是上一次�
 写着什么，这个 agent 都是空闲的——不要据此让用户去手工清窗口或按回车，
 那正是这个工具存在的意义所在。
 
+## `blocked` 是一份报告，不是诊断
+
+herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocked`、一秒后
+又变回 `working`。真正的审批提示不会在一秒内自己消失。所以：
+
+- 绝不要因为 herdr 报了 `blocked`，或者某个错误里出现了 "requires
+  interactive input" 这几个字，就告诉用户 agent "卡在交互菜单上"。这句话是
+  herdr 的措辞，在这个部署上多数时候是错的：报 `agent_blocked` 而失败的 96
+  个任务里，有 69 个其实已经交付了结果。
+- 失败的 `ask` 会在 `reason` 里说明是哪种失败。只有 `blocked_confirmed`
+  才表示 agent 持续阻塞、确实在等输入。`delivery_unknown` 的意思是"不知道
+  prompt 有没有送达"，**不是**"被阻塞"；先查 `ready` 和 `read`。
+- 如果 `ready` 报告 `blocked`，过几秒再查一次，再决定怎么做。
+- 在断定工作丢了之前，先再查一次任务：`error`/`orphaned` 的任务在结果到达后
+  会自己变成 `done`。
+
 ## 写任务描述
 
 直接写要做什么。不要规定 agent 该用什么工具或什么 shell 写法——指定具体

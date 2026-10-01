@@ -19,9 +19,23 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 22
+BRIDGE_VERSION = 23
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
+
+# After herdr aborts its wait with agent_blocked, how the bridge decides what
+# actually happened. herdr's `blocked` flickers while an agent is busy -- one
+# measured failure showed it blocked, then working a second later -- so the
+# abort is not taken as a verdict; the agent is watched instead.
+#
+# BLOCKED_CONFIRM_SEC: how long it must *stay* blocked before the bridge says
+#   so. Long enough that a flicker does not qualify, short enough that a real
+#   approval prompt is not left waiting out the task's whole timeout.
+# NOT_STARTED_GRACE_SEC: how long to wait for any sign of activity before
+#   concluding the prompt was never taken up.
+BLOCKED_CONFIRM_SEC = float(os.environ.get("SENTINEL_BLOCKED_CONFIRM_SEC", "20"))
+NOT_STARTED_GRACE_SEC = float(os.environ.get("SENTINEL_NOT_STARTED_GRACE_SEC", "8"))
+ABORT_POLL_SEC = 2.0
 
 # How long an orderly shutdown waits for requests already in flight. Short on
 # purpose: the listener is closed first, so nothing new arrives, and a
@@ -1115,9 +1129,24 @@ def list_agents():
 
 
 class SentinelPromptError(RuntimeError):
-    def __init__(self, message, raw_output=""):
+    def __init__(self, message, raw_output="", reason=None):
         self.raw_output = raw_output
+        # Which failure this is, when the bridge has established it, so a
+        # caller is told rather than left to infer it from herdr's wording.
+        self.reason = reason
         super().__init__(message)
+
+
+class PromptWaitAborted(SentinelPromptError):
+    """herdr stopped waiting for the agent. The prompt may well have landed.
+
+    A subclass of SentinelPromptError so anything that handled the old
+    failure still does.
+    """
+
+    def __init__(self, message, raw_output="", code=None):
+        super().__init__(message, raw_output=raw_output)
+        self.code = code
 
 
 class AgentQuotaExhaustedError(SentinelPromptError):
@@ -1195,10 +1224,15 @@ def ready_hint(agent_status):
         return None
 
     if agent_status == "blocked":
+        # Worded as a report, not a diagnosis. herdr's `blocked` flickers
+        # while an agent is busy (observed: blocked, then working a second
+        # later), and the previous wording -- "will not free itself" -- sent a
+        # caller off reporting an interactive menu that was not there.
         return (
-            "This agent is waiting on interactive input in its own terminal "
-            "(a permission prompt or a mode that needs approval). It will not "
-            "free itself. `read` shows what it is waiting for."
+            "herdr reports this agent as blocked, which usually means a "
+            "permission prompt or approval -- but the report can flicker "
+            "while an agent is busy. Check again in a few seconds before "
+            "acting on it; `read` shows what is on its screen."
         )
 
     if agent_status == "working":
@@ -1529,10 +1563,36 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False)
         raise AgentQuotaExhaustedError(agent_name, detail, raw_output=output)
 
     if not result["ok"]:
-        # Delivery failed, so nothing reached an agent and re-sending
-        # cannot double-execute anything. This is the one safe place to
-        # recover from a stale identifier -- and it costs nothing on the
-        # happy path, unlike resolving every request up front.
+        code = herdr_error_code(result)
+
+        if code == "timeout":
+            # herdr's own wait expired: the prompt was delivered and the
+            # agent is still going. The same event as the subprocess timeout
+            # above, and handled the same way -- it used to surface as a 500
+            # "prompt command failed", telling the caller it had not landed.
+            raise TimeoutError(
+                "Bridge stopped waiting for Sentinel. "
+                "Sentinel may still be executing the task."
+            )
+
+        if code == "agent_blocked":
+            # NOT a delivery failure. `--wait` delivers the prompt and then
+            # waits, and herdr aborts the wait on a transient blocked just as
+            # readily as on a real one. Measured: 69 of 96 tasks that failed
+            # this way had gone on to deliver a result.
+            raise PromptWaitAborted(
+                "Herdr prompt command failed: " + result.get("stderr", ""),
+                raw_output=_read_terminal_tail(agent_name, READ_LINES_DEFAULT),
+                code=code,
+            )
+
+        # Any other failure: the error says the target could not take the
+        # prompt (an unknown agent, say), so nothing reached an agent and
+        # re-sending cannot double-execute anything. That reasoning holds
+        # for these codes only -- it did not hold for the two above, and an
+        # earlier version of this comment claimed it for all of them. This is
+        # the one safe place to recover from a stale identifier, and it costs
+        # nothing on the happy path, unlike resolving every request up front.
         if not _retrying:
             try:
                 target = resolve_agent(agent_name)
@@ -1559,6 +1619,109 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False)
         )
 
     return result
+
+
+def herdr_error_code(result):
+    """The `error.code` from a failed herdr call, or None."""
+    for stream in (result.get("stderr", ""), result.get("stdout", "")):
+        try:
+            payload = json.loads(stream)
+        except (TypeError, ValueError):
+            continue
+
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict) and error.get("code"):
+            return error["code"]
+
+    return None
+
+
+def settle_after_abort(agent_name, task_id, aborted, deadline):
+    """herdr aborted its wait; work out what actually happened.
+
+    The abort tells the bridge almost nothing: it fires for a transient
+    `blocked` exactly as for a real one. So rather than take it as a verdict,
+    watch the agent and let what it does decide:
+
+      result file appears        -> it delivered; carry on
+      working, then idle/done    -> its turn ended; carry on (the caller
+                                    reads the file, or asks once for it)
+      still blocked after a while -> only now say so: it really is waiting
+                                    on interactive input
+      idle/done and never started -> the prompt was not taken up, or at
+                                    least nothing shows that it was
+      deadline                   -> TimeoutError, as for any task
+
+    A failed status lookup is not a verdict either; it just means look again.
+    Returns normally whenever it is safe to go on and read the result.
+    """
+    started = time.monotonic()
+    saw_working = False
+    blocked_since = None
+
+    while True:
+        if os.path.exists(result_file_path(task_id)):
+            return
+
+        now = time.monotonic()
+
+        if now >= deadline:
+            raise TimeoutError(
+                "Bridge stopped waiting for Sentinel. "
+                "Sentinel may still be executing the task."
+            )
+
+        try:
+            status, _ = get_agent_status(agent_name)
+        except Exception:
+            status = None
+
+        if status == "working":
+            saw_working = True
+            blocked_since = None
+
+        elif status == "blocked":
+            if blocked_since is None:
+                blocked_since = now
+            elif now - blocked_since >= BLOCKED_CONFIRM_SEC:
+                raise SentinelPromptError(
+                    f"The agent stayed blocked for {BLOCKED_CONFIRM_SEC:g}s "
+                    "after herdr aborted its wait, so it really is waiting "
+                    "on interactive input in its own terminal -- a "
+                    "permission prompt or an approval. The terminal tail, if "
+                    "herdr would give one, is attached.",
+                    raw_output=_read_terminal_tail(agent_name, READ_LINES_DEFAULT),
+                    reason="blocked_confirmed",
+                )
+
+        elif status in AVAILABLE_STATES:
+            blocked_since = None
+
+            if saw_working:
+                return
+
+            if now - started >= NOT_STARTED_GRACE_SEC:
+                raise SentinelPromptError(
+                    "herdr aborted its wait with agent_blocked, but afterwards "
+                    "the agent showed no activity and no result appeared "
+                    f"within {NOT_STARTED_GRACE_SEC:g}s. It is unknown whether "
+                    "the prompt was delivered, so do not retry blindly: check "
+                    "the agent first (ready, then read).",
+                    raw_output=aborted.raw_output,
+                    reason="delivery_unknown",
+                )
+
+        time.sleep(ABORT_POLL_SEC)
+
+
+def deliver_prompt(agent_name, delegated_prompt, timeout_ms, task_id):
+    """Send a prompt and wait for the agent, tolerating a spurious abort."""
+    deadline = time.monotonic() + timeout_ms / 1000
+
+    try:
+        _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
+    except PromptWaitAborted as aborted:
+        settle_after_abort(agent_name, task_id, aborted, deadline)
 
 
 def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
@@ -1593,10 +1756,11 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
                           slurm_policy=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
 
-    _run_herdr_prompt(
+    deliver_prompt(
         agent_name,
         build_delegation_prompt(task, task_id, slurm_policy),
         timeout_ms,
+        task_id,
     )
 
     response = read_result_file(task_id)
@@ -1628,10 +1792,11 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
             f"sending reminder (agent={agent_name})"
         )
 
-        _run_herdr_prompt(
+        deliver_prompt(
             agent_name,
             build_result_reminder_prompt(task_id),
             RESULT_REMINDER_TIMEOUT_MS,
+            task_id,
         )
 
         response = read_result_file(task_id)
@@ -2724,14 +2889,27 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         except SentinelPromptError as e:
-            self.send_json(
-                {
-                    "ok": False,
-                    "task_id": task_id,
-                    "error": str(e),
-                },
-                500,
-            )
+            payload = {
+                "ok": False,
+                "task_id": task_id,
+                "error": str(e),
+            }
+
+            if e.reason:
+                payload["reason"] = e.reason
+
+            # Where the prompt may have landed, a result can still follow, so
+            # leave the row it would be adopted into. A confirmed block is an
+            # error; "unknown whether delivered" is lost tracking.
+            if path == "/ask" and e.reason in ("blocked_confirmed", "delivery_unknown"):
+                if record_sync_failure(
+                    task_id, task, timeout_ms, agent_name, slurm_policy,
+                    "error" if e.reason == "blocked_confirmed" else "orphaned",
+                    str(e),
+                ):
+                    payload["hint"] = SYNC_RECOVERY_HINT
+
+            self.send_json(payload, 500)
             return
 
 
