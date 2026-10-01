@@ -151,6 +151,26 @@ says idle or done, the agent is free no matter what the terminal shows --
 do not ask the user to clear the window or press enter by hand, which is
 the very thing this tool exists to avoid.
 
+## `blocked` is a report, not a diagnosis
+
+herdr's `blocked` status flickers while an agent is busy: it has been
+observed `blocked` and then `working` one second later. A real approval
+prompt does not clear itself in a second. So:
+
+- Never tell the user an agent is "stuck on an interactive menu" because
+  herdr said `blocked` or because an error contained the words "requires
+  interactive input". That wording is herdr's, and on this deployment most
+  of the time it was wrong: of 96 tasks that failed with `agent_blocked`, 69
+  had in fact delivered a result.
+- An `ask` that fails says which failure it is in `reason`. Only
+  `blocked_confirmed` means the agent stayed blocked and really is waiting
+  on input. `delivery_unknown` means it is not known whether the prompt
+  landed -- not that anything is blocked; check `ready` and `read`.
+- If `ready` reports `blocked`, check again in a few seconds before acting.
+- Before concluding that work was lost, query the task again: an
+  `error`/`orphaned` task turns into `done` by itself when the result
+  arrives.
+
 ## Writing task descriptions
 
 Say what needs doing. Do not prescribe which tool or shell construct the

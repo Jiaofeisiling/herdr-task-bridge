@@ -2111,10 +2111,20 @@ def test_worker_records_the_terminal_tail_for_a_blocked_agent(tmp_path, monkeypa
     _fresh_db(tmp_path, monkeypatch)
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
 
+    # A *genuinely* blocked agent: idle when the task is claimed, then blocked
+    # and staying that way. A single agent_blocked abort no longer fails a
+    # task on its own -- 72% of those had in fact delivered -- so the failure
+    # this test expects has to be earned by the agent actually staying blocked.
+    monkeypatch.setattr(bridge, "BLOCKED_CONFIRM_SEC", 0.1)
+    monkeypatch.setattr(bridge, "ABORT_POLL_SEC", 0.01)
+    gets = {"n": 0}
+
     def fake_run_herdr(*args, **kwargs):
         if args[1] == "get":
+            gets["n"] += 1
+            status = "idle" if gets["n"] == 1 else "blocked"
             return {"ok": True, "stdout": json_module.dumps(
-                {"result": {"agent": {"agent_status": "idle"}}}
+                {"result": {"agent": {"agent_status": status}}}
             ), "stderr": ""}
         if args[1] == "prompt":
             return {"ok": False, "stdout": "", "stderr": '{"error":{"code":"agent_blocked"}}'}
@@ -3530,3 +3540,239 @@ def test_a_real_signal_stops_the_bridge_in_an_orderly_way(tmp_path, sig_name):
 
     assert status == "orphaned"
     assert sig_name in error_text
+
+
+# --- herdr aborting its wait is not the prompt failing -----------------
+#
+# The bridge sends `herdr agent prompt --wait`, which delivers the prompt and
+# then waits for the agent to finish. If herdr sees the agent become
+# "blocked" during that wait it aborts with agent_blocked -- and it does so
+# for a transient blocked as readily as for a real one. The bridge read that
+# as "the prompt failed", marked the task error, and told the caller the
+# agent "requires interactive input".
+#
+# Measured on the live host: of 129 failed tasks, 96 were agent_blocked, and
+# 69 of those 96 (72%) had in fact delivered a result. One of three sampled
+# failures showed herdr reporting `blocked`, then `working` one second later;
+# a real approval prompt does not clear itself in a second. The agent was
+# doing the work. A caller then repeated herdr's wording as "blocked by an
+# interactive menu" -- three times, each wrong.
+#
+# So an abort is not a verdict. The bridge observes what the agent does next
+# and only asserts "blocked" once it has stayed blocked.
+
+
+_ABORT_STDERR = json_module.dumps({"error": {
+    "code": "agent_blocked",
+    "message": "agent w1:p1 is blocked and requires interactive input",
+}})
+
+
+def _abort_world(monkeypatch, tmp_path, statuses, task_id, result_after=None):
+    """herdr aborts the wait; the agent's status then follows `statuses`.
+
+    result_after: write the result file once get_agent_status has been
+    called that many times, as an agent finishing partway through.
+    """
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "ABORT_POLL_SEC", 0.01)
+    monkeypatch.setattr(bridge, "NOT_STARTED_GRACE_SEC", 0.2)
+    monkeypatch.setattr(bridge, "BLOCKED_CONFIRM_SEC", 0.2)
+
+    calls = {"n": 0}
+
+    def fake_status(agent, *a, **k):
+        index = calls["n"]
+        calls["n"] += 1
+        if result_after is not None and calls["n"] >= result_after:
+            _result_for(task_id, "the finished answer")
+        return statuses[min(index, len(statuses) - 1)], {"ok": True}
+
+    monkeypatch.setattr(bridge, "get_agent_status", fake_status)
+
+    def fake_run(*args, **kwargs):
+        if args[1] == "prompt":
+            return {"ok": False, "stdout": "", "stderr": _ABORT_STDERR}
+        if args[1] == "read":
+            return {"ok": True, "stdout": "terminal tail", "stderr": ""}
+        return {"ok": True, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run)
+
+
+TASK = "cccccccc-1111-2222-3333-444444444444"
+
+
+def test_a_transient_blocked_does_not_fail_a_task_that_goes_on_to_finish(tmp_path, monkeypatch):
+    # blocked -> working -> working, and the result turns up: the exact
+    # shape of the live failures.
+    _abort_world(monkeypatch, tmp_path, ["blocked", "working", "working", "working"],
+                 TASK, result_after=4)
+
+    result = bridge.execute_sentinel_task("w1:p1", TASK, "audit", 60000)
+
+    assert result == "the finished answer"
+
+
+def test_a_transient_blocked_followed_by_the_agent_finishing_is_fine(tmp_path, monkeypatch):
+    # The turn ended and the file is there by the time status says done.
+    _abort_world(monkeypatch, tmp_path, ["blocked", "working", "done"], TASK, result_after=3)
+
+    assert bridge.execute_sentinel_task("w1:p1", TASK, "audit", 60000) == "the finished answer"
+
+
+def test_it_only_says_blocked_once_the_agent_has_stayed_blocked(tmp_path, monkeypatch):
+    _abort_world(monkeypatch, tmp_path, ["blocked"], TASK)
+
+    with pytest.raises(bridge.SentinelPromptError) as exc_info:
+        bridge.execute_sentinel_task("w1:p1", TASK, "audit", 60000)
+
+    error = exc_info.value
+    # The one case where the claim is earned: it did not clear.
+    assert error.reason == "blocked_confirmed"
+    assert "stayed blocked" in str(error)
+    assert "interactive" in str(error)
+
+
+def test_an_agent_that_never_starts_is_not_called_blocked(tmp_path, monkeypatch):
+    _abort_world(monkeypatch, tmp_path, ["done"], TASK)
+
+    with pytest.raises(bridge.SentinelPromptError) as exc_info:
+        bridge.execute_sentinel_task("w1:p1", TASK, "audit", 60000)
+
+    error = exc_info.value
+    # herdr aborted, the agent showed no activity, and no result appeared.
+    # Whether the prompt was delivered is genuinely unknown, and saying
+    # "blocked" here would be the very misreport this exists to stop.
+    assert error.reason == "delivery_unknown"
+    assert "unknown whether" in str(error)
+    assert "interactive" not in str(error)
+
+
+def test_waiting_after_an_abort_stops_at_the_tasks_own_deadline(tmp_path, monkeypatch):
+    _abort_world(monkeypatch, tmp_path, ["working"], TASK)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        bridge.execute_sentinel_task("w1:p1", TASK, "audit", 300)   # 0.3 s budget
+
+    # A prompt that never completes must not hold the worker forever.
+    assert time.monotonic() - started < 3
+
+
+def test_status_lookups_that_fail_do_not_end_the_wait(tmp_path, monkeypatch):
+    _abort_world(monkeypatch, tmp_path, ["working"], TASK, result_after=5)
+    real = bridge.get_agent_status
+    count = {"n": 0}
+
+    def flaky(agent, *a, **k):
+        count["n"] += 1
+        if count["n"] in (1, 2):
+            raise RuntimeError("herdr hiccup")
+        return real(agent, *a, **k)
+
+    monkeypatch.setattr(bridge, "get_agent_status", flaky)
+
+    # Observing the agent is a convenience; a failed look is not a verdict.
+    assert bridge.execute_sentinel_task("w1:p1", TASK, "audit", 60000) == "the finished answer"
+
+
+def test_a_herdr_timeout_is_a_timeout_not_a_prompt_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "stdout": "",
+        "stderr": json_module.dumps({"error": {"code": "timeout", "message": "wait timed out"}}),
+    })
+
+    # herdr's own wait expired: the prompt WAS delivered and the agent is
+    # still going. That is the same event as the bridge's subprocess timeout,
+    # and the same recovery applies -- a 504, a row, a late result adopted --
+    # where it used to surface as a 500 "prompt command failed".
+    with pytest.raises(TimeoutError):
+        bridge.execute_sentinel_task("w1:p1", TASK, "audit", 60000)
+
+
+def test_the_reminder_prompt_gets_the_same_treatment(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "ABORT_POLL_SEC", 0.01)
+    monkeypatch.setattr(bridge, "NOT_STARTED_GRACE_SEC", 0.2)
+    monkeypatch.setattr(bridge, "BLOCKED_CONFIRM_SEC", 0.2)
+
+    prompts = []
+
+    def fake_run(*args, **kwargs):
+        if args[1] == "prompt":
+            prompts.append(args[3])
+            if len(prompts) == 1:
+                return {"ok": True, "stdout": "", "stderr": ""}     # task prompt: fine, no file
+            return {"ok": False, "stdout": "", "stderr": _ABORT_STDERR}   # reminder: aborted
+        return {"ok": True, "stdout": "terminal tail", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake_run)
+    statuses = iter(["blocked", "working", "working"])
+
+    def fake_status(agent, *a, **k):
+        value = next(statuses, "working")
+        if value == "working" and len(prompts) == 2:
+            _result_for(TASK, "written after the reminder")
+        return value, {"ok": True}
+
+    monkeypatch.setattr(bridge, "get_agent_status", fake_status)
+
+    assert bridge.execute_sentinel_task("w1:p1", TASK, "audit", 60000) == "written after the reminder"
+
+
+def test_a_worker_task_survives_a_transient_blocked(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    _abort_world(monkeypatch, tmp_path, ["idle", "blocked", "working", "working"],
+                 task_id, result_after=5)
+
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    for _ in range(200):
+        if bridge.get_task(task_id)["status"] in ("done", "error"):
+            break
+        time.sleep(0.05)
+    stop.set()
+    worker.join(timeout=5)
+
+    # Before: error, "agent_blocked", with a good result arriving a moment
+    # later to be thrown away.
+    assert bridge.get_task(task_id)["status"] == "done"
+    assert bridge.get_task(task_id)["result_text"] == "the finished answer"
+
+
+def test_ask_reports_a_confirmed_block_and_records_it_for_recovery(tmp_path, monkeypatch, live_server):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    error = bridge.SentinelPromptError("it stayed blocked", raw_output="tail", reason="blocked_confirmed")
+    monkeypatch.setattr(
+        bridge, "run_with_quota_failover",
+        lambda *a, **k: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+
+    status, body = _post(live_server, "/ask", {"task": "audit", "agent": "w1:p1", "timeout_ms": 5000})
+
+    assert status == 500
+    # The caller is told *which* failure this is, instead of having to infer
+    # it from herdr's wording.
+    assert body["reason"] == "blocked_confirmed"
+    assert bridge.get_task(body["task_id"])["status"] == "error"
+
+
+# --- the blocked hint must not claim more than herdr can support -------
+
+
+def test_the_blocked_hint_does_not_claim_a_certainty_herdr_cannot_give():
+    hint = bridge.ready_hint("blocked")
+
+    # herdr's `blocked` flickers while an agent is busy (observed: blocked,
+    # then working a second later). The hint used to say the agent "will not
+    # free itself", which is false often enough to have sent a caller off
+    # reporting a menu that was not there.
+    assert "will not free itself" not in hint
+    assert "again" in hint.lower()
+    assert "read" in hint
