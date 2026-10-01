@@ -196,6 +196,10 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 
 所有快速命令都有上限（默认 5 秒，`SENTINEL_CLIENT_TIMEOUT_SEC`）。原因是调用方通常只给一条命令 10–30 秒，到时就交回空结果并报告"堵塞"；对 3400 多次真实调用的统计显示：`health` 中位数 1.9 秒，而**每一次空结果的耗时恰好等于调用方自己的等待时间**。PowerShell 7 的 `Invoke-RestMethod` **默认没有超时**，所以转发仍能建立连接、却已不通往主机时，客户端会无限挂起，下面这段说明也就永远来不及被读到。`ask` 和 `prompt` 的上限是你给的 `-TimeoutMs` 再加 30 秒，合法的慢任务不会被切断。
 
+**重试并不总是安全的，客户端会明说这一点。** 一个没收到回复的请求可能已经生效：丢的是回复，不一定是请求。因此 `delegate` 会带一个幂等键（不传就自动生成，回复丢失时会打印出来）；用同一个 `-IdempotencyKey` 重试会返回原来的任务，而不是再入队一份——在默认允许提交 Slurm 的情况下，后者就是重复提交作业。桥在入队事务**内部**原子地认领这个键（先查再插会在并发重试下输掉竞争），重放请求优先于任何可能拒绝它的检查（队列已满、agent 已不在），同一个键配上不同的参数则返回 `422`，而不是把一个你没要求过的结果交给你。`ask` 和 `prompt` 没有这种键；回复丢失时它们会说明请求可能已经执行过，并指向 `ready`/`read`。
+
+`wait` 能扛过瞬时故障：一次没得到回应的轮询不会结束它，只有连续失败超过 `SENTINEL_WAIT_TOLERANCE_SEC`（60 秒）才以退出码 `4` 放弃，并告知任务本身未受影响。
+
 请求超时时，客户端会先探测 `/health` 再开口——因为超时本身无法区分"转发断了"和"bridge 活着、只是它背后某一次调用卡住了"，而这两种情况需要相反的处理。能应答是退出码 `5`，没有应答是退出码 `4`。
 
 此前连接失败会打印一段 `Invoke-RestMethod` 的原始堆栈，**并且退出码为 0**，调用方既无从判断也无从分支。
@@ -280,6 +284,9 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_SLURM_POLICY` | `submit` | 部署级默认 Slurm 策略；请求里的 `slurm_policy` 可覆盖。 |
 | `SENTINEL_AGENT_PRIORITY` | 未设置 | 成本偏好顺序，便宜的在前；按 agent 名或运行时家族匹配。只对当前能接活的 agent 排序。 |
 | `SENTINEL_CLIENT_TIMEOUT_SEC` | `5` | 客户端（`sentinel.ps1`）侧：任何快速调用的时间上限。应明显小于你的调用方放弃等待的时间。 |
+| `SENTINEL_WAIT_TOLERANCE_SEC` | `60` | 客户端：`wait` 在通道持续中断时继续轮询多久，超过则以退出码 4 放弃。 |
+| `SENTINEL_ASK_GRACE_SEC` | `30` | 客户端：在 `ask`/`prompt` 自己的 `-TimeoutMs` 之外追加的宽限，超过才放弃。 |
+| `SENTINEL_HERDR_TIMEOUT_SEC` | `30` | bridge 端：任何没自带超时的 herdr 调用的上限。herdr 卡住时表现为 504，而不是让请求线程无限阻塞。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 
 将 [`remote/bridge.env.example`](remote/bridge.env.example) 复制为未追踪的 `remote/bridge.env`，再填写部署专用配置。绝不要提交真实主机名、项目标识、路径、用户名、任务提示词或令牌；项目的敏感信息规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。

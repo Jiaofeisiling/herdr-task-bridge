@@ -35,7 +35,13 @@ param(
     # sbatch is reversible and holding one back costs more than it saves.
     # Pass a narrower value when a task genuinely should not submit.
     [ValidateSet("dry_run_only", "test_only", "submit")]
-    [string]$SlurmPolicy
+    [string]$SlurmPolicy,
+
+    # Names one logical delegate across its retries. Omit and one is
+    # generated; on a failure the client prints it, so a retry can pass it
+    # back and the bridge collapses the repeat into the original task
+    # instead of queueing a second copy.
+    [string]$IdempotencyKey
 )
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -56,6 +62,23 @@ $BaseUrl = if ($env:SENTINEL_BRIDGE_URL) { $env:SENTINEL_BRIDGE_URL } else { "ht
 # time. The bound has to be shorter than that, or the explanation printed on
 # failure arrives after the reader has gone.
 $QuickTimeoutSec = if ($env:SENTINEL_CLIENT_TIMEOUT_SEC) { [int]$env:SENTINEL_CLIENT_TIMEOUT_SEC } else { 5 }
+
+# Slack added on top of an ask/prompt's own -TimeoutMs before the client gives
+# up on it, so it outlives the bridge's timeout rather than abandoning work
+# that is proceeding normally.
+$AskGraceSec = if ($env:SENTINEL_ASK_GRACE_SEC) { [int]$env:SENTINEL_ASK_GRACE_SEC } else { 30 }
+
+# How long `wait` keeps polling through a continuous channel outage before it
+# gives up. wait is meant to outlast a task that may run for hours, so a
+# brief tunnel blip must not end it -- but a channel that stays dead should.
+$WaitToleranceSec = if ($env:SENTINEL_WAIT_TOLERANCE_SEC) { [int]$env:SENTINEL_WAIT_TOLERANCE_SEC } else { 60 }
+
+# What the current command is, for the one thing that depends on it: what to
+# say about retrying when a request gets no reply. Reads are safe to repeat;
+# a delegate or an ask may already have taken effect.
+$Script:ActiveRequest = $null
+$Script:ChannelFailed = $false
+$Script:LastChannelError = $null
 
 # How long the follow-up liveness probe may take. Worst case for a stalled
 # call is therefore the bound plus this plus about a second of PowerShell
@@ -133,6 +156,37 @@ function Test-BridgeAnswers {
     }
 }
 
+function Get-RetryAdvice {
+    $req = $Script:ActiveRequest
+    if ($null -eq $req) { return @() }
+
+    switch ($req.Kind) {
+        "delegate" {
+            return @(
+                "  This delegate MAY HAVE BEEN QUEUED: the reply was lost, not necessarily the request.",
+                "  Do not simply run it again -- that can queue it twice. Retry with the same key,",
+                "  which is safe, and the bridge will return the original task if it exists:",
+                "    sentinel.ps1 delegate -IdempotencyKey $($req.Key) <the same task>",
+                "  Or look for it first with: sentinel.ps1 tasks"
+            )
+        }
+        "execute" {
+            return @(
+                "  This request MAY HAVE ALREADY RUN on the host. Do not retry blindly --",
+                "  check the agent with ready and read first."
+            )
+        }
+        "wait" {
+            return @(
+                "  The task itself is unaffected and is still on the host.",
+                "  Run again when the channel is back: sentinel.ps1 wait $($req.TaskId)"
+            )
+        }
+    }
+
+    return @()
+}
+
 # Exit 4 -- the bridge was never reached, so nothing is known about it.
 # Exit 5 -- the bridge answers /health, but this one request got no reply.
 #
@@ -152,8 +206,16 @@ function Exit-ChannelDown {
             "NO REPLY: $Uri did not answer within ${WaitedSec}s, but the bridge's /health does.",
             "  The channel is fine and the bridge is up; this one request is stuck behind it,",
             "  most often a herdr call on the host that is slow or hung. Do NOT reconnect",
-            "  VS Code. Retry once; if it repeats, look at what the host's herdr is doing."
+            "  VS Code."
         )
+        $advice = Get-RetryAdvice
+        if ($advice.Count -eq 0) {
+            # Only for a read, where repeating it cannot do any harm.
+            $lines += "  Retry once; if it repeats, look at what the host's herdr is doing."
+        }
+        else {
+            $lines += $advice
+        }
         foreach ($line in $lines) { [Console]::Error.WriteLine($line) }
         exit 5
     }
@@ -186,7 +248,7 @@ function Exit-ChannelDown {
         }
     }
 
-    foreach ($line in $lines) {
+    foreach ($line in ($lines + (Get-RetryAdvice))) {
         [Console]::Error.WriteLine($line)
     }
 
@@ -198,8 +260,11 @@ function Invoke-SentinelApi {
         [Parameter(Mandatory=$true)][string]$Uri,
         [string]$Method = "Get",
         [string]$Body = $null,
-        [int]$TimeoutSec = $QuickTimeoutSec
+        [int]$TimeoutSec = $QuickTimeoutSec,
+        [switch]$SoftFail
     )
+
+    $Script:ChannelFailed = $false
 
     $headers = @{}
 
@@ -238,6 +303,14 @@ function Invoke-SentinelApi {
             # a connection-layer failure, not an HTTP error. Rethrowing
             # here printed a raw Invoke-RestMethod stack trace *and* left
             # the exit code at 0, so callers saw success on a dead channel.
+            if ($SoftFail) {
+                # The caller (wait) decides how long to keep trying, so it is
+                # told rather than having the process ended under it.
+                $Script:ChannelFailed = $true
+                $Script:LastChannelError = $caughtError
+                return $null
+            }
+
             Exit-ChannelDown -ErrorRecord $caughtError -Uri $Uri -WaitedSec $TimeoutSec
         }
 
@@ -362,8 +435,9 @@ switch ($Command) {
         # These legitimately run as long as the caller allowed, so the client has to
         # outlive the bridge's own timeout (plus slack) or it abandons work that
         # is proceeding normally and then misreports it as a dead channel.
+        $Script:ActiveRequest = @{ Kind = "execute" }
         $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body `
-            -TimeoutSec ([int][math]::Ceiling($TimeoutMs / 1000) + 30)
+            -TimeoutSec ([int][math]::Ceiling($TimeoutMs / 1000) + $AskGraceSec)
         $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {
@@ -398,8 +472,9 @@ switch ($Command) {
         # These legitimately run as long as the caller allowed, so the client has to
         # outlive the bridge's own timeout (plus slack) or it abandons work that
         # is proceeding normally and then misreports it as a dead channel.
+        $Script:ActiveRequest = @{ Kind = "execute" }
         $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body `
-            -TimeoutSec ([int][math]::Ceiling($TimeoutMs / 1000) + 30)
+            -TimeoutSec ([int][math]::Ceiling($TimeoutMs / 1000) + $AskGraceSec)
         $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {
@@ -428,6 +503,13 @@ switch ($Command) {
         if ($PSBoundParameters.ContainsKey("SlurmPolicy")) {
             $payload["slurm_policy"] = $SlurmPolicy
         }
+
+        # One key per logical delegate, reused by any retry. A caller who
+        # supplies none still gets one, because the point is to be able to
+        # print it when a reply is lost.
+        $key = if ($PSBoundParameters.ContainsKey("IdempotencyKey")) { $IdempotencyKey } else { [guid]::NewGuid().ToString() }
+        $payload["idempotency_key"] = $key
+        $Script:ActiveRequest = @{ Kind = "delegate"; Key = $key }
 
         $body = $payload | ConvertTo-Json -Compress
 
@@ -489,15 +571,36 @@ switch ($Command) {
         # until a test running the script as a child process showed the
         # progress landing in the captured stdout alongside the result.
         $shownProgress = ""
+        $failingSince = $null
 
         while ($true) {
             try {
-                $response = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$taskId"
+                $response = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$taskId" -SoftFail
             }
             catch {
                 Write-Error $_
                 exit 1
             }
+
+            if ($Script:ChannelFailed) {
+                # One poll that got no answer says nothing about the task,
+                # which is still running on the host. Keep going until the
+                # outage has lasted long enough to be a real one.
+                if ($null -eq $failingSince) { $failingSince = Get-Date }
+
+                if (((Get-Date) - $failingSince).TotalSeconds -ge $WaitToleranceSec) {
+                    $Script:ActiveRequest = @{ Kind = "wait"; TaskId = $taskId }
+                    Exit-ChannelDown -ErrorRecord $Script:LastChannelError `
+                        -Uri "$BaseUrl/tasks/$taskId" -WaitedSec $QuickTimeoutSec
+                }
+
+                # Jittered, so callers that all lost the channel together
+                # do not all come back in the same instant.
+                Start-Sleep -Milliseconds (1500 + (Get-Random -Minimum 0 -Maximum 1000))
+                continue
+            }
+
+            $failingSince = $null
 
             if (-not $response.ok) {
                 Write-Error ($response | ConvertTo-Json -Depth 20)

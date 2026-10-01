@@ -727,3 +727,165 @@ Describe "bounded client calls" {
         }
     }
 }
+
+Describe "retrying a request that may already have run" {
+    # The previous change told callers to "retry once" when a request got no
+    # reply. For a read that is right. For delegate it is a trap: a timeout
+    # cannot say whether the task was queued -- the request may have landed
+    # and only the reply been lost -- so retrying can enqueue it twice, and
+    # with Slurm submission allowed by default that is a duplicate job.
+
+    BeforeAll {
+        $Script:Fast = @{ SENTINEL_CLIENT_TIMEOUT_SEC = "2" }
+    }
+
+    It "sends an idempotency key with every delegate" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("delegate", "check disk")
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            Send-StubResponse -Context $req.Context -Status 202 -Payload @{ ok = $true; task_id = "t1"; status = "queued" }
+            $null = Wait-SentinelExit -Process $proc -TimeoutMs 15000
+
+            $req.Body.idempotency_key | Should -Not -BeNullOrEmpty
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "uses the key the caller supplies, so a retry can reuse it" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("delegate", "-IdempotencyKey", "op-42", "check disk")
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            Send-StubResponse -Context $req.Context -Status 202 -Payload @{ ok = $true; task_id = "t1"; status = "queued" }
+            $null = Wait-SentinelExit -Process $proc -TimeoutMs 15000
+
+            $req.Body.idempotency_key | Should -Be "op-42"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "tells a caller whose delegate got no reply how to retry safely" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("delegate", "-IdempotencyKey", "op-42", "check disk") -Env $Script:Fast
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000      # stalls
+            $probe = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000     # /health probe
+            Send-StubResponse -Context $probe.Context -Status 200 -Payload @{ ok = $true }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+            $output = "$($result.StdOut)$($result.StdErr)"
+
+            $result.ExitCode | Should -Be 5
+            # The key, and the instruction to reuse it...
+            $output | Should -Match "op-42"
+            $output | Should -Match "MAY HAVE BEEN QUEUED"
+            $output | Should -Match "-IdempotencyKey"
+            # ...and no longer the blanket advice that is unsafe here.
+            $output | Should -Not -Match "Retry once"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "warns that ask may already have run, instead of inviting a retry" {
+        $stub = Start-StubListener
+        try {
+            # TimeoutMs of 1 s keeps the client bound short for the test.
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("ask", "-TimeoutMs", "1000", "check disk") `
+                -Env @{ SENTINEL_CLIENT_TIMEOUT_SEC = "2"; SENTINEL_ASK_GRACE_SEC = "1" }
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            $probe = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            Send-StubResponse -Context $probe.Context -Status 200 -Payload @{ ok = $true }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 30000
+            $output = "$($result.StdOut)$($result.StdErr)"
+
+            $output | Should -Match "MAY HAVE ALREADY RUN"
+            $output | Should -Not -Match "Retry once"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "does not put a delegate's key on ask, which has no use for one" {
+        # Caught while writing this change: a patch anchored on a substring
+        # inserted the key into the wrong command. Pinned so it cannot
+        # quietly return.
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("ask", "check disk")
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true; result = @{ text = "ok" } }
+            $null = Wait-SentinelExit -Process $proc -TimeoutMs 15000
+
+            $req.Body.PSObject.Properties.Name | Should -Not -Contain "idempotency_key"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "still says a read-only command is safe to retry" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("ready") -Env $Script:Fast
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            $probe = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            Send-StubResponse -Context $probe.Context -Status 200 -Payload @{ ok = $true }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+
+            "$($result.StdOut)$($result.StdErr)" | Should -Match "Retry once"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}
+
+Describe "wait rides out a transient channel failure" {
+    # wait polls for as long as a task takes, which can be hours. With
+    # the new bound, a single poll that got no answer made it exit 4 -- so a
+    # five-second tunnel blip abandoned the wait for a task that was still
+    # running perfectly well. Before the bound it hung instead; neither is
+    # right for something that is meant to outlast brief outages.
+
+    It "keeps polling after one poll gets no reply" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("wait", "t1") `
+                -Env @{ SENTINEL_CLIENT_TIMEOUT_SEC = "2"; SENTINEL_WAIT_TOLERANCE_SEC = "30" }
+
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000    # stalls
+
+            $next = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 20000    # the re-poll
+            $next.Path | Should -Be "/tasks/t1"
+            Send-StubResponse -Context $next.Context -Status 200 -Payload @{
+                ok = $true; task = @{ status = "done"; result_text = "finished" }
+            }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 30000
+
+            $result.ExitCode | Should -Be 0
+            $result.StdOut.Trim() | Should -Be "finished"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "gives up with exit 4 once the outage outlasts the tolerance" {
+        $stub = Start-StubListener
+        try {
+            # Nothing is ever received or answered: a channel that stays dead.
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("wait", "t1") `
+                -Env @{ SENTINEL_CLIENT_TIMEOUT_SEC = "2"; SENTINEL_WAIT_TOLERANCE_SEC = "4" }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 40000
+            $output = "$($result.StdOut)$($result.StdErr)"
+
+            $result.ExitCode | Should -Be 4
+            # The task was never touched, and the message has to say so --
+            # otherwise the caller assumes the work was lost.
+            $output | Should -Match "still"
+            $output | Should -Match "wait t1|task id"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}
