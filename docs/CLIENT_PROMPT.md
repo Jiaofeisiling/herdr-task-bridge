@@ -37,6 +37,14 @@ nothing listening, or connected but never replying -- and what fixes it.
 running fine on the remote side. Do not conclude that the remote has not
 recovered; try again once the user has reconnected, which often succeeds.
 
+Exit 5 (NO REPLY) is the opposite case: the bridge answers /health but one
+request stalled. The channel is fine -- do not ask the user to reconnect
+anything. Retry once.
+
+`ready` returning false is not a fault. Its `hint` field says what that
+particular state means; for a busy agent the answer is to omit the agent,
+not to keep polling it.
+
 ## You cannot see that machine
 
 You have no direct view of the cluster. Never hard-code partition names,

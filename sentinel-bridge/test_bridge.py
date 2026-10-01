@@ -2813,3 +2813,89 @@ def test_queued_reason_survives_herdr_being_unreachable(tmp_path, monkeypatch, l
     # query into a 500 when herdr happens to be unavailable.
     assert status == 200
     assert body["task"]["status"] == "queued"
+
+
+# --- ready says what a false answer means ------------------------------
+#
+# A caller polled `ready` on one agent every forty seconds for minutes,
+# reading ready=false as the system being blocked, while another agent sat
+# idle the whole time. The answer was accurate: the agent was working.
+# What it did not say is that working is ordinary, that it is not a fault,
+# and what to do about it -- and "false" with no reason attached reads as
+# an obstruction.
+
+
+def test_ready_explains_a_busy_agent_and_points_at_auto_selection(live_server, monkeypatch):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "working"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("working", {"ok": True}))
+
+    status, body = _get(live_server, "/ready?agent=w1:p1")
+
+    assert body["ready"] is False
+    # Names the cause as ordinary, and the way out: leave the agent unnamed.
+    assert "not a fault" in body["hint"]
+    assert "omit" in body["hint"].lower()
+
+
+def test_ready_tells_a_blocked_agent_apart_from_a_busy_one(live_server, monkeypatch):
+    _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "blocked"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("blocked", {"ok": True}))
+
+    status, body = _get(live_server, "/ready?agent=w1:p1")
+
+    # Blocked is the one state that genuinely needs a person: the agent is
+    # waiting on input in its own terminal. Saying "busy, not a fault" here
+    # would hide it, so the two must not share wording.
+    assert "not a fault" not in body["hint"]
+    assert "read" in body["hint"]
+
+
+def test_ready_gives_no_hint_when_the_agent_is_free(live_server, monkeypatch):
+    _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+
+    status, body = _get(live_server, "/ready?agent=w1:p3")
+
+    # Nothing to explain, and a field that is always populated stops being
+    # read.
+    assert body["ready"] is True
+    assert "hint" not in body
+
+
+# --- PowerShell sources must survive a non-UTF-8 console code page -----
+#
+# Windows PowerShell 5.1 reads a BOM-less file in the machine's ANSI code
+# page, not UTF-8. On a Chinese Windows that is GBK, where a multi-byte
+# lead byte consumes the byte after it -- and the byte after the last
+# character of a UTF-8 sequence is often a closing quote. The quote is
+# swallowed, the string never terminates, and the whole file fails to
+# parse with an error pointing at a line far from the cause.
+#
+# CI runs an English locale and never saw it. It surfaced only on a Chinese
+# machine, where sentinel.Tests.ps1 failed discovery outright. Keeping the
+# sources pure ASCII is the cheap structural fix, and checking it here
+# turns "fails on someone's machine" into "fails in CI".
+
+
+def test_powershell_sources_are_pure_ascii():
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    offenders = {}
+
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in (".git", ".venv", "node_modules", ".superpowers")]
+        for name in files:
+            if not name.endswith((".ps1", ".psm1", ".psd1")):
+                continue
+            path = os.path.join(root, name)
+            with open(path, "rb") as f:
+                raw = f.read()
+            if raw.startswith(b"\xef\xbb\xbf"):
+                continue  # a BOM makes 5.1 read UTF-8 correctly
+            for number, line in enumerate(raw.split(b"\n"), 1):
+                if any(byte > 0x7F for byte in line):
+                    offenders.setdefault(os.path.relpath(path, repo), []).append(number)
+
+    assert not offenders, (
+        "non-ASCII in BOM-less PowerShell source breaks Windows PowerShell 5.1 "
+        f"under a non-UTF-8 code page: {offenders}"
+    )

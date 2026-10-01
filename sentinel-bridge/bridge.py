@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 19
+BRIDGE_VERSION = 20
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -924,6 +924,39 @@ def read_progress_file(task_id):
         return None
 
     return content or None
+
+
+def ready_hint(agent_status):
+    """What a not-ready answer means and what to do about it, or None.
+
+    A caller polled ready on one agent every forty seconds for minutes,
+    reading ready=false as the system being blocked, while another agent sat
+    idle throughout. The answer was accurate. What it did not say is that
+    "working" is ordinary, and "false" with no reason attached reads as an
+    obstruction.
+
+    blocked is worded differently on purpose: it is the one state that
+    really does need a person -- the agent is waiting on input in its own
+    terminal -- and describing it as ordinary busyness would hide that.
+    """
+    if agent_status in AVAILABLE_STATES:
+        return None
+
+    if agent_status == "blocked":
+        return (
+            "This agent is waiting on interactive input in its own terminal "
+            "(a permission prompt or a mode that needs approval). It will not "
+            "free itself. `read` shows what it is waiting for."
+        )
+
+    if agent_status == "working":
+        return (
+            "This agent is busy with other work -- ordinary, not a fault. "
+            "Omit the agent to let the bridge pick one that is free, or wait. "
+            "Polling this one repeatedly gains nothing."
+        )
+
+    return None
 
 
 def explain_queued(agent_name):
@@ -1859,11 +1892,17 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            self.send_json({
+            payload = {
                 "ok": True,
                 "ready": agent_status in AVAILABLE_STATES,
                 "agent_status": agent_status,
-            })
+            }
+
+            hint = ready_hint(agent_status)
+            if hint:
+                payload["hint"] = hint
+
+            self.send_json(payload)
             return
 
         if path == "/read":

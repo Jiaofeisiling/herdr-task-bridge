@@ -190,8 +190,13 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `2` | 任务以 `orphaned` 结束 |
 | `3` | 任务以 `quota_exhausted` 结束 |
 | `4` | **根本没有到达 bridge** —— 通道不通，bridge 本身的状态无从得知 |
+| `5` | **bridge 能回应 `/health`，但这一个请求没在时限内得到回复** —— 通道本身没问题，不要去重连任何东西 |
 
 `4` 被刻意单列。SSH 转发不在时，远端的 bridge 通常好好地跑着、只是联系不上；把这种情况报成"bridge 故障"会把人引向错误的机器。消息里会指明是两种通道状态中的哪一种——没有东西在监听，还是连上了却不回应——因为二者的处理方式不同；并且明确说明 bridge 的状态是**未知**而非损坏。
+
+所有快速命令都有上限（默认 5 秒，`SENTINEL_CLIENT_TIMEOUT_SEC`）。原因是调用方通常只给一条命令 10–30 秒，到时就交回空结果并报告"堵塞"；对 3400 多次真实调用的统计显示：`health` 中位数 1.9 秒，而**每一次空结果的耗时恰好等于调用方自己的等待时间**。PowerShell 7 的 `Invoke-RestMethod` **默认没有超时**，所以转发仍能建立连接、却已不通往主机时，客户端会无限挂起，下面这段说明也就永远来不及被读到。`ask` 和 `prompt` 的上限是你给的 `-TimeoutMs` 再加 30 秒，合法的慢任务不会被切断。
+
+请求超时时，客户端会先探测 `/health` 再开口——因为超时本身无法区分"转发断了"和"bridge 活着、只是它背后某一次调用卡住了"，而这两种情况需要相反的处理。能应答是退出码 `5`，没有应答是退出码 `4`。
 
 此前连接失败会打印一段 `Invoke-RestMethod` 的原始堆栈，**并且退出码为 0**，调用方既无从判断也无从分支。
 
@@ -274,6 +279,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
 | `SENTINEL_SLURM_POLICY` | `submit` | 部署级默认 Slurm 策略；请求里的 `slurm_policy` 可覆盖。 |
 | `SENTINEL_AGENT_PRIORITY` | 未设置 | 成本偏好顺序，便宜的在前；按 agent 名或运行时家族匹配。只对当前能接活的 agent 排序。 |
+| `SENTINEL_CLIENT_TIMEOUT_SEC` | `5` | 客户端（`sentinel.ps1`）侧：任何快速调用的时间上限。应明显小于你的调用方放弃等待的时间。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 
 将 [`remote/bridge.env.example`](remote/bridge.env.example) 复制为未追踪的 `remote/bridge.env`，再填写部署专用配置。绝不要提交真实主机名、项目标识、路径、用户名、任务提示词或令牌；项目的敏感信息规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
