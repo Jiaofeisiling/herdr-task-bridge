@@ -190,8 +190,13 @@ Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask
 | `2` | A task ended `orphaned` |
 | `3` | A task ended `quota_exhausted` |
 | `4` | **The bridge was never reached** — the channel is down, and nothing is known about the bridge itself |
+| `5` | **The bridge answers `/health`, but this one request got no reply in time** — the channel is fine, do not reconnect anything |
 
 Code `4` is deliberately distinct. When the SSH forward is not in place, the bridge is usually running perfectly well on the remote side and simply cannot be talked to; reporting that as a bridge failure sends the reader to the wrong machine. The message names which of the two channel states applies — nothing listening, or connected but never replying — because they need different fixes, and says plainly that the bridge's state is unknown rather than bad.
+
+Every quick command is bounded (5 s by default, `SENTINEL_CLIENT_TIMEOUT_SEC`). That bound exists because a caller typically gives a command 10–30 s before it hands back an empty result and reports it blocked; measured over 3,400 recorded calls, `health` took 1.9 s at the median and every empty result took exactly the caller's own wait. PowerShell 7's `Invoke-RestMethod` has **no timeout by default**, so a forward that still accepted connections but no longer reached the host used to hang the client indefinitely, and the explanation below could never arrive in time to be read. `ask` and `prompt` are bounded by the `-TimeoutMs` you gave them plus 30 s, so a legitimately slow one is not cut off.
+
+When a request times out, the client probes `/health` before saying anything, because a timeout looks identical whether the forward is dead or the bridge is up and one call behind it is stuck — and the two want opposite reactions. Answering is exit `5`; silence is exit `4`.
 
 Connection failures previously printed a raw `Invoke-RestMethod` stack trace **and exited 0**, so a caller had nothing to act on and nothing to branch on.
 
@@ -274,6 +279,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |
 | `SENTINEL_SLURM_POLICY` | `submit` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
 | `SENTINEL_AGENT_PRIORITY` | unset | Ordered cost preference, cheapest first, matched on agent name or runtime family. Only orders agents that can take work now. |
+| `SENTINEL_CLIENT_TIMEOUT_SEC` | `5` | Client-side (`sentinel.ps1`): upper bound on any quick call. Keep it comfortably under the time your caller waits before giving up. |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | How long a quota circuit stays open before expiring by itself. `0` keeps it open until cleared by hand. |
 
 Copy [`remote/bridge.env.example`](remote/bridge.env.example) to the untracked `remote/bridge.env` for deployment-specific values. Never commit real hostnames, project identifiers, paths, usernames, prompts, or tokens; see [CONTRIBUTING.md](CONTRIBUTING.md) for the project's sensitive-data rules.

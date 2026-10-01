@@ -46,6 +46,24 @@ $OutputEncoding           = $Utf8
 
 $BaseUrl = if ($env:SENTINEL_BRIDGE_URL) { $env:SENTINEL_BRIDGE_URL } else { "http://127.0.0.1:8765" }
 
+# Upper bound, in seconds, on any call that is meant to be quick. Without it
+# there was none at all: PowerShell 7's Invoke-RestMethod default is
+# infinite, so a forward that still accepted connections but no longer
+# reached the host hung the client until something killed it. A real caller
+# gives a command ten or thirty seconds before handing back an empty result
+# and reporting it blocked -- measured over 3,400 recorded calls, health took
+# 1.9 s at the median and every empty result took exactly the caller's yield
+# time. The bound has to be shorter than that, or the explanation printed on
+# failure arrives after the reader has gone.
+$QuickTimeoutSec = if ($env:SENTINEL_CLIENT_TIMEOUT_SEC) { [int]$env:SENTINEL_CLIENT_TIMEOUT_SEC } else { 5 }
+
+# How long the follow-up liveness probe may take. Worst case for a stalled
+# call is therefore the bound plus this plus about a second of PowerShell
+# startup -- about 7 s against the 10 s a caller gives a quick command. An
+# earlier 6 s bound with a 2 s probe came to 9.3 s, which only moved the
+# point at which the same failure appears by 0.7 s.
+$ProbeTimeoutSec = 1
+
 # Query-string suffix for the GET endpoints that accept ?agent=... . Empty
 # when -Agent wasn't passed, so the bridge falls back to its own default.
 $AgentQuery = if ($PSBoundParameters.ContainsKey("Agent")) {
@@ -67,9 +85,9 @@ function Join-TaskText {
 
 
 # Classify a connection-layer failure without reading the exception text.
-# That text is localised -- on a Chinese Windows it reads 由于目标计算机积极
-# 拒绝 -- so matching on it would work on one machine and quietly fail on
-# the next. SocketError and WebExceptionStatus are stable and language
+# That text is localised -- on a Chinese Windows a refused connection is
+# reported in Chinese, not English -- so matching on it would work on one
+# machine and quietly fail on the next. SocketError and WebExceptionStatus are stable and language
 # independent, and PowerShell 5.1 and 7 wrap them differently, so both
 # shapes are unwrapped here.
 function Get-ChannelFailureKind {
@@ -105,10 +123,40 @@ function Get-ChannelFailureKind {
 # because none of those happened: the bridge was never reached, so nothing
 # is known about it either way. A caller once reported a remote outage on
 # the strength of a failure that was entirely on this side of the tunnel.
+function Test-BridgeAnswers {
+    try {
+        $null = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get -TimeoutSec $ProbeTimeoutSec
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# Exit 4 -- the bridge was never reached, so nothing is known about it.
+# Exit 5 -- the bridge answers /health, but this one request got no reply.
+#
+# Told apart by asking, not by guessing. A request that times out looks the
+# same whether the forward is dead or the bridge is up and one call behind it
+# (a herdr call hung on the host) is stuck, and the two want opposite
+# reactions: reconnect VS Code, or do not touch the tunnel at all. /health
+# is the right probe because it deliberately depends on nothing else.
 function Exit-ChannelDown {
-    param($ErrorRecord, [string]$Uri)
+    param($ErrorRecord, [string]$Uri, [int]$WaitedSec = 0)
 
     $kind = Get-ChannelFailureKind -ErrorRecord $ErrorRecord
+    $isHealthCall = $Uri -like "*/health"
+
+    if ($kind -eq "timeout" -and -not $isHealthCall -and (Test-BridgeAnswers)) {
+        $lines = @(
+            "NO REPLY: $Uri did not answer within ${WaitedSec}s, but the bridge's /health does.",
+            "  The channel is fine and the bridge is up; this one request is stuck behind it,",
+            "  most often a herdr call on the host that is slow or hung. Do NOT reconnect",
+            "  VS Code. Retry once; if it repeats, look at what the host's herdr is doing."
+        )
+        foreach ($line in $lines) { [Console]::Error.WriteLine($line) }
+        exit 5
+    }
 
     $lines = switch ($kind) {
         "refused" {
@@ -121,7 +169,7 @@ function Exit-ChannelDown {
         }
         "timeout" {
             @(
-                "CHANNEL DOWN: connected to $Uri but it never replied.",
+                "CHANNEL DOWN: connected to $Uri but nothing came back within ${WaitedSec}s$(if (-not $isHealthCall) { ', and /health did not answer either' }).",
                 "  The local port is still forwarded, but the forward's path to the host",
                 "  is dead. Disconnect and reconnect VS Code -- reloading the window",
                 "  usually does not rebuild the forward. The bridge was not reached, so",
@@ -149,7 +197,8 @@ function Invoke-SentinelApi {
     param(
         [Parameter(Mandatory=$true)][string]$Uri,
         [string]$Method = "Get",
-        [string]$Body = $null
+        [string]$Body = $null,
+        [int]$TimeoutSec = $QuickTimeoutSec
     )
 
     $headers = @{}
@@ -160,11 +209,11 @@ function Invoke-SentinelApi {
 
     try {
         if ($Body) {
-            return Invoke-RestMethod -Uri $Uri -Method $Method `
+            return Invoke-RestMethod -Uri $Uri -Method $Method -TimeoutSec $TimeoutSec `
                 -ContentType "application/json; charset=utf-8" -Body $Body -Headers $headers
         }
 
-        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers
+        return Invoke-RestMethod -Uri $Uri -Method $Method -TimeoutSec $TimeoutSec -Headers $headers
     }
     catch {
         # Windows PowerShell 5.1 throws WebException for non-2xx responses;
@@ -189,7 +238,7 @@ function Invoke-SentinelApi {
             # a connection-layer failure, not an HTTP error. Rethrowing
             # here printed a raw Invoke-RestMethod stack trace *and* left
             # the exit code at 0, so callers saw success on a dead channel.
-            Exit-ChannelDown -ErrorRecord $caughtError -Uri $Uri
+            Exit-ChannelDown -ErrorRecord $caughtError -Uri $Uri -WaitedSec $TimeoutSec
         }
 
         $rawBody = $null
@@ -310,7 +359,11 @@ switch ($Command) {
 
         $body = $payload | ConvertTo-Json -Compress
 
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body
+        # These legitimately run as long as the caller allowed, so the client has to
+        # outlive the bridge's own timeout (plus slack) or it abandons work that
+        # is proceeding normally and then misreports it as a dead channel.
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/prompt" -Method Post -Body $body `
+            -TimeoutSec ([int][math]::Ceiling($TimeoutMs / 1000) + 30)
         $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {
@@ -342,7 +395,11 @@ switch ($Command) {
 
         $body = $payload | ConvertTo-Json -Compress
 
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body
+        # These legitimately run as long as the caller allowed, so the client has to
+        # outlive the bridge's own timeout (plus slack) or it abandons work that
+        # is proceeding normally and then misreports it as a dead channel.
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/ask" -Method Post -Body $body `
+            -TimeoutSec ([int][math]::Ceiling($TimeoutMs / 1000) + 30)
         $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {

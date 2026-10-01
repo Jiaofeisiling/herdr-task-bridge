@@ -41,7 +41,8 @@ BeforeAll {
         param(
             [Parameter(Mandatory = $true)][string[]]$ScriptArgs,
             [Parameter(Mandatory = $true)][string]$BaseUrl,
-            [string]$Token
+            [string]$Token,
+            [hashtable]$Env = @{}
         )
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -52,6 +53,9 @@ BeforeAll {
         $psi.Arguments = "-NoProfile -NonInteractive -File `"$Script:ScriptPath`" " + ($quotedArgs -join " ")
 
         $psi.EnvironmentVariables["SENTINEL_BRIDGE_URL"] = $BaseUrl
+        foreach ($name in $Env.Keys) {
+            $psi.EnvironmentVariables[$name] = [string]$Env[$name]
+        }
         if ($Token) {
             $psi.EnvironmentVariables["SENTINEL_BRIDGE_TOKEN"] = $Token
         } else {
@@ -66,9 +70,20 @@ BeforeAll {
     }
 
     function Receive-StubRequest {
-        param([Parameter(Mandatory = $true)]$Listener)
+        # TimeoutMs bounds the wait. GetContext() alone blocks forever, so a
+        # test expecting a request that never comes -- precisely what
+        # happens against a client that has the bug under test -- would
+        # hang the whole suite rather than fail. Returns $null on timeout.
+        param([Parameter(Mandatory = $true)]$Listener, [int]$TimeoutMs = 0)
 
-        $context = $Listener.GetContext()
+        if ($TimeoutMs -gt 0) {
+            $pending = $Listener.GetContextAsync()
+            if (-not $pending.Wait($TimeoutMs)) { return $null }
+            $context = $pending.Result
+        }
+        else {
+            $context = $Listener.GetContext()
+        }
 
         $body = $null
         if ($context.Request.HasEntityBody) {
@@ -583,6 +598,132 @@ Describe "channel failures" {
         # Nothing was listening, so the bridge process was never reached
         # and its health is simply unknown. Saying otherwise is what sent
         # the caller off reporting a remote outage that had not happened.
-        $output | Should -Match "not reached|unknown|未到达"
+        $output | Should -Match "not reached|unknown"
+    }
+}
+
+
+Describe "bounded client calls" {
+    # Found by reading what a real caller actually received. Across 3,396
+    # recorded calls, health took 1.9 s at the median; every empty result
+    # took 30.2 s -- exactly the caller's own yield time, i.e. the command
+    # had not returned when the caller gave up and reported it blocked.
+    # They clustered: 61% fell in three hours, so these were outages and
+    # not noise. The cause was that sentinel.ps1 set no timeout at all.
+    # PowerShell 7's default is infinite, so a forward that still accepts
+    # connections but no longer reaches the host hung the client until it
+    # was killed -- and the CHANNEL DOWN message that was supposed to
+    # explain it could never be reached in time to be read.
+
+    BeforeAll {
+        # Small so the tests are quick; the real default is larger.
+        $Script:Fast = @{ SENTINEL_CLIENT_TIMEOUT_SEC = "2" }
+    }
+
+    It "health returns within a bound when nothing ever answers it" {
+        $stub = Start-StubListener
+        try {
+            $clock = [System.Diagnostics.Stopwatch]::StartNew()
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("health") -Env $Script:Fast
+
+            # Accept the request and say nothing: the half-dead forward.
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+            $clock.Stop()
+
+            $result.ExitCode | Should -Be 4
+            $clock.Elapsed.TotalSeconds | Should -BeLessThan 12
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "says so plainly instead of leaving the caller with an empty result" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("health") -Env $Script:Fast
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+            $output = "$($result.StdOut)$($result.StdErr)"
+
+            $output | Should -Match "CHANNEL DOWN"
+            $output | Should -Match "VS Code"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "tells a stalled request apart from a dead channel by probing /health" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("ready") -Env $Script:Fast
+
+            # The request stalls...
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+
+            # ...but the bridge's own liveness endpoint still answers.
+            $probe = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            $probe.Path | Should -Be "/health"
+            Send-StubResponse -Context $probe.Context -Status 200 -Payload @{ ok = $true; version = 1 }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+            $output = "$($result.StdOut)$($result.StdErr)"
+
+            # Exit 5, not 4. Reporting this as a dead channel would send the
+            # reader to reconnect a tunnel that is working; the bridge is up
+            # and one request behind it is stuck.
+            $result.ExitCode | Should -Be 5
+            $output | Should -Match "NO REPLY"
+            $output | Should -Not -Match "CHANNEL DOWN"
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "reports a dead channel when the probe is silent too" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("ready") -Env $Script:Fast
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+            $null = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000   # the /health probe, ignored too
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+
+            $result.ExitCode | Should -Be 4
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
+    }
+
+    It "does not cut a legitimately slow ask off at the quick-call bound" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("ask", "-TimeoutMs", "30000", "check disk") -Env $Script:Fast
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 15000
+
+            # Four seconds against a two-second quick bound. ask is allowed
+            # to take as long as the caller said it may, and the client has
+            # to outlive the bridge's own timeout or it abandons work that
+            # is proceeding normally.
+            Start-Sleep -Seconds 4
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; result = @{ text = "disk ok" }
+            }
+
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+
+            $result.ExitCode | Should -Be 0
+        }
+        finally {
+            $stub.Listener.Stop()
+        }
     }
 }
