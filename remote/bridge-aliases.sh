@@ -35,29 +35,15 @@ bridge-logs() {
     tail -n 50 -f "$_BRIDGE_LOG"
 }
 
-# Tears down any existing `bridge` screen session (supervisor loop +
-# whatever bridge.py it's currently running) plus any orphaned bare
-# bridge.py from before the supervisor loop existed, then starts a fresh
-# supervised instance. See remote/bridge-supervisor.sh for why bridge.py
-# is never launched directly in screen.
-#
-# The pkill pattern is anchored (^...$) on purpose: these functions get
-# invoked remotely as `bash -c "bridge-restart"` (or a longer chained
-# command), and that wrapping bash -c's own argv contains this whole
-# script's text -- including the literal string "python3 bridge.py" --
-# so an unanchored `pkill -f 'python3 bridge.py'` matches and kills that
-# wrapping shell too, silently truncating whatever ran after it. Hit this
-# for real. Anchoring works because the wrapper's cmdline always starts
-# with "bash", never "python3".
+# Restarts the bridge, and fails -- loudly, with its log -- if it does not come
+# back. The sequence itself lives in bridge-restart.sh and not here, for two
+# reasons that both bit a real deploy: a script works out its own location,
+# where this function relied on `_BRIDGE_ROOT`, a plain variable that a child
+# shell (an agent's) does not have; and a script is read afresh on every run,
+# where a function lives on in a long-running shell as whatever version it was
+# when that shell started.
 bridge-restart() {
-    screen -S bridge -X quit >/dev/null 2>&1
-    pkill -f '^python3 bridge\.py$' 2>/dev/null
-    sleep 2
-
-    screen -dmS bridge bash "$_BRIDGE_ROOT/remote/bridge-supervisor.sh"
-    sleep 2
-
-    bridge-status
+    bash "${_BRIDGE_ROOT:-$HOME/herdr-task-bridge}/remote/bridge-restart.sh"
 }
 
 # Pull latest code, then restart. This is the one-liner for "deploy".
