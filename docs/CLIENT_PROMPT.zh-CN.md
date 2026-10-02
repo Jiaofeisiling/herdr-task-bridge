@@ -123,6 +123,14 @@ TUI 在任务完成后不会清屏，所以 `read` 返回的经常是上一次�
 写着什么，这个 agent 都是空闲的——不要据此让用户去手工清窗口或按回车，
 那正是这个工具存在的意义所在。
 
+想看一个**正在工作**的 agent，照常调用 `read` 即可。herdr 不允许读取工作中
+agent 的历史，所以桥会改为返回可见屏幕，并在 `note` 里说明（CLI 会把它打印
+成 `[note]`）：你拿到的是屏幕，不是你要的那些行。这正是查看长任务在做什么、
+以及在告诉用户"agent 在等权限确认"之前确认提示上到底写了什么的办法。
+`-Source visible` 直接要屏幕；`-Source recent-unwrapped` 坚持要历史，agent
+工作期间会被拒绝。herdr 自己的写法 `--source visible` 同样可用。对处于
+blocked 的 agent 发 `prompt` 会被拒绝（409）：它无法替用户回答权限提示。
+
 ## `blocked` 是一份报告，不是诊断
 
 herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocked`、一秒后

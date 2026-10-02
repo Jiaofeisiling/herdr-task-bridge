@@ -19,7 +19,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 24
+BRIDGE_VERSION = 25
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -310,6 +310,21 @@ def validate_timeout_ms(timeout_ms):
         )
 
     return timeout_ms
+
+
+# Which part of an agent's terminal to read. herdr offers more, but these are
+# the two a caller needs: the scrollback (what `lines` counts) and the screen.
+READ_SOURCES = ("recent-unwrapped", "visible")
+DEFAULT_READ_SOURCE = "recent-unwrapped"
+
+
+def validate_read_source(source):
+    if source not in READ_SOURCES:
+        raise ValueError(
+            f"source must be one of {', '.join(READ_SOURCES)}, got {source!r}"
+        )
+
+    return source
 
 
 def validate_read_lines(read_lines):
@@ -860,11 +875,15 @@ def routing_note(requested, used):
 def fail_task(task_id, error_text):
     discard_progress_file(task_id)
 
+    # Only a running task can fail. A shutdown that has already marked it
+    # orphaned -- "may have run; do not retry" -- must not be overwritten by
+    # the worker's own report of the same event: `error` says retrying is
+    # safe, and which of the two arrived last was a race.
     with db_session() as conn:
         conn.execute("""
             UPDATE tasks
             SET status = 'error', error_text = ?, finished_at = ?
-            WHERE task_id = ?
+            WHERE task_id = ? AND status = 'running'
         """, (error_text, now_iso(), task_id))
 
 
@@ -1770,6 +1789,20 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False)
                 code=code,
             )
 
+        if not (result.get("stderr", "").strip() or result.get("stdout", "").strip()):
+            # No error, no output, just a non-zero exit: the call was killed
+            # (bridge-restart hangs up the whole process group, `herdr agent
+            # prompt` included) rather than refused. Nothing here says the
+            # prompt did not land, and "failed" -- which means safe to retry --
+            # is exactly the claim that cannot be made. Reported as a lost
+            # track instead, which is what the worker records as orphaned.
+            raise TimeoutError(
+                "The herdr prompt call ended without any output -- it was "
+                "probably killed, as a bridge restart does -- so it is "
+                "unknown whether the prompt reached the agent. Sentinel may "
+                "still be executing the task."
+            )
+
         # Any other failure: the error says the target could not take the
         # prompt (an unknown agent, say), so nothing reached an agent and
         # re-sending cannot double-execute anything. That reasoning holds
@@ -1903,9 +1936,20 @@ def deliver_prompt(agent_name, delegated_prompt, timeout_ms, task_id):
     deadline = time.monotonic() + timeout_ms / 1000
 
     try:
-        _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
+        return _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
     except PromptWaitAborted as aborted:
         settle_after_abort(agent_name, task_id, aborted, deadline)
+
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "note": (
+                "herdr aborted its wait on a transient `blocked`; the agent "
+                "was then seen to carry on."
+            ),
+        }
 
 
 def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
@@ -1921,7 +1965,7 @@ def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
     # checking.
     before, _ = _terminal_read(agent_name, READ_LINES_DEFAULT)
 
-    result = _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms)
+    result = deliver_prompt(agent_name, delegated_prompt, timeout_ms, task_id)
 
     if before is not None:
         after, _ = _terminal_read(agent_name, READ_LINES_DEFAULT)
@@ -1933,19 +1977,60 @@ def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
     return result
 
 
+WORKING_READ_NOTE = (
+    "The agent is working, and herdr reads history only while an agent is "
+    "idle (a request for more lines than the screen holds has to scroll back), "
+    "so this is the visible screen only -- not the lines asked for. Ask again "
+    "when it is idle for more."
+)
+
+
+def _read_once(agent_name, source, read_lines, timeout):
+    args = ["agent", "read", agent_name, "--source", source]
+
+    # `visible` is the screen itself. herdr clamps a line count to the
+    # screen's height rather than refusing it, so leaving the count off asks
+    # for what is wanted instead of for a number that has no meaning here.
+    if source != "visible":
+        args += ["--lines", str(read_lines)]
+
+    return run_herdr(*args, timeout=timeout)
+
+
+def read_terminal(agent_name, read_lines, source=None, timeout=10):
+    """Read an agent's terminal. Returns (result, source_used, note).
+
+    herdr refuses to read the history of a working agent once more lines are
+    asked for than the screen holds -- measured: fine at the screen's height,
+    `agent_not_idle` one line past it, and `visible` never refused. The
+    default request is well past any screen, so without this every read of a
+    working agent failed, at the one time a caller most wants to look.
+
+    When the caller did not name a source, a refused history read falls back
+    to the visible screen and says so. When it did, it gets what it asked for.
+    """
+    chosen = source or DEFAULT_READ_SOURCE
+    result = _read_once(agent_name, chosen, read_lines, timeout)
+
+    if (
+        result["ok"]
+        or source is not None
+        or herdr_error_code(result) != "agent_not_idle"
+    ):
+        return result, chosen, None
+
+    screen = _read_once(agent_name, "visible", read_lines, timeout)
+
+    if not screen["ok"]:
+        return result, chosen, None
+
+    return screen, "visible", WORKING_READ_NOTE
+
+
 def _terminal_read(agent_name, read_lines):
     """(text, None) if the terminal could be read, else (None, why)."""
     try:
-        result = run_herdr(
-            "agent",
-            "read",
-            agent_name,
-            "--source",
-            "recent-unwrapped",
-            "--lines",
-            str(read_lines),
-            timeout=60,
-        )
+        result, _, _ = read_terminal(agent_name, read_lines, timeout=60)
     except Exception as e:
         return None, f"unable to read terminal for diagnostics: {e}"
 
@@ -2469,6 +2554,14 @@ class Handler(BaseHTTPRequestHandler):
             validate_agent_name(values[0] if values else DEFAULT_AGENT)
         )
 
+    def query_read_source(self):
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        values = query.get("source")
+
+        # None, not the default: whether the caller named a source decides
+        # whether a refused read may fall back to the screen.
+        return validate_read_source(values[0]) if values else None
+
     def query_read_lines(self):
         query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
         values = query.get("lines")
@@ -2611,6 +2704,9 @@ class Handler(BaseHTTPRequestHandler):
                 read_lines = (
                     self.query_read_lines() if path == "/read" else None
                 )
+                read_source = (
+                    self.query_read_source() if path == "/read" else None
+                )
             except (TypeError, ValueError) as e:
                 self.send_json(
                     {"ok": False, "error": f"invalid request: {e}"},
@@ -2709,15 +2805,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/read":
-            result = run_herdr(
-                "agent",
-                "read",
-                agent_name,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                str(read_lines),
-                timeout=10,
+            result, used_source, note = read_terminal(
+                agent_name, read_lines, source=read_source, timeout=10
             )
 
             # A TUI does not clear itself when a task finishes, so this
@@ -2742,6 +2831,20 @@ class Handler(BaseHTTPRequestHandler):
             result = dict(result)
             result["agent"] = agent_name
             result["agent_status"] = agent_status
+            result["source"] = used_source
+
+            if note:
+                result["note"] = note
+            elif (
+                not result["ok"]
+                and read_source is not None
+                and herdr_error_code(result) == "agent_not_idle"
+            ):
+                result["hint"] = (
+                    "This agent is working, and herdr reads history only "
+                    "while an agent is idle. Ask for source=visible to see "
+                    "its screen now."
+                )
 
             self.send_json(
                 result,
