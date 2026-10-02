@@ -329,6 +329,8 @@ bridge-deploy    # 拉取并重启
 bridge-status    # 检查 screen、进程、health 与日志
 ```
 
+`bridge-restart` 只是 [`remote/bridge-restart.sh`](remote/bridge-restart.sh) 的一层薄封装，重启流程就定义在那个脚本里。它是脚本而不是 shell 函数，因为它不能依赖自己所在的 shell：脚本从自身所在位置找到检出目录，所以在子 shell 里也能工作——agent 正是这样调用它的，而旧函数依赖的那个普通变量在子 shell 里并不存在。它按顺序做：**先检查能不能启动新的 bridge，再停掉旧的**（这是唯一无法撤销的一步，而 bridge 是你回来的唯一途径）；然后重启；再**等待 `/health` 应答，如果没有应答就带着日志以非零退出码失败**。早先的版本先杀掉 bridge，再去启动一个由空变量拼出来的路径，却仍然报告成功；部署期间 bridge 因此下线了大约两分钟。agent 部署时应调用 `bash ~/herdr-task-bridge/remote/bridge-restart.sh` 并检查它的退出码。
+
 部署完成后，对运行中的 bridge 做一次实机验证：
 
 ```bash

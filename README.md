@@ -329,6 +329,8 @@ bridge-deploy    # pull and restart
 bridge-status    # inspect screen, process, health, and logs
 ```
 
+`bridge-restart` is a thin wrapper around [`remote/bridge-restart.sh`](remote/bridge-restart.sh), which is where the sequence lives. It is a script rather than a shell function because it must not depend on the shell it runs in: it finds its checkout from its own location, so it works from a child shell — which is how an agent runs it, and where the plain variable the function used to rely on does not exist. In order, it **checks that a new bridge can be started before stopping the old one** (the only step that cannot be undone, and the bridge is the way back in), restarts, then **waits for `/health` to answer and exits non-zero, with the log, if it does not**. An earlier version killed the bridge first, launched a path built from an empty variable, and still reported success; the bridge stayed down for about two minutes during a deploy. An agent deploying should call `bash ~/herdr-task-bridge/remote/bridge-restart.sh` and check its exit status.
+
 After deploying, verify against the running bridge:
 
 ```bash
