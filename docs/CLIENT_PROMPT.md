@@ -151,6 +151,17 @@ says idle or done, the agent is free no matter what the terminal shows --
 do not ask the user to clear the window or press enter by hand, which is
 the very thing this tool exists to avoid.
 
+To look at an agent that is **working**, call `read` as usual. herdr will not
+read the history of a working agent, so the bridge returns the visible screen
+instead and says so in `note` (the CLI prints it as `[note]`): it is the
+screen, not the lines you asked for. This is how to see what a long task is
+doing, and what a permission prompt actually says before you tell the user an
+agent is waiting on one. `-Source visible` asks for the screen directly;
+`-Source recent-unwrapped` insists on history and is refused while the agent
+works. herdr's own spelling, `--source visible`, works too. A `prompt` to an
+agent that is blocked is refused (409): it cannot answer a permission prompt
+for the user.
+
 ## `blocked` is a report, not a diagnosis
 
 herdr's `blocked` status flickers while an agent is busy: it has been

@@ -921,3 +921,137 @@ Describe "a bridge that answers with an error is still a bridge that answers" {
         finally { $stub.Listener.Stop() }
     }
 }
+
+
+Describe "reading an agent that is working" {
+    # herdr refuses to read the history of a working agent and says "use
+    # --source visible". Callers did exactly that -- 33 failed reads in one
+    # night -- and got the identical refusal back, because the client had
+    # swallowed the option: with a free-text parameter that takes the
+    # remaining arguments, anything undeclared lands in it, and `read` has
+    # no use for free text. The caller believed it had asked for the visible
+    # screen; the bridge never heard.
+
+    It "passes -Source on as a query parameter" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("read", "-Agent", "w1:p3", "-Source", "visible")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; stdout = "the screen"; stderr = ""
+            }
+
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 0
+            $req.Context.Request.QueryString["source"] | Should -Be "visible"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "sends no source when none was asked for, so the bridge decides" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("read")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; stdout = "x"; stderr = ""
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.QueryString["source"] | Should -BeNullOrEmpty
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "rejects a source herdr does not offer, without contacting the bridge" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("read", "-Source", "bogus")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 2500
+            $result = Wait-SentinelExit -Process $proc
+
+            $req | Should -BeNullOrEmpty
+            $result.ExitCode | Should -Not -Be 0
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "accepts herdr's own spelling, --source, which its error message recommends" {
+        # Callers copy what herdr says. PowerShell reads --source as -Source,
+        # so once the parameter exists the advice just works.
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("read", "-Agent", "w1:p3", "--source", "visible")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; stdout = "the screen"; stderr = ""
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 0
+            $req.Context.Request.QueryString["source"] | Should -Be "visible"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "tells the caller when the bridge handed back the screen instead of history" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("read")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; stdout = "the screen"; stderr = ""; source = "visible"
+                note = "The agent is working so this is the visible screen only."
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 0
+            # The terminal text stays exactly the terminal text on stdout.
+            $result.StdOut.Trim() | Should -Be "the screen"
+            $result.StdErr | Should -Match "visible screen only"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "refuses an unrecognised argument to any command that takes no text" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("ready", "-Agent", "w1:p3", "-Bogus", "1")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 2500
+            $result = Wait-SentinelExit -Process $proc
+
+            $req | Should -BeNullOrEmpty
+            $result.ExitCode | Should -Be 1
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "still lets a command that takes text have it" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("delegate", "do the thing")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req.Body.task | Should -Be "do the thing"
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; task_id = "t"; status = "queued"
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}

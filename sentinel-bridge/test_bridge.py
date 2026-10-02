@@ -4068,3 +4068,213 @@ def test_evidence_in_a_single_column_still_keeps_its_context():
 
     assert "Usage limit reached" in detail
     assert "resets 4:20pm" in detail
+
+
+# --- reading an agent that is working ------------------------------------
+#
+# herdr will not read the *history* of a working agent: "cannot read 120 lines
+# while w1:p3 is working: its alternate-screen history can only be captured by
+# scrolling while idle. Wait and retry, or use --source visible". The bridge's
+# default is more lines than any screen holds, so every read of a working
+# agent failed -- 33 times in one night, each answered by the same refusal
+# after the caller followed herdr's advice, because the bridge could not
+# honour it: the source was hard-coded. The one time a caller most wants to
+# see an agent's terminal is while it is working.
+
+NOT_IDLE = json_module.dumps({"error": {
+    "code": "agent_not_idle",
+    "message": "cannot read 120 lines while w1:p3 is working: its alternate-screen "
+               "history can only be captured by scrolling while idle. Wait and "
+               "retry, or use --source visible",
+}, "id": "cli:agent:read"})
+
+
+def _read_world(monkeypatch, history_refused=True):
+    """herdr refusing to read history (not the visible screen) when asked to."""
+    reads = []
+
+    def fake(*args, **kwargs):
+        if args[1] == "read":
+            source = args[args.index("--source") + 1]
+            reads.append((source, "--lines" in args))
+            if source != "visible" and history_refused:
+                return {"ok": False, "returncode": 1, "stdout": "", "stderr": NOT_IDLE}
+            return {"ok": True, "returncode": 0, "stdout": f"screen via {source}", "stderr": ""}
+        return {"ok": True, "returncode": 0, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", fake)
+    _two_agents(monkeypatch)
+    return reads
+
+
+def test_reading_a_working_agent_falls_back_to_the_visible_screen(live_server, monkeypatch):
+    reads = _read_world(monkeypatch)
+
+    status, body = _get(live_server, "/read?agent=w1:p3")
+
+    assert status == 200 and body["ok"] is True
+    assert body["stdout"] == "screen via visible"
+    assert body["source"] == "visible"
+    # Says plainly that this is not what was asked for, and why.
+    assert "working" in body["note"] and "visible" in body["note"]
+    # The visible screen is asked for without a line count: it is the screen.
+    assert reads == [("recent-unwrapped", True), ("visible", False)]
+
+
+def test_read_honours_an_explicit_source(live_server, monkeypatch):
+    reads = _read_world(monkeypatch)
+
+    status, body = _get(live_server, "/read?agent=w1:p3&source=visible&lines=300")
+
+    assert status == 200
+    assert body["source"] == "visible"
+    assert "note" not in body
+    assert reads == [("visible", False)]
+
+
+def test_read_rejects_a_source_herdr_does_not_offer(live_server, monkeypatch):
+    reads = _read_world(monkeypatch)
+
+    status, body = _get(live_server, "/read?agent=w1:p3&source=bogus")
+
+    assert status == 400
+    assert "visible" in body["error"]
+    assert reads == []
+
+
+def test_an_explicit_history_read_is_not_quietly_swapped_for_the_screen(live_server, monkeypatch):
+    reads = _read_world(monkeypatch)
+
+    status, body = _get(live_server, "/read?agent=w1:p3&source=recent-unwrapped")
+
+    # The caller named the source, so it gets what it asked for -- here, the
+    # refusal -- plus the way forward, instead of a different answer.
+    assert status == 500 and body["ok"] is False
+    assert "source=visible" in body["hint"]
+    assert reads == [("recent-unwrapped", True)]
+
+
+def test_an_idle_agent_is_read_exactly_as_before(live_server, monkeypatch):
+    reads = _read_world(monkeypatch, history_refused=False)
+
+    status, body = _get(live_server, "/read?agent=w1:p3&lines=40")
+
+    assert status == 200
+    assert body["source"] == "recent-unwrapped"
+    assert "note" not in body
+    assert reads == [("recent-unwrapped", True)]
+
+
+def test_failure_diagnostics_use_the_visible_screen_when_history_is_refused(monkeypatch):
+    _read_world(monkeypatch)
+
+    # Evidence is wanted exactly when something has gone wrong, and that is
+    # often while the agent is still busy or stuck on a prompt. "(terminal
+    # read failed ...)" is no evidence at all; the screen is.
+    assert bridge._read_terminal_tail("w1:p3", 120) == "screen via visible"
+
+
+# --- a herdr call that is killed has not reported a failed prompt --------
+#
+# bridge-restart quits the screen session, which hangs up the whole process
+# group -- including the `herdr agent prompt` the worker is waiting on. That
+# call then ends with no output at all, and the bridge reported it as "Herdr
+# prompt command failed:" followed by nothing, marking the task `error`.
+# Seen on a real deploy. `error` means it failed, so retrying is safe;
+# whether the prompt had landed was never known. An agent that had just been
+# handed a Slurm submission would be handed it again.
+
+
+def test_a_herdr_call_that_dies_without_a_word_is_not_a_failed_prompt(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "returncode": -1, "stdout": "", "stderr": "",
+    })
+
+    # Not SentinelPromptError ("it failed"): TimeoutError, "the bridge lost
+    # track and the agent may still be working".
+    with pytest.raises(TimeoutError):
+        bridge._run_herdr_prompt("w1:p3", "task", 1000)
+
+
+def test_a_failure_that_explains_itself_is_still_a_failure(monkeypatch):
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
+        "ok": False, "returncode": 1, "stdout": "",
+        "stderr": "error: unrecognised option",
+    })
+
+    with pytest.raises(bridge.SentinelPromptError):
+        bridge._run_herdr_prompt("w1:p3", "task", 1000)
+
+
+def test_a_task_whose_herdr_call_is_killed_ends_orphaned_not_error(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _two_agents(monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: (
+        {"ok": False, "returncode": -1, "stdout": "", "stderr": ""}
+        if a[1] == "prompt" else {"ok": True, "returncode": 0, "stdout": "tail", "stderr": ""}
+    ))
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    for _ in range(200):
+        if bridge.get_task(task_id)["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.05)
+    stop.set()
+    worker.join(timeout=5)
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "orphaned"
+    assert "may still" in row["error_text"]
+
+
+def test_an_error_never_overwrites_an_orphaned_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    bridge.orphan_task(task_id, "stopped while running")
+
+    # `orphaned` says "may have run; do not retry". Whichever of the shutdown
+    # and the worker gets there second must not downgrade that to `error`.
+    bridge.fail_task(task_id, "late failure")
+
+    assert bridge.get_task(task_id)["status"] == "orphaned"
+
+
+# --- /prompt: herdr's wait aborting is not the prompt failing ------------
+#
+# Applied to tasks in v23; /prompt called the raw prompt and still answered a
+# transient `blocked` with a 500 saying the agent "requires interactive
+# input".
+
+
+def test_prompt_survives_a_transient_blocked(live_server, tmp_path, monkeypatch):
+    _two_agents(monkeypatch)
+    _abort_world(monkeypatch, tmp_path, ["idle", "blocked", "working", "done"], TASK)
+
+    status, body = _post(live_server, "/prompt", {"task": "do it", "agent": "w1:p3", "timeout_ms": 5000})
+
+    assert status == 200 and body["ok"] is True
+
+
+def test_prompt_that_stays_blocked_says_so(live_server, tmp_path, monkeypatch):
+    _two_agents(monkeypatch)
+    _abort_world(monkeypatch, tmp_path, ["idle", "blocked"], TASK)
+
+    status, body = _post(live_server, "/prompt", {"task": "do it", "agent": "w1:p3", "timeout_ms": 5000})
+
+    assert body["ok"] is False
+    assert body["reason"] == "blocked_confirmed"
+
+
+def test_prompt_that_never_started_is_not_called_blocked(live_server, tmp_path, monkeypatch):
+    _two_agents(monkeypatch)
+    _abort_world(monkeypatch, tmp_path, ["idle", "done"], TASK)
+
+    status, body = _post(live_server, "/prompt", {"task": "do it", "agent": "w1:p3", "timeout_ms": 5000})
+
+    assert body["ok"] is False
+    assert body["reason"] == "delivery_unknown"
+    assert "interactive" not in body["error"]

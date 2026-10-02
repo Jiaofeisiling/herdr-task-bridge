@@ -23,6 +23,13 @@ param(
     [ValidateRange(1, 5000)]
     [int]$Lines = 80,
 
+    # Which part of the terminal `read` returns. Omit it and a read of a
+    # working agent falls back to the visible screen on its own, saying so;
+    # name it to get exactly that. PowerShell reads --Source as -Source, so
+    # herdr's own spelling, which its error message recommends, works too.
+    [ValidateSet("recent-unwrapped", "visible")]
+    [string]$Source,
+
     [int]$TimeoutMs = 120000,
 
     # Which herdr agent to target. Omit to use the bridge's own
@@ -99,7 +106,22 @@ $ReadQueryParts = @("lines=$Lines")
 if ($PSBoundParameters.ContainsKey("Agent")) {
     $ReadQueryParts += "agent=$([uri]::EscapeDataString($Agent))"
 }
+if ($PSBoundParameters.ContainsKey("Source")) {
+    $ReadQueryParts += "source=$([uri]::EscapeDataString($Source))"
+}
 $ReadQuery = "?" + ($ReadQueryParts -join "&")
+
+# `$Text` collects every argument that is not a declared parameter, which is
+# what lets a task be typed without quotes -- and also swallows anything
+# mistyped or unsupported. For a command with no use for free text that meant
+# an option such as `--source visible` was silently dropped while the caller
+# believed it had been sent: 33 failed reads in a night, each followed by a
+# retry with the same dropped option. Refuse instead of pretending.
+$TakesNoText = @("read", "ready", "status", "health", "agents", "quota", "quota-reset", "tasks")
+if (($TakesNoText -contains $Command) -and $Text -and ($Text.Count -gt 0)) {
+    [Console]::Error.WriteLine("sentinel.ps1 ${Command}: unrecognised argument(s): " + ($Text -join " "))
+    exit 1
+}
 
 
 function Join-TaskText {
@@ -387,6 +409,12 @@ switch ($Command) {
 
     "read" {
         $result = Invoke-SentinelApi -Uri "$BaseUrl/read$ReadQuery"
+
+        # Said on stderr so the terminal text on stdout stays exactly the
+        # terminal text. Without it a caller cannot tell it was handed the
+        # visible screen in place of the history it asked for.
+        if ($result.note) { [Console]::Error.WriteLine("[note] " + $result.note) }
+        if ($result.hint) { [Console]::Error.WriteLine("[hint] " + $result.hint) }
 
         if (-not $result.ok) {
             Write-Error $result.stderr

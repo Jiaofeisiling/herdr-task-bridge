@@ -169,7 +169,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `agents` | GET | `/agents` | 列出 Herdr 管理的 agent 及其状态。 |
 | `ready` | GET | `/ready` | 检查所选 agent 是否可接收任务（`idle` 或 `done`）。 |
 | `status` | GET | `/status` | 返回原始 `herdr agent get` 响应。 |
-| `read` | GET | `/read` | 读取最近的 agent 终端画面，并附带 `agent_status`，供诊断使用。终端是快照，任务完成后仍显示旧画面；忙闲一律以 `agent_status` 为准。 |
+| `read` | GET | `/read` | 读取最近的 agent 终端画面，并附带 `agent_status`，供诊断使用。`source` 取 `recent-unwrapped`（默认，遵循 `lines`）或 `visible`（当前屏幕）；agent 正在工作而又没指定来源时，会退回到 `visible`，并在 `note` 里说明。终端是快照，任务完成后仍显示旧画面；忙闲一律以 `agent_status` 为准。 |
 | `quota` | GET | `/quota` | 列出因模型提供商额度或余额错误而被临时阻断的 agent。 |
 | `quota-reset` | POST | `/quota/reset` | 使用 `-Agent` 清除一个 agent 的额度熔断；刻意不传时清除全部熔断。 |
 | `delegate <task>` | POST | `/delegate` | 将任务加入队列并返回 `task_id`；服务端默认超时为 6 小时。 |
@@ -179,7 +179,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `ask <task>` | POST | `/ask` | 同步执行并返回 agent 结果；目标 agent 忙时返回 `409`。 |
 | `prompt <task>` | POST | `/prompt` | 同步发送任务，但不提取结果。文本会被包进委派信封，所以它是一个任务而不是一次按键：用它发 `/compact` 并不是斜杠命令。带 `-Agent` 时只会发给那个 agent，绝不会被转给备用 agent。 |
 
-通用客户端参数为 `-Agent <name>`、`-TimeoutMs <milliseconds>`（用于 `ask`、`prompt` 和 `delegate`）以及 `-Lines <count>`（用于 `read`）。agent 名称会去除首尾空白，不能为空，最长 200 个字符。请求超时必须在 1 秒至 6 小时之间。
+通用客户端参数为 `-Agent <name>`、`-TimeoutMs <milliseconds>`（用于 `ask`、`prompt` 和 `delegate`）以及 `-Lines <count>` 和 `-Source recent-unwrapped|visible`（用于 `read`）。agent 名称会去除首尾空白，不能为空，最长 200 个字符。请求超时必须在 1 秒至 6 小时之间。
 
 ### 退出码与通道故障
 
@@ -218,6 +218,10 @@ queued → running → done
 - `error` 表示 bridge 已确认执行或结果收集失败。
 - **`orphaned` 和 `error` 并不总是终态。** 如果 agent 在 bridge 停止等待之后才交付结果文件，该任务会被采纳：变为 `done`，`result_text` 被填入，`recovered_at` 被记录，原来的错误说明保留并追加一条注释，而不是被改写。这发生在启动时，以及每次查询该任务时（`task`、`wait`、`tasks`）。在这个机制出现之前，我在线上主机上量到的是：189 个已交付却未被采集的结果——76 个属于被标成 `error` 的任务，2 个属于 `orphaned`，111 个根本没有对应任务。没有一个属于 `done` 任务，这正是关键：正常采集会删除文件，所以这些全是 agent 给出了、bridge 却丢掉的答案。
 - **herdr 中止等待，不等于 prompt 失败。** 桥发送的是 `herdr agent prompt --wait`：先送达，再等 agent 完成。herdr 在看到 agent 变为 `blocked` 时会以 `agent_blocked` 中止这次等待——瞬时的 `blocked` 和真正的 `blocked` 它一视同仁（实测：`blocked`，一秒后又变回 `working`）。桥过去把这个中止当作"送达失败"，把任务标成 `error`，并告诉调用方该 agent "需要交互输入"。在线上主机上，**因此失败的 96 个任务里，有 69 个其实已经交付了结果。** 现在中止只是一次观察，而不是判决：桥会观察 agent 接下来的动作——出现结果文件或 `working` 就继续；持续 `blocked` 满 `SENTINEL_BLOCKED_CONFIRM_SEC`（20 秒）才说它确实在等输入（`reason: blocked_confirmed`）；空闲且在 `SENTINEL_NOT_STARTED_GRACE_SEC`（8 秒）内毫无活动，则报告为 `reason: delivery_unknown`，并明确**不**说它被阻塞。herdr 自己的 `timeout` 错误码现在是 504 而不是 500。
+- **读取一个正在工作的 agent。** herdr 在请求的行数超过屏幕能容纳的行数时，拒绝读取工作中 agent 的历史——实测：行数等于屏幕高度时可以，多一行就报 `agent_not_idle`；而 `visible` 从不被拒，只会被截断到屏幕高度。默认请求的行数超过任何屏幕，所以对工作中的 agent 每次读取都失败：一夜之间 33 次，每次之后调用方照着 herdr 的建议加 `--source visible` 重试，却被客户端悄悄丢掉。`/read` 现在接受 `source`。没指定来源而 herdr 拒绝读历史时，桥退回到可见屏幕并说明（`source`、`note`）；指定了来源则给它所要求的，附带一条 `hint`。失败诊断用同样的退路，所以 agent 忙碌或停在提示上时失败的任务，依然带着证据，而不是"terminal read failed"。
+- **客户端不再吞掉它不认识的选项。** `sentinel.ps1` 把所有未声明的参数收进自由文本参数，所以在不吃文本的命令上，拼错或不支持的选项被丢掉，调用方却以为已经发出。这些命令现在拒绝无法识别的参数（退出码 1）。`-Source` 是真正的选项，而 PowerShell 把 `--source` 当作 `-Source`，所以 herdr 自己的写法——它的报错信息推荐的那种——也能用。
+- **被杀掉的 `herdr agent prompt` 不等于 prompt 失败。** `bridge-restart` 会挂断整个进程组，包括 worker 正在等待的那次调用。那次调用没有任何输出就结束，被报告成"Herdr prompt command failed:"后面一片空白，任务被标成 `error`——这等于告诉调用方重试是安全的，而 prompt 是否已送达从来没有人知道。现在，一次调用若没有任何输出就结束，按"失去跟踪"处理（任务为 `orphaned`：“可能仍在执行”），并且 `error` 不再能覆盖 `orphaned`，无论关停和 worker 谁后到。
+- **`/prompt` 与任务一样处理等待中止**（v23 只修了任务）：瞬时的 `blocked` 不会再导致一个说 agent “需要交互输入”的 500。
 - **同步 `ask` 超时（504）或提醒后仍无结果（502）时，现在会留下一条任务记录**，并在 `hint` 中告知。此前那个响应里的 `task_id` 查询会返回 404，所以一分钟后才到的结果无处可去——这就是上面的 111 个。成功的 ask 和被拒绝的 ask（忙、不可用、额度）不写任何东西：前者不需要记录，后者什么都没发生，所以成功路径保持不变。
 - `quota_exhausted` 表示所有合资格备用 agent 也被额度熔断或报告了额度/余额失败；任务到此为止，不会继续重试。
 - bridge 重启时，所有仍为 `running` 的任务会被标记为 `orphaned`，绝不会被自动重跑。
