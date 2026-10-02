@@ -202,6 +202,18 @@ terminal. So "done" and "ok" do not mean the work happened. What to look for:
   slash command. Do not try `/compact` through it: it fails, and each failed
   attempt makes the session larger.
 
+## Size, and tasks that never started
+
+- A task whose delegation prompt is too large is refused with 400 and
+  `reason: task_too_large` (the limit is in bytes, and a Chinese character is
+  three). Do not shorten it by cutting content: put the material in a file on
+  the host and have the task read it by path.
+- A queued task fails with "no longer exists" if its agent has gone (agent
+  names do not survive a restart). It was never sent, so resubmitting is safe
+  -- and it is better not to name an agent at all.
+- `tasks -Status queued` lists what is waiting. The plain `tasks` is only the
+  newest twenty, so a task that has been stuck for a while is not in it.
+
 ## Writing task descriptions
 
 Say what needs doing. Do not prescribe which tool or shell construct the

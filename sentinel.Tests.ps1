@@ -1055,3 +1055,61 @@ Describe "reading an agent that is working" {
         finally { $stub.Listener.Stop() }
     }
 }
+
+
+Describe "listing tasks beyond the newest twenty" {
+    # /tasks showed only the newest twenty with no way to ask for more, so two
+    # tasks that had been queued for three weeks were invisible to every caller.
+
+    It "sends -Status and -Limit as query parameters" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("tasks", "-Status", "queued", "-Limit", "50")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; tasks = @()
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 0
+            $req.Path | Should -Be "/tasks"
+            $req.Context.Request.QueryString["status"] | Should -Be "queued"
+            $req.Context.Request.QueryString["limit"] | Should -Be "50"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "sends no query at all when neither was given" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("tasks")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; tasks = @()
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.Url.Query | Should -BeNullOrEmpty
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "rejects a status the bridge does not have, without contacting it" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("tasks", "-Status", "bogus")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 2500
+            $result = Wait-SentinelExit -Process $proc
+
+            $req | Should -BeNullOrEmpty
+            $result.ExitCode | Should -Not -Be 0
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}
