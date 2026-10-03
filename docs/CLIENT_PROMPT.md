@@ -202,6 +202,37 @@ terminal. So "done" and "ok" do not mean the work happened. What to look for:
   slash command. Do not try `/compact` through it: it fails, and each failed
   attempt makes the session larger.
 
+## Several agents
+
+There are usually two agents on the host (an OpenCode and a Claude Code).
+Treat them as interchangeable workers behind one queue. The bridge chooses
+between them better than you can: it knows which are free and which provider
+has refused.
+
+- **Do not name an agent unless the task needs that one.** Leave `-Agent` off.
+  The bridge picks a free agent in the operator's cost order, and when a
+  provider refuses one (a quota, a session grown too large) it moves the task
+  to another by itself and says so in the task's `error_text` ("Ran on X, not
+  the requested Y"). Naming an agent gives that up. Names also go stale: an
+  agent's name does not survive its process restarting.
+- **When you must name one, use its pane id** (`w1:p3`) or its runtime family
+  (`opencode`, `claude`) -- never a name.
+- **Name one only to continue its own work** -- a task that builds on what that
+  agent just did, in its working directory or conversation -- or to look at its
+  terminal with `read`.
+- **Independent tasks can go to different agents at once. One agent runs one
+  task at a time** and the rest queue behind it, so do not delegate several
+  things to one agent and expect them to run in parallel.
+- **An unavailable agent is not a refusal.** `ready` false, `quota_blocked`,
+  `context_limit`, busy, blocked, a failed delivery: none of these is an agent
+  declining to do something. Delegate again without naming an agent. Only a
+  reply in which the agent says it will not do the thing is a refusal, and that
+  you report.
+- **When every agent is unavailable**, say why and until when (a quota's
+  `detail` often states the reset time) and stop. Do not poll, and do not
+  `quota-reset` a circuit unless the user has confirmed the account is back.
+- **Report which agent did the work** when it was not the one you asked for.
+
 ## Size, and tasks that never started
 
 - A task whose delegation prompt is too large is refused with 400 and
@@ -213,6 +244,34 @@ terminal. So "done" and "ok" do not mean the work happened. What to look for:
   -- and it is better not to name an agent at all.
 - `tasks -Status queued` lists what is waiting. The plain `tasks` is only the
   newest twenty, so a task that has been stuck for a while is not in it.
+
+## Errors at a glance
+
+| You see | It means | Do |
+|---|---|---|
+| exit 4, `CHANNEL DOWN` | The SSH forward is down. The bridge is unknown, not broken | Ask the user to reconnect. Do not claim the remote is down |
+| exit 5, `NO REPLY` | The bridge is up; this one request stalled | Read-only: retry. `delegate`: retry with the same `-IdempotencyKey`. `ask`/`prompt`: check `ready`/`read` first |
+| exit 3, `quota_exhausted` | Every eligible agent is quota-blocked | Report the reset time from `quota`. Do not retry |
+| exit 2, `orphaned` | The bridge restarted or lost track; the work may have run | Do not retry. Query the task again shortly (a late result turns it `done`), then a read-only check |
+| `reason: provider_rejected`, `kind: context_limit` | That agent's session outgrew its model's limit | Use another agent. Tell the user the session needs compacting or restarting in its terminal |
+| `reason: ended_quickly` | The turn ended in seconds with no result: it almost certainly never started | Read the evidence it carries. Do not wait, and do not resend the same prompt |
+| `reason: blocked_confirmed` | The agent stayed blocked on a prompt | `read` the screen and tell the user what it asks. Do not answer it for them: a `prompt` to a blocked agent is refused |
+| `reason: delivery_unknown` | Unknown whether the prompt landed | `ready`, then `read`. Do not blindly resend |
+| `agent_status: blocked`, no `reason` | herdr's report, often momentary | Look again in a few seconds. Never say "interactive menu" on this alone |
+| `400 task_too_large` | The task is over about 120 KB | Write the material to a file on the host and have the task read it |
+| `409 busy` | That agent has no hands free | Ordinary. Omit `-Agent`, or wait |
+| `422` | The `-IdempotencyKey` was reused with different parameters | Use a new key |
+| `429` | The queue is full | Wait for tasks to finish. Do not pile on |
+| `404 agent_not_found` | The agent you named does not exist | Run `agents`. Omit `-Agent` |
+| `health` reports `worker_dead` (503) | The bridge's worker thread has died | Tell the user the bridge needs restarting |
+| task `error`: "no longer exists ... never sent" | Its agent vanished while it was queued | Safe to resubmit. Do not name an agent |
+| task `error`, then `done` | A late result is adopted automatically | Query again before declaring the work lost |
+| `504` from `ask` | The bridge stopped waiting; the agent may still be working | Query the returned `task_id` shortly |
+
+When something fails that is not in the table: first decide which of five it
+is -- the channel, your own request, an agent that is unavailable, an agent that
+refused, or a task that ran and failed -- because each is handled differently,
+and only the fourth is yours to stop at.
 
 ## Writing task descriptions
 
@@ -231,7 +290,10 @@ system more likely to stop it, where its native tools would not be.
   Being busy is not a refusal: an agent_status of working, a blocked
   reply, or a task sitting at queued all mean it has no hands free right
   now. Waiting, or using a free agent instead, is ordinary and is not
-  routing around anything.
+  routing around anything. Nor is any failure of the machinery: a quota or
+  provider refusal, a session grown too large, a task refused as too large,
+  a delivery that failed. Those are not the agent declining, and using
+  another agent for them is what the bridge itself does.
 - Restarting the bridge orphans whatever task is running. That is
   expected, not a fault.
 - Ask the user before anything irreversible: deleting data, overwriting

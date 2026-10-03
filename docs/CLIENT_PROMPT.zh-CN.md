@@ -165,6 +165,32 @@ herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocke
 - `prompt` 会把文本包进委派信封，所以发不了斜杠命令。不要通过它发
   `/compact`：它会失败，而且每次失败都会让会话更大。
 
+## 多个 agent
+
+主机上通常有两个 agent（一个 OpenCode，一个 Claude Code）。把它们当作同一个
+队列背后可互换的工人。桥比你更会在它们之间做选择：它知道谁空闲、哪个
+提供商拒绝了谁。
+
+- **除非任务确实需要某一个，否则不要指定 agent。** 省略 `-Agent`：桥会按
+  运维设定的成本顺序挑一个空闲的；当提供商拒绝某个 agent（额度、会话过大）
+  时，它会自己把任务改派给另一个，并在任务的 `error_text` 里说明
+  （"Ran on X, not the requested Y"）。指定 agent 就放弃了这一切。名字还
+  会过期：agent 的名字在它的进程重启后不会保留。
+- **必须指定时，用 pane id**（`w1:p3`）**或运行时家族**（`opencode`、
+  `claude`），绝不用名字。
+- **只在延续它自己的工作时才指定**——任务建立在那个 agent 刚做完的事情上，
+  需要它的工作目录或对话上下文——或者要用 `read` 看它的终端。
+- **互相独立的任务可以同时派给不同的 agent。一个 agent 一次只跑一个任务**，
+  其余排在后面，所以不要把好几件事派给同一个 agent 还指望它们并行。
+- **agent 不可用不是拒绝。** `ready` 为 false、`quota_blocked`、
+  `context_limit`、忙、blocked、投递失败：这些都不是 agent 在拒绝做某事。
+  不指定 agent 重新派发即可。只有 agent 的回复里明确表示它不会做这件事，
+  才是拒绝，那才需要你原样汇报。
+- **所有 agent 都不可用时**，说明原因和恢复时间（额度的 `detail` 里常带有
+  重置时间）然后停下。不要轮询；除非用户确认账户已经恢复，不要对熔断做
+  `quota-reset`。
+- **任务不是你指定的那个 agent 做的时，汇报实际是谁做的。**
+
 ## 大小，以及从未开始的任务
 
 - 委派 prompt 过大的任务会被以 400 和 `reason: task_too_large` 拒绝（上限按
@@ -175,6 +201,33 @@ herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocke
   不指定 agent。
 - `tasks -Status queued` 会列出正在等待的任务。不带参数的 `tasks` 只是最新
   20 条，所以卡了一段时间的任务不在里面。
+
+## 常见错误速查
+
+| 你看到 | 意味着 | 怎么做 |
+|---|---|---|
+| 退出码 4、`CHANNEL DOWN` | SSH 转发断了。桥的状态未知，不是坏了 | 请用户重连。不要断言远端故障 |
+| 退出码 5、`NO REPLY` | 桥在线，只是这一个请求卡住了 | 只读命令：重试。`delegate`：用同一个 `-IdempotencyKey` 重试。`ask`/`prompt`：先查 `ready`/`read` |
+| 退出码 3、`quota_exhausted` | 所有合格 agent 都被额度熔断 | 从 `quota` 里读出恢复时间并汇报。不要重试 |
+| 退出码 2、`orphaned` | 桥重启或失去跟踪，工作可能已执行 | 不要重试。过一会儿再查这个任务（迟到的结果会让它变成 `done`），再做只读核查 |
+| `reason: provider_rejected`、`kind: context_limit` | 该 agent 的会话超过了它的模型上限 | 改用另一个 agent。告诉用户该会话需要在它的终端里压缩或重启 |
+| `reason: ended_quickly` | 一轮几秒内就结束且没有结果：几乎肯定根本没开始 | 读它附带的证据。不要等，也不要把同一个 prompt 再发一遍 |
+| `reason: blocked_confirmed` | agent 持续卡在一个提示上 | `read` 屏幕，把它问了什么告诉用户。不要替用户回答：对 blocked 的 agent 发 `prompt` 会被拒绝 |
+| `reason: delivery_unknown` | 不知道 prompt 有没有送达 | 先 `ready`，再 `read`。不要盲目重发 |
+| `agent_status: blocked` 且没有 `reason` | herdr 的报告，往往只是瞬时 | 几秒后再看。仅凭这一条绝不要说"卡在交互菜单" |
+| `400 task_too_large` | 任务超过约 120 KB | 把材料写进主机上的文件，让任务去读 |
+| `409 busy` | 该 agent 腾不出手 | 正常。省略 `-Agent`，或者等 |
+| `422` | `-IdempotencyKey` 被拿去配了不同的参数 | 换一个新 key |
+| `429` | 队列满了 | 等任务跑完。不要继续堆 |
+| `404 agent_not_found` | 你指定的 agent 不存在 | 运行 `agents`。省略 `-Agent` |
+| `health` 报 `worker_dead`（503） | 桥的 worker 线程挂了 | 告诉用户桥需要重启 |
+| 任务 `error`："no longer exists ... never sent" | 它排队时 agent 已经消失 | 可安全重新提交。不要指定 agent |
+| 任务先 `error` 后来变 `done` | 迟到的结果会被自动补回 | 断定工作丢了之前先再查一次 |
+| `ask` 返回 `504` | 桥不再等了，agent 可能仍在工作 | 过一会儿查返回的 `task_id` |
+
+遇到表里没有的失败，先判断它属于五类里的哪一类——通道、你自己的请求、不可用的
+agent、拒绝了的 agent、跑过但失败的任务——因为每一类的处理方式都不同，
+只有第四类才该由你停在那里。
 
 ## 写任务描述
 
@@ -189,6 +242,9 @@ herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocke
   也不要换个 agent 绕过去，把拒绝原样报告给用户。
   但"忙"不是拒绝：agent_status 是 working、或报 blocked、或任务停在 queued，
   都只是它此刻腾不出手。等一等或换个空闲 agent 都完全正常，不算绕过。
+  机制上的任何故障同样不是拒绝：额度或提供商的拒绝、会话过大、任务因过大被
+  拒、投递失败。那些不是 agent 在拒绝，为它们换用另一个 agent 正是桥自己会
+  做的事。
 - 重启桥会让当时正在执行的任务变成 orphaned。这是预期行为，不是故障。
 - 不可逆的操作先问用户：删除数据、覆盖结果、修改共享配置。提交和取消
   Slurm 作业不在此列——它们是可逆的，放手做。
