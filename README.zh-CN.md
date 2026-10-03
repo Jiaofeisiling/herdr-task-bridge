@@ -175,7 +175,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `delegate <task>` | POST | `/delegate` | 将任务加入队列并返回 `task_id`；服务端默认超时为 6 小时。 |
 | `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态，附带执行中的 `progress`；处于 `queued` 时还会给出 `queued_reason`，说明它在等什么。 |
 | `wait <task_id>` | GET | `/tasks/<id>` | 每 3 秒轮询至终态，再输出结果或错误。 |
-| `tasks` | GET | `/tasks` | 列出最近 20 个任务。 |
+| `tasks` | GET | `/tasks` | 列出最近 20 个任务。`status`（`queued`、`running`、`done`、`error`、`orphaned`、`quota_exhausted`）和 `limit`（1–200）可以缩小或放宽范围——`tasks -Status queued` 就是找出正在等待的任务的办法。 |
 | `ask <task>` | POST | `/ask` | 同步执行并返回 agent 结果；目标 agent 忙时返回 `409`。 |
 | `prompt <task>` | POST | `/prompt` | 同步发送任务，但不提取结果。文本会被包进委派信封，所以它是一个任务而不是一次按键：用它发 `/compact` 并不是斜杠命令。带 `-Agent` 时只会发给那个 agent，绝不会被转给备用 agent。 |
 
@@ -220,6 +220,8 @@ queued → running → done
 - **herdr 中止等待，不等于 prompt 失败。** 桥发送的是 `herdr agent prompt --wait`：先送达，再等 agent 完成。herdr 在看到 agent 变为 `blocked` 时会以 `agent_blocked` 中止这次等待——瞬时的 `blocked` 和真正的 `blocked` 它一视同仁（实测：`blocked`，一秒后又变回 `working`）。桥过去把这个中止当作"送达失败"，把任务标成 `error`，并告诉调用方该 agent "需要交互输入"。在线上主机上，**因此失败的 96 个任务里，有 69 个其实已经交付了结果。** 现在中止只是一次观察，而不是判决：桥会观察 agent 接下来的动作——出现结果文件或 `working` 就继续；持续 `blocked` 满 `SENTINEL_BLOCKED_CONFIRM_SEC`（20 秒）才说它确实在等输入（`reason: blocked_confirmed`）；空闲且在 `SENTINEL_NOT_STARTED_GRACE_SEC`（8 秒）内毫无活动，则报告为 `reason: delivery_unknown`，并明确**不**说它被阻塞。herdr 自己的 `timeout` 错误码现在是 504 而不是 500。
 - **读取一个正在工作的 agent。** herdr 在请求的行数超过屏幕能容纳的行数时，拒绝读取工作中 agent 的历史——实测：行数等于屏幕高度时可以，多一行就报 `agent_not_idle`；而 `visible` 从不被拒，只会被截断到屏幕高度。默认请求的行数超过任何屏幕，所以对工作中的 agent 每次读取都失败：一夜之间 33 次，每次之后调用方照着 herdr 的建议加 `--source visible` 重试，却被客户端悄悄丢掉。`/read` 现在接受 `source`。没指定来源而 herdr 拒绝读历史时，桥退回到可见屏幕并说明（`source`、`note`）；指定了来源则给它所要求的，附带一条 `hint`。失败诊断用同样的退路，所以 agent 忙碌或停在提示上时失败的任务，依然带着证据，而不是"terminal read failed"。
 - **客户端不再吞掉它不认识的选项。** `sentinel.ps1` 把所有未声明的参数收进自由文本参数，所以在不吃文本的命令上，拼错或不支持的选项被丢掉，调用方却以为已经发出。这些命令现在拒绝无法识别的参数（退出码 1）。`-Source` 是真正的选项，而 PowerShell 把 `--source` 当作 `-Source`，所以 herdr 自己的写法——它的报错信息推荐的那种——也能用。
+- **过大的任务会在入口被拒绝。** herdr 把 prompt 当作一个命令行参数，而 Linux 把单个参数限制在 131072 字节：在主机上实测，131000 字节能送达，131072 字节就以 `Errno 7` 失败。以前桥什么都不检查，所以过大的任务被接受并排队——调用方被告知 `queued`——然后在 worker 里以那个光秃秃的 errno 失败；线上真实发生过一次。现在 `/delegate`、`/ask` 和 `/prompt` 会测量实际发出的内容（包含信封、结果路径和策略行，按 UTF-8 字节计，一个汉字是 3 字节），与 `SENTINEL_MAX_PROMPT_BYTES` 比较，超限就返回 400、`reason: task_too_large`，并说明该怎么办：把材料放进主机上的文件，再让任务按路径引用它。
+- **排队等待一个已不存在的 agent 的任务，不再永远等下去。** herdr 在 agent 进程重启时会丢掉它的名字。曾有两个排队给 `sentinel-claude` 和 `sentinel-opencode` 的任务在 `queued` 状态停了三周：桥知道不会有人接手（`queued_reason` 就这么说），却从不采取行动，所以调用方的 `wait` 会无限等下去，这些任务还一直占着队列名额；而 `/tasks` 只显示最新 20 条，没人看到它们。现在，排队超过 `SENTINEL_STALE_TARGET_SEC`（10 分钟）、且 herdr 已不再列出其 agent 的任务，会被判为失败，错误信息说明它从未被发送、可以放心重新提交。它不会被改派给别的 agent：把任务发给错的 agent，比不发更糟。它会先等满这段时间，因为正在重启的 agent 会短暂地从列表里消失；而当 herdr 无法应答，或 agent 存在但在忙时，它什么也不做。
 - **被杀掉的 `herdr agent prompt` 不等于 prompt 失败。** `bridge-restart` 会挂断整个进程组，包括 worker 正在等待的那次调用。那次调用没有任何输出就结束，被报告成"Herdr prompt command failed:"后面一片空白，任务被标成 `error`——这等于告诉调用方重试是安全的，而 prompt 是否已送达从来没有人知道。现在，一次调用若没有任何输出就结束，按"失去跟踪"处理（任务为 `orphaned`：“可能仍在执行”），并且 `error` 不再能覆盖 `orphaned`，无论关停和 worker 谁后到。
 - **`/prompt` 与任务一样处理等待中止**（v23 只修了任务）：瞬时的 `blocked` 不会再导致一个说 agent “需要交互输入”的 500。
 - **同步 `ask` 超时（504）或提醒后仍无结果（502）时，现在会留下一条任务记录**，并在 `hint` 中告知。此前那个响应里的 `task_id` 查询会返回 404，所以一分钟后才到的结果无处可去——这就是上面的 111 个。成功的 ask 和被拒绝的 ask（忙、不可用、额度）不写任何东西：前者不需要记录，后者什么都没发生，所以成功路径保持不变。
@@ -310,6 +312,8 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_SHUTDOWN_GRACE_SEC` | `5` | bridge 端：有序停机时等待已在处理中的请求多久，超时即放弃。 |
 | `SENTINEL_HERDR_TIMEOUT_SEC` | `30` | bridge 端：任何没自带超时的 herdr 调用的上限。herdr 卡住时表现为 504，而不是让请求线程无限阻塞。 |
 | `SENTINEL_CONTEXT_BLOCK_TTL_SECONDS` | `600` | 因会话过大被拒而开启的熔断保持多久。比额度的短，因为治法是有人去压缩或重启会话。 |
+| `SENTINEL_MAX_PROMPT_BYTES` | `120000` | bridge 接受的最大委派 prompt（含信封，按 UTF-8 字节）。Linux 把单个命令行参数限制在 131072 字节，而 herdr 把 prompt 当作一个参数。 |
+| `SENTINEL_STALE_TARGET_SEC` | `600` | 排队任务最多等待一个 herdr 已不再列出的 agent 多久，之后按"从未发送"判为失败。 |
 | `SENTINEL_QUICK_END_SEC` | `15` | 一轮结束得比这更快且没有结果文件，就报告为 `ended_quickly`：快到不可能执行过任务。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 

@@ -30,6 +30,15 @@ param(
     [ValidateSet("recent-unwrapped", "visible")]
     [string]$Source,
 
+    # For `tasks`: list only tasks in this state, and how many. Without them
+    # it is the newest twenty of everything, which is how two tasks stuck in
+    # the queue for three weeks were never seen.
+    [ValidateSet("queued", "running", "done", "error", "orphaned", "quota_exhausted")]
+    [string]$Status,
+
+    [ValidateRange(1, 200)]
+    [int]$Limit,
+
     [int]$TimeoutMs = 120000,
 
     # Which herdr agent to target. Omit to use the bridge's own
@@ -579,7 +588,12 @@ switch ($Command) {
     }
 
     "tasks" {
-        $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks"
+        $tasksQuery = @()
+        if ($PSBoundParameters.ContainsKey("Status")) { $tasksQuery += "status=$([uri]::EscapeDataString($Status))" }
+        if ($PSBoundParameters.ContainsKey("Limit")) { $tasksQuery += "limit=$Limit" }
+        $tasksSuffix = if ($tasksQuery.Count -gt 0) { "?" + ($tasksQuery -join "&") } else { "" }
+
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks$tasksSuffix"
         $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {

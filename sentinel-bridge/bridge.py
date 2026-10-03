@@ -19,7 +19,7 @@ from urllib.parse import urlparse, parse_qs
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 25
+BRIDGE_VERSION = 26
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -300,6 +300,64 @@ def provider_failure_kind(detail):
         return "context_limit"
 
     return "quota"
+
+
+# How long a queued task may wait for an agent that is not among herdr's
+# running agents before the bridge gives up on it. herdr drops an agent's name
+# whenever its process restarts, so a task queued for a name can end up waiting
+# for something that no longer exists -- two did, for three weeks. Not
+# immediately, because an agent that is restarting is missing from the list
+# for a moment, and failing then would lose work that was about to be possible.
+STALE_TARGET_SEC = int(os.environ.get("SENTINEL_STALE_TARGET_SEC", "600"))
+
+TASK_STATUSES = (
+    "queued", "running", "done", "error", "orphaned", "quota_exhausted",
+)
+TASKS_LIMIT_DEFAULT = 20
+TASKS_LIMIT_MAX = 200
+
+# herdr takes the prompt as ONE command-line argument, and Linux caps a single
+# argument at 131072 bytes (MAX_ARG_STRLEN) -- measured on the host: 131000
+# bytes is delivered, 131072 fails with OSError [Errno 7]. The default leaves
+# room under that; the cap is on bytes, not characters, so a Chinese character
+# counts three.
+MAX_PROMPT_BYTES = int(os.environ.get("SENTINEL_MAX_PROMPT_BYTES", "120000"))
+
+
+class TaskTooLargeError(ValueError):
+    reason = "task_too_large"
+
+
+def validate_task_size(task, slurm_policy=None):
+    # Measured on what is actually sent: the envelope, the result path and the
+    # policy line travel in the same argument as the task.
+    size = len(
+        build_delegation_prompt(
+            task, "00000000-0000-0000-0000-000000000000", slurm_policy
+        ).encode("utf-8")
+    )
+
+    if size > MAX_PROMPT_BYTES:
+        raise TaskTooLargeError(
+            f"task is too large to deliver: with the delegation envelope the "
+            f"prompt is {size} bytes (UTF-8; a Chinese character is 3) and the "
+            f"limit is {MAX_PROMPT_BYTES}. herdr takes the prompt as one "
+            "command-line argument, which Linux caps at 131072 bytes. Put the "
+            "material in a file on the host and have the task refer to it by "
+            "path."
+        )
+
+    return task
+
+
+def invalid_request_payload(error):
+    payload = {"ok": False, "error": f"invalid request: {error}"}
+
+    reason = getattr(error, "reason", None)
+    if reason:
+        payload["reason"] = reason
+
+    return payload
 
 
 def validate_timeout_ms(timeout_ms):
@@ -773,14 +831,65 @@ def get_task(task_id):
     return dict(row) if row else None
 
 
-def list_tasks(limit=20):
+def list_tasks(limit=TASKS_LIMIT_DEFAULT, status=None):
+    where = "WHERE status = ?" if status else ""
+    params = (status, limit) if status else (limit,)
+
     with db_session() as conn:
         rows = conn.execute(
-            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
-            (limit,),
+            f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ?",
+            params,
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def validate_tasks_query(query):
+    """(limit, status) from a parsed query string; ValueError if either is bad."""
+    limit_values = query.get("limit")
+    status_values = query.get("status")
+
+    limit = TASKS_LIMIT_DEFAULT
+    if limit_values:
+        limit = int(limit_values[0])
+        if not (1 <= limit <= TASKS_LIMIT_MAX):
+            raise ValueError(
+                f"limit must be between 1 and {TASKS_LIMIT_MAX}, got {limit}"
+            )
+
+    status = None
+    if status_values:
+        status = status_values[0]
+        if status not in TASK_STATUSES:
+            raise ValueError(
+                f"status must be one of {', '.join(TASK_STATUSES)}, got {status!r}"
+            )
+
+    return limit, status
+
+
+def abandon_task(task_id, error_text):
+    """Fail a task that is still queued. Never touches one that has started."""
+    with db_session() as conn:
+        cursor = conn.execute("""
+            UPDATE tasks
+            SET status = 'error', error_text = ?, finished_at = ?
+            WHERE task_id = ? AND status = 'queued'
+        """, (error_text, now_iso(), task_id))
+
+        return cursor.rowcount == 1
+
+
+def _age_seconds(iso_stamp):
+    try:
+        stamp = datetime.fromisoformat(iso_stamp)
+    except (TypeError, ValueError):
+        return None
+
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+
+    return (datetime.now(timezone.utc) - stamp).total_seconds()
 
 
 def count_queued_tasks():
@@ -1384,6 +1493,47 @@ def ready_hint(agent_status):
         )
 
     return None
+
+
+def abandon_unreachable_task(task_row):
+    """Fail a queued task whose target agent no longer exists. True if it did.
+
+    Conservative on every side: only after STALE_TARGET_SEC, only when herdr
+    actually answered and listed no such agent (a herdr that cannot be asked
+    proves nothing), and never for an agent that exists but is busy -- waiting
+    for a free agent is the job, however long it takes.
+
+    It does not re-point the task at some other agent. resolve_agent() holds
+    that sending work to the wrong agent is worse than not sending it, and the
+    caller can choose. What it does do is say so, and say that nothing was sent.
+    """
+    age = _age_seconds(task_row["created_at"])
+
+    if age is None or age < STALE_TARGET_SEC:
+        return False
+
+    try:
+        agents, _ = list_agents()
+    except Exception:
+        return False
+
+    if agents is None:
+        return False
+
+    live = [a for a in agents if isinstance(a, dict)]
+    agent_name = task_row["agent"]
+
+    if any(agent_name in agent_identifiers(a) for a in live):
+        return False
+
+    return abandon_task(
+        task_row["task_id"],
+        f"The agent this task was queued for ('{agent_name}') no longer "
+        f"exists -- herdr now lists {describe_live_agents(live)} -- so "
+        "nothing could ever pick it up. It was never sent to any agent, so "
+        "resubmitting is safe. (A herdr agent's name does not survive its "
+        "process restarting; omit the agent and the bridge will choose one.)",
+    )
 
 
 def explain_queued(agent_name):
@@ -2335,7 +2485,18 @@ def task_worker(stop_event=None):
                     quota_exhausted_task(task_id, detail)
                     print(f"[task {task_id}] quota exhausted: {e}")
 
-            except (SentinelBusyError, SentinelUnavailableError):
+            except (SentinelBusyError, SentinelUnavailableError) as unavailable:
+                if (
+                    isinstance(unavailable, SentinelUnavailableError)
+                    and not claimed
+                    and abandon_unreachable_task(task_row)
+                ):
+                    print(
+                        f"[task {task_id}] abandoned: its agent "
+                        f"({agent_name}) no longer exists"
+                    )
+                    continue
+
                 if claimed:
                     # A quota fallback exists but is temporarily occupied or
                     # unreachable. Preserve the task and retry later; do not
@@ -2853,11 +3014,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/tasks":
+            try:
+                limit, status_filter = validate_tasks_query(
+                    parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                )
+            except (TypeError, ValueError) as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"}, 400
+                )
+                return
+
             # A late result may have arrived since anyone last looked.
             tasks = [
                 (adopt_late_result(t["task_id"]) or t)
                 if t["status"] in LATE_RESULT_STATUSES else t
-                for t in list_tasks()
+                for t in list_tasks(limit, status_filter)
             ]
 
             self.send_json({
@@ -2973,14 +3144,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not task:
                     raise ValueError("task cannot be empty")
 
+                validate_task_size(task, slurm_policy)
+
             except Exception as e:
-                self.send_json(
-                    {
-                        "ok": False,
-                        "error": f"invalid request: {e}",
-                    },
-                    400,
-                )
+                self.send_json(invalid_request_payload(e), 400)
                 return
 
             fingerprint = None
@@ -3111,14 +3278,10 @@ class Handler(BaseHTTPRequestHandler):
             if not task:
                 raise ValueError("task cannot be empty")
 
+            validate_task_size(task, slurm_policy)
+
         except Exception as e:
-            self.send_json(
-                {
-                    "ok": False,
-                    "error": f"invalid request: {e}",
-                },
-                400,
-            )
+            self.send_json(invalid_request_payload(e), 400)
             return
 
         try:

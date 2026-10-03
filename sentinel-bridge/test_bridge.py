@@ -4278,3 +4278,227 @@ def test_prompt_that_never_started_is_not_called_blocked(live_server, tmp_path, 
     assert body["ok"] is False
     assert body["reason"] == "delivery_unknown"
     assert "interactive" not in body["error"]
+
+
+# --- a task too large to deliver is refused up front ---------------------
+#
+# herdr takes the prompt as ONE command-line argument, and Linux caps a single
+# argument at 131072 bytes. Measured on the host: 131000 bytes is delivered,
+# 131072 fails with OSError [Errno 7] Argument list too long. The bridge
+# checked nothing, so an oversized task was accepted, queued -- the caller was
+# told `queued` -- and then failed in the worker with that bare errno. A
+# delegate carrying a large pasted log would be reported as accepted, and
+# never could have run. (The cap is on bytes, not characters: a Chinese
+# character is three.)
+
+
+def _envelope_bytes():
+    prompt = bridge.build_delegation_prompt("x", "00000000-0000-0000-0000-000000000000")
+    return len(prompt.encode("utf-8"))
+
+
+def test_the_default_limit_leaves_room_under_the_os_limit():
+    # A default above the kernel's cap would reintroduce the failure it exists to stop.
+    assert bridge.MAX_PROMPT_BYTES < 131072
+
+
+def test_delegate_refuses_a_task_too_large_to_deliver(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_PROMPT_BYTES", _envelope_bytes() + 2000)
+
+    status, body = _post(live_server, "/delegate", {"task": "a" * 5000})
+
+    assert status == 400
+    assert body["reason"] == "task_too_large"
+    assert "131072" in body["error"]
+    # Says what to do instead, not just no.
+    assert "file" in body["error"]
+    # Refused before it is queued: the caller is not told `queued` for work that cannot run.
+    assert bridge.list_tasks() == []
+
+
+def test_ask_and_prompt_refuse_it_too(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_PROMPT_BYTES", _envelope_bytes() + 2000)
+
+    for path in ("/ask", "/prompt"):
+        status, body = _post(live_server, path, {"task": "a" * 5000, "agent": "w1:p1"})
+
+        assert status == 400, path
+        assert body["reason"] == "task_too_large", path
+
+
+def test_a_task_that_fits_is_accepted(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_PROMPT_BYTES", _envelope_bytes() + 2000)
+
+    status, body = _post(live_server, "/delegate", {"task": "a" * 1500})
+
+    assert status == 202
+
+
+def test_the_limit_counts_bytes_not_characters(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_PROMPT_BYTES", _envelope_bytes() + 2000)
+
+    # 1500 characters either way -- but 4500 bytes in UTF-8.
+    ascii_status, _ = _post(live_server, "/delegate", {"task": "a" * 1500})
+    chinese_status, body = _post(live_server, "/delegate", {"task": "任" * 1500})
+
+    assert ascii_status == 202
+    assert chinese_status == 400
+    assert body["reason"] == "task_too_large"
+
+
+# --- a task queued for an agent that no longer exists --------------------
+#
+# Found on the host: two tasks queued on 2026-09-13 for `sentinel-claude` and
+# `sentinel-opencode`, still `queued` three weeks later. herdr drops an agent's
+# name when its process restarts, so those names stopped resolving and nothing
+# could ever pick the tasks up. The bridge knew -- explain_queued() reports
+# "nothing will pick this up" -- but left them `queued`: no signal to the
+# caller, a `wait` that never ends, and a slot in the queue cap for good. They
+# were also invisible: /tasks shows only the newest twenty.
+
+
+def _age_task(task_id, seconds):
+    stale = (
+        datetime_module.now(datetime_module_tz.utc)
+        - datetime_module_delta(seconds=seconds)
+    ).isoformat()
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET created_at = ? WHERE task_id = ?", (stale, task_id))
+
+
+def _run_worker_until(predicate, seconds=6):
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not predicate():
+        time.sleep(0.05)
+    stop.set()
+    worker.join(timeout=5)
+
+
+def _only_these_agents(monkeypatch, agents):
+    """herdr answers, listing `agents`; asking after anything else finds nothing."""
+    monkeypatch.setattr(bridge, "list_agents", lambda: (agents, {"ok": True}))
+
+    def status(name, *a, **k):
+        for agent in agents:
+            if name in (agent.get("name"), agent.get("pane_id")):
+                return agent.get("agent_status"), {"ok": True}
+        return None, {"ok": False, "stderr": f"agent target {name} not found"}
+
+    monkeypatch.setattr(bridge, "get_agent_status", status)
+
+
+LIVE = [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"}]
+
+
+def test_a_long_queued_task_for_an_agent_that_is_gone_is_failed_clearly(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+    monkeypatch.setattr(bridge, "STALE_TARGET_SEC", 600)
+    task_id = bridge.create_task("audit", 60000, "sentinel-claude")
+    _age_task(task_id, 3600)
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued")
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "error"
+    assert "no longer exists" in row["error_text"]
+    # The caller's one question: is it safe to send again? Nothing was sent.
+    assert "never sent" in row["error_text"] and "safe" in row["error_text"]
+    assert "w1:p3" in row["error_text"]          # what does exist
+
+
+def test_a_young_task_for_a_missing_agent_is_given_time_to_come_back(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+    monkeypatch.setattr(bridge, "STALE_TARGET_SEC", 600)
+    task_id = bridge.create_task("audit", 60000, "sentinel-claude")   # created just now
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    # An agent restarting is missing from herdr's list for a moment; failing at
+    # once would lose work that was about to be possible.
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+def test_a_task_is_not_failed_when_herdr_cannot_be_asked(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "list_agents", lambda: (None, {"ok": False}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: (None, {"ok": False}))
+    monkeypatch.setattr(bridge, "STALE_TARGET_SEC", 600)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    _age_task(task_id, 3600)
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    # No answer proves nothing about whether the agent exists.
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+def test_an_old_task_for_a_busy_agent_that_exists_keeps_waiting(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3", "agent_status": "working"}])
+    monkeypatch.setattr(bridge, "STALE_TARGET_SEC", 600)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    _age_task(task_id, 3600)
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    # Busy is ordinary, however long: waiting for a free agent is the job.
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+# --- finding such tasks: /tasks can be filtered --------------------------
+
+
+def test_tasks_can_be_listed_by_status_beyond_the_newest_twenty(live_server, tmp_path, monkeypatch):
+    old = bridge.create_task("stuck", 60000, "sentinel-claude")
+    _age_task(old, 86400 * 20)
+    for i in range(25):
+        tid = bridge.create_task(f"t{i}", 60000, "w1:p3")
+        with bridge.db_session() as conn:
+            conn.execute("UPDATE tasks SET status = 'done' WHERE task_id = ?", (tid,))
+
+    # The unfiltered list is the newest twenty and the stuck one is not in it ...
+    _, everything = _get(live_server, "/tasks")
+    assert old not in [t["task_id"] for t in everything["tasks"]]
+
+    # ... which is how it went unseen for three weeks.
+    status, body = _get(live_server, "/tasks?status=queued")
+    assert status == 200
+    assert [t["task_id"] for t in body["tasks"]] == [old]
+
+
+def test_tasks_limit_is_validated(live_server):
+    assert _get(live_server, "/tasks?limit=5")[0] == 200
+    assert _get(live_server, "/tasks?limit=0")[0] == 400
+    assert _get(live_server, "/tasks?limit=100000")[0] == 400
+    assert _get(live_server, "/tasks?limit=abc")[0] == 400
+    assert _get(live_server, "/tasks?status=bogus")[0] == 400
+
+
+def test_abandoning_never_touches_a_task_that_has_started(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    assert bridge.claim_task(task_id)
+
+    # It is running somewhere: a late "its agent is gone" must not rewrite that.
+    assert bridge.abandon_task(task_id, "gone") is False
+    assert bridge.get_task(task_id)["status"] == "running"
+
+
+def test_an_agent_that_is_listed_but_cannot_be_queried_keeps_its_tasks(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    # herdr lists the agent, but asking after its status fails -- a hiccup, not
+    # an absence. Only the list says whether an agent exists.
+    monkeypatch.setattr(bridge, "list_agents", lambda: (LIVE, {"ok": True}))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: (None, {"ok": False}))
+    monkeypatch.setattr(bridge, "STALE_TARGET_SEC", 600)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    _age_task(task_id, 3600)
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    assert bridge.get_task(task_id)["status"] == "queued"
