@@ -1430,7 +1430,7 @@ def test_execute_sentinel_task_returns_the_file_contents(tmp_path, monkeypatch):
     assert result == "干净的结果，没有终端噪音"
 
 
-def test_execute_sentinel_task_never_reads_the_terminal_on_the_happy_path(tmp_path, monkeypatch):
+def test_execute_sentinel_task_only_reads_a_before_snapshot_on_success(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
 
     task_id = "66666666-6666-6666-6666-666666666666"
@@ -1438,15 +1438,16 @@ def test_execute_sentinel_task_never_reads_the_terminal_on_the_happy_path(tmp_pa
 
     def fake_run_herdr(*args, **kwargs):
         calls.append(args[1])
-        with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
-            f.write("ok")
+        if args[1] == "prompt":
+            with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+                f.write("ok")
         return {"ok": True, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
     bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
 
-    assert calls == ["prompt"]  # no "read" -- scraping is off the critical path
+    assert calls == ["read", "prompt"]  # snapshot, then file-based result
 
 
 def test_execute_sentinel_task_reminds_once_when_the_file_is_missing(tmp_path, monkeypatch):
@@ -1653,7 +1654,8 @@ def test_missing_result_quota_does_not_send_recovery_prompt(tmp_path, monkeypatc
         if args[1] == "read":
             return {
                 "ok": True,
-                "stdout": "OpenCode API: insufficient credits",
+                "stdout": "OpenCode API: insufficient credits" if any(
+                    call[1] == "prompt" for call in calls) else "",
                 "stderr": "",
             }
         return {"ok": True, "stdout": "", "stderr": ""}
@@ -1813,7 +1815,7 @@ def test_missing_result_diagnostics_cover_the_reminder_attempt(tmp_path, monkeyp
 
     # The whole question when this error fires is "what happened during the
     # reminder", so the attached tail has to be read after it, not before.
-    assert "#2" in exc_info.value.raw_output
+    assert "#3" in exc_info.value.raw_output  # before, missing file, after reminder
 
 
 # --- stale result files -------------------------------------------------
@@ -1959,6 +1961,157 @@ def test_resolve_agent_accepts_a_pane_id(monkeypatch):
     _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3"}])
 
     assert bridge.resolve_agent("w1:p3") == "w1:p3"
+
+
+def test_named_agent_aliases_share_one_dispatch_lock(monkeypatch):
+    _live(monkeypatch, [{"name": "primary", "agent": "claude", "pane_id": "w1:p3"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    assert bridge.agent_or_auto("primary") == bridge.agent_or_auto("w1:p3")
+    # Also cover rows queued before aliases were canonicalized.
+    with bridge.acquire_agent_for_delegation("primary"):
+        with pytest.raises(bridge.SentinelBusyError):
+            with bridge.acquire_agent_for_delegation("w1:p3"):
+                pytest.fail("the same agent acquired two locks")
+        _live(monkeypatch, [], ok=False)
+        with pytest.raises(bridge.SentinelBusyError):
+            with bridge.acquire_agent_for_delegation("w1:p3"):
+                pytest.fail("discovery failure gave a known alias a second lock")
+
+
+def test_fallback_allowlist_excludes_primary_aliases_and_deduplicates(monkeypatch):
+    _live(monkeypatch, [
+        {"name": "primary", "agent": "claude", "pane_id": "w1:p3"},
+        {"name": "backup", "agent": "opencode", "pane_id": "w1:p1"},
+    ])
+    monkeypatch.setattr(bridge, "QUOTA_FAILOVER_AGENTS",
+                        ("w1:p3", "primary", "w1:p1", "backup"))
+    assert bridge.quota_failover_candidates("primary") == ["backup"]
+
+
+def test_expiring_legacy_quota_alias_keeps_active_circuit(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"name": "primary", "agent": "claude", "pane_id": "w1:p3"}])
+    old = (datetime_module.now(datetime_module_tz.utc) - datetime_module_delta(days=10)).isoformat()
+    with bridge.db_session() as conn:
+        conn.executemany("INSERT INTO quota_blocks VALUES (?, ?, ?)", [
+            ("primary", bridge.now_iso(), "insufficient credits"),
+            ("w1:p3", old, "insufficient credits"),
+        ])
+    assert [b["agent"] for b in bridge.list_agent_quota_blocks()] == ["primary"]
+    assert bridge.get_agent_quota_block("w1:p3") is not None
+
+
+def test_quota_circuit_and_reset_apply_to_all_live_aliases(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"name": "primary", "agent": "claude", "pane_id": "w1:p3"}])
+    # A circuit recorded by an older bridge under its pane id must hold too.
+    with bridge.db_session() as conn:
+        conn.execute("INSERT INTO quota_blocks VALUES (?, ?, ?)",
+                     ("w1:p3", bridge.now_iso(), "insufficient credits"))
+    assert bridge.get_agent_quota_block("primary") is not None
+    assert bridge.clear_agent_quota_blocks("primary") == 1
+    bridge.mark_agent_quota_blocked("primary", "insufficient credits")
+    assert bridge.get_agent_quota_block("w1:p3") is not None
+    assert bridge.clear_agent_quota_blocks("w1:p3") == 1
+
+
+def test_result_survives_failed_commit_and_restart(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 1000, "primary")
+    bridge.claim_task(task_id)
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("durable answer"))
+    answer = bridge.execute_sentinel_task("primary", task_id, "audit", 1000)
+    original_connect = bridge.db_connect
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(bridge, "db_connect", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        bridge.complete_task(task_id, answer)
+    assert os.path.exists(bridge.result_file_path(task_id))
+    monkeypatch.setattr(bridge, "db_connect", original_connect)
+    bridge.init_db()
+    recovered = bridge.adopt_late_result(task_id)
+    assert recovered["status"] == "done"
+    assert recovered["result_text"] == "durable answer"
+    assert not os.path.exists(bridge.result_file_path(task_id))
+
+
+def test_result_is_removed_only_after_successful_commit(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 1000, "primary")
+    bridge.claim_task(task_id)
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("durable answer"))
+    answer = bridge.execute_sentinel_task("primary", task_id, "audit", 1000)
+    assert os.path.exists(bridge.result_file_path(task_id))
+    bridge.complete_task(task_id, answer)
+    assert bridge.get_task(task_id)["result_text"] == "durable answer"
+    assert not os.path.exists(bridge.result_file_path(task_id))
+
+
+def test_old_terminal_quota_does_not_reroute_executed_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    _live(monkeypatch, [
+        {"name": "primary", "agent": "claude", "pane_id": "w1:p3"},
+        {"name": "backup", "agent": "opencode", "pane_id": "w1:p1"},
+    ])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    history = "Yesterday: HTTP 429 Too Many Requests"
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: (history, {}))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: history)
+    task_id = "old-terminal-error"
+    calls = []
+
+    def deliver(target, prompt, timeout, token):
+        calls.append(target)
+        if len(calls) == 2:
+            with open(bridge.result_file_path(token), "w", encoding="utf-8") as f:
+                f.write("original task result")
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "deliver_prompt", deliver)
+    answer, used = bridge.run_with_quota_failover(
+        "primary", lambda target: bridge.execute_sentinel_task(target, task_id, "audit", 1000))
+    assert calls == ["primary", "primary"]  # task, then result-only reminder
+    assert used == "primary"
+    assert answer == "original task result"
+    assert bridge.list_agent_quota_blocks() == []
+
+
+def test_unreadable_terminal_before_task_cannot_prove_new_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: (None, {}))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: "HTTP 429 Too Many Requests")
+    monkeypatch.setattr(bridge, "deliver_prompt", lambda *a: {"ok": True})
+    with pytest.raises(bridge.SentinelResultMissingError):
+        bridge.execute_sentinel_task("primary", "no-snapshot", "audit", 1000)
+
+
+def test_quota_refusal_of_result_reminder_does_not_replay_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: ("", {}))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: "")
+    calls = []
+
+    def deliver(target, prompt, timeout, token):
+        calls.append(target)
+        if len(calls) == 2:
+            raise bridge.AgentQuotaExhaustedError(target, "insufficient credits")
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "deliver_prompt", deliver)
+    monkeypatch.setattr(bridge, "quota_failover_candidates", lambda *a: ["backup"])
+    with pytest.raises(bridge.SentinelResultMissingError) as failure:
+        bridge.run_with_quota_failover("primary", lambda target:
+            bridge.execute_sentinel_task(target, "reminder-refused", "audit", 1000))
+    assert calls == ["primary", "primary"]
+    assert failure.value.reason == "result_delivery_refused"
 
 
 def test_resolve_agent_falls_back_to_a_unique_runtime_family(monkeypatch):
@@ -3864,7 +4017,7 @@ def test_a_size_limit_is_reported_as_one_not_as_a_missing_file(tmp_path, monkeyp
         if args[1] == "prompt":
             prompts.append(args)
         if args[1] == "read":
-            return {"ok": True, "stdout": SIZE_LIMIT_TAIL, "stderr": ""}
+            return {"ok": True, "stdout": SIZE_LIMIT_TAIL if prompts else "", "stderr": ""}
         return {"ok": True, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr(bridge, "run_herdr", fake)

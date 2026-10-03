@@ -81,7 +81,8 @@ RESULT_DIR = os.environ.get(
 
 # How long an uncollected result file survives before the startup sweep
 # takes it. Only failed deliveries ever reach this age -- a collected file
-# is deleted the moment it is read. 0 disables the sweep.
+# is deleted after persistence or a successful synchronous response.
+# 0 disables the sweep.
 RESULT_RETENTION_DAYS = int(os.environ.get("SENTINEL_RESULT_RETENTION_DAYS", "7"))
 
 # Budget for the one reminder sent when the agent finished but never wrote
@@ -945,11 +946,6 @@ def requeue_task(task_id):
 
 
 def complete_task(task_id, result_text, note=None):
-    # The task is over, so its progress no longer describes anything.
-    # Left in place, every finished task would leak one -- the same leak
-    # the result sweep had to be built for.
-    discard_progress_file(task_id)
-
     # `note` rides in error_text, as a late delivery's does: a finished task
     # that still has something the reader should know.
     with db_session() as conn:
@@ -959,6 +955,10 @@ def complete_task(task_id, result_text, note=None):
                 error_text = COALESCE(?, error_text), finished_at = ?
             WHERE task_id = ?
         """, (result_text, note, now_iso(), task_id))
+
+    # The file is the recovery copy until the transaction commits.
+    discard_result_file(task_id)
+    discard_progress_file(task_id)
 
 
 def routing_note(requested, used):
@@ -1017,6 +1017,7 @@ def quota_exhausted_task(task_id, error_text):
 
 
 def mark_agent_quota_blocked(agent_name, detail):
+    agent_name = live_agent_aliases(agent_name)[0]
     with db_session() as conn:
         conn.execute("""
             INSERT INTO quota_blocks (agent, detected_at, detail)
@@ -1062,24 +1063,22 @@ def _quota_block_expired(block):
 
 
 def get_agent_quota_block(agent_name):
+    aliases = live_agent_aliases(agent_name)
+    placeholders = ", ".join("?" for _ in aliases)
     with db_session() as conn:
-        row = conn.execute(
-            "SELECT * FROM quota_blocks WHERE agent = ?", (agent_name,)
-        ).fetchone()
-
-    if row is None:
-        return None
-
-    block = dict(row)
-
-    if _quota_block_expired(block):
-        # Drop it rather than just ignoring it, so /quota, the worker and
-        # the failover path cannot disagree about whether it still holds.
-        clear_agent_quota_blocks(agent_name)
-        return None
-
-    block["kind"] = provider_failure_kind(block.get("detail"))
-    return block
+        rows = conn.execute(
+            f"SELECT * FROM quota_blocks WHERE agent IN ({placeholders}) "
+            "ORDER BY detected_at DESC", aliases,
+        ).fetchall()
+        active = None
+        for row in rows:
+            block = dict(row)
+            if _quota_block_expired(block):
+                conn.execute("DELETE FROM quota_blocks WHERE agent = ?", (block["agent"],))
+            elif active is None:
+                block["kind"] = provider_failure_kind(block.get("detail"))
+                active = block
+    return active
 
 
 def list_agent_quota_blocks():
@@ -1092,7 +1091,9 @@ def list_agent_quota_blocks():
     for row in rows:
         block = dict(row)
         if _quota_block_expired(block):
-            clear_agent_quota_blocks(block["agent"])
+            # Expiring one legacy alias must not clear another active row.
+            with db_session() as conn:
+                conn.execute("DELETE FROM quota_blocks WHERE agent = ?", (block["agent"],))
             continue
         block["kind"] = provider_failure_kind(block.get("detail"))
         live.append(block)
@@ -1101,12 +1102,14 @@ def list_agent_quota_blocks():
 
 
 def clear_agent_quota_blocks(agent_name=None):
+    aliases = live_agent_aliases(agent_name) if agent_name is not None else None
     with db_session() as conn:
         if agent_name is None:
             cursor = conn.execute("DELETE FROM quota_blocks")
         else:
             cursor = conn.execute(
-                "DELETE FROM quota_blocks WHERE agent = ?", (agent_name,)
+                "DELETE FROM quota_blocks WHERE agent IN ("
+                + ", ".join("?" for _ in aliases) + ")", aliases,
             )
 
     return cursor.rowcount
@@ -1127,11 +1130,17 @@ AVAILABLE_STATES = {
 
 
 def get_agent_lock(agent_name):
+    # Include old queued rows, which can still carry a pane id alias.
+    aliases = live_agent_aliases(agent_name)
     with _agent_locks_guard:
-        lock = _agent_locks.get(agent_name)
+        lock = next((_agent_locks[alias] for alias in aliases
+                     if alias in _agent_locks), None)
         if lock is None:
             lock = threading.Lock()
-            _agent_locks[agent_name] = lock
+        # Remember both addresses so a temporary discovery outage, or a
+        # name disappearing, cannot give a known pane a second lock.
+        for alias in aliases:
+            _agent_locks[alias] = lock
         return lock
 
 
@@ -1176,6 +1185,20 @@ def agent_priority_rank(agent):
 def agent_identifiers(agent):
     """Every string herdr will accept as a target for this agent."""
     return [v for v in (agent.get("name"), agent.get("pane_id")) if v]
+
+
+def live_agent_aliases(identifier):
+    """Canonical address first; keep offline circuits/rows addressable too."""
+    try:
+        agents, _ = list_agents()
+    except Exception:
+        agents = None
+    for agent in agents or ():
+        if isinstance(agent, dict):
+            aliases = agent_identifiers(agent)
+            if identifier in aliases:
+                return aliases
+    return [identifier]
 
 
 def describe_live_agents(agents):
@@ -1261,7 +1284,7 @@ def resolve_agent(identifier):
 
     for agent in agents:
         if identifier in agent_identifiers(agent):
-            return identifier
+            return agent_identifiers(agent)[0]
 
     # Nothing matched exactly. A runtime family ("opencode", "claude")
     # outlives both the name and the pane id, so it is the one identifier
@@ -1684,6 +1707,13 @@ def result_dir_scope_warning():
     )
 
 
+def discard_result_file(task_id):
+    try:
+        os.remove(result_file_path(task_id))
+    except OSError:
+        pass
+
+
 def read_result_file(task_id, cleanup=True):
     """Return the agent's answer, or None if it never wrote one."""
     path = result_file_path(task_id)
@@ -1698,12 +1728,7 @@ def read_result_file(task_id, cleanup=True):
         return None
 
     if cleanup:
-        try:
-            os.remove(path)
-        except OSError:
-            # A leftover file is untidy, not a failure -- the content is
-            # already in hand and the name is task-unique either way.
-            pass
+        discard_result_file(task_id)
 
     return content or None
 
@@ -1857,8 +1882,9 @@ def quota_failover_candidates(primary_agent):
                 names.append(identifiers[0])
 
     candidates = []
+    primary_aliases = agent_identifiers(by_id.get(primary_agent, {}))
     for name in names:
-        if name == primary_agent or name not in by_id:
+        if name == primary_agent or name in primary_aliases or name not in by_id:
             continue
 
         # A configured allowlist is an operator's explicit decision to use
@@ -1869,7 +1895,9 @@ def quota_failover_candidates(primary_agent):
             if not primary_family or not family or family == primary_family:
                 continue
 
-        candidates.append(name)
+        canonical = agent_identifiers(by_id[name])[0]
+        if canonical not in candidates:
+            candidates.append(canonical)
 
     if QUOTA_FAILOVER_AGENTS:
         # An explicit allowlist is already an ordered operator decision.
@@ -2177,10 +2205,10 @@ def read_terminal(agent_name, read_lines, source=None, timeout=10):
     return screen, "visible", WORKING_READ_NOTE
 
 
-def _terminal_read(agent_name, read_lines):
+def _terminal_read(agent_name, read_lines, timeout=60):
     """(text, None) if the terminal could be read, else (None, why)."""
     try:
-        result, _, _ = read_terminal(agent_name, read_lines, timeout=60)
+        result, _, _ = read_terminal(agent_name, read_lines, timeout=timeout)
     except Exception as e:
         return None, f"unable to read terminal for diagnostics: {e}"
 
@@ -2205,6 +2233,8 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
                           slurm_policy=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
 
+    # Old terminal errors are not evidence that this request was refused.
+    before, _ = _terminal_read(agent_name, read_lines, 10)
     turn_began = time.monotonic()
     deliver_prompt(
         agent_name,
@@ -2214,15 +2244,17 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
     )
     turn_sec = time.monotonic() - turn_began
 
-    response = read_result_file(task_id)
+    response = read_result_file(task_id, cleanup=False)
 
     if response is None:
         terminal_tail = _read_terminal_tail(agent_name, read_lines)
 
-        # `ignore=task`: the terminal echoes the delegated task back, so
-        # without this a task about rate limits would read as the agent
-        # having hit one -- and that would durably circuit-break the agent.
-        detail = quota_error_detail(terminal_tail, ignore=task)
+        # Without a before snapshot, delivery remains uncertain: missing
+        # output must not send already-executed work to another agent.
+        detail = (
+            fresh_provider_refusal(before, terminal_tail, ignore=task)
+            if before is not None else None
+        )
         if detail:
             raise AgentQuotaExhaustedError(
                 agent_name, detail, raw_output=terminal_tail
@@ -2243,14 +2275,25 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
             f"sending reminder (agent={agent_name})"
         )
 
-        deliver_prompt(
-            agent_name,
-            build_result_reminder_prompt(task_id),
-            RESULT_REMINDER_TIMEOUT_MS,
-            task_id,
-        )
+        try:
+            deliver_prompt(
+                agent_name,
+                build_result_reminder_prompt(task_id),
+                RESULT_REMINDER_TIMEOUT_MS,
+                task_id,
+            )
+        except AgentQuotaExhaustedError as error:
+            # The original task may already have run. A refusal of its
+            # result-only reminder cannot justify replaying that task.
+            raise SentinelResultMissingError(
+                "The result-only reminder was refused by the provider. "
+                "The original task may already have executed; do not retry "
+                "it on another agent without checking its effects.",
+                raw_output=error.raw_output,
+                reason="result_delivery_refused",
+            ) from error
 
-        response = read_result_file(task_id)
+        response = read_result_file(task_id, cleanup=False)
 
     if response is None and turn_sec < QUICK_END_SEC:
         # Too quick to have run anything. Say that, instead of sending the
@@ -3330,6 +3373,10 @@ class Handler(BaseHTTPRequestHandler):
                 "agent": used_agent,
                 "result": {"text": result_text},
             })
+            # Synchronous asks have no completion transaction. Keep their
+            # recovery copy until the response has been written successfully.
+            discard_result_file(task_id)
+            discard_progress_file(task_id)
             return
 
         except QuotaFailoverExhaustedError as e:
