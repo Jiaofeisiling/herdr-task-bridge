@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import signal
@@ -14,12 +15,12 @@ import uuid
 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 26
+BRIDGE_VERSION = 27
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -81,7 +82,8 @@ RESULT_DIR = os.environ.get(
 
 # How long an uncollected result file survives before the startup sweep
 # takes it. Only failed deliveries ever reach this age -- a collected file
-# is deleted the moment it is read. 0 disables the sweep.
+# is deleted after persistence or a successful synchronous response.
+# 0 disables the sweep.
 RESULT_RETENTION_DAYS = int(os.environ.get("SENTINEL_RESULT_RETENTION_DAYS", "7"))
 
 # Budget for the one reminder sent when the agent finished but never wrote
@@ -234,6 +236,27 @@ def validate_slurm_policy(policy):
 
     return policy
 
+# What may become of a queued task whose agent no longer exists. `none` is the
+# default and fails it, since sending work to the wrong agent is worse than not
+# sending it; `any` is the caller saying it does not care which agent runs it.
+REROUTE_POLICIES = ("none", "any")
+
+
+def validate_reroute(policy):
+    if policy is None:
+        return "none"
+
+    if policy not in REROUTE_POLICIES:
+        # Never a quiet fallback to the default, for the same reason as
+        # validate_slurm_policy: a typo must not change what was asked for.
+        raise ValueError(
+            f"reroute must be one of {', '.join(REROUTE_POLICIES)}, "
+            f"got {policy!r}"
+        )
+
+    return policy
+
+
 # Wordings of "this request is over a size its model or provider accepts". Kept apart
 # from the quota wordings because the remedy differs: a quota waits for a
 # reset, a size limit is cured by shrinking the session, and waiting never
@@ -312,7 +335,38 @@ STALE_TARGET_SEC = int(os.environ.get("SENTINEL_STALE_TARGET_SEC", "600"))
 
 TASK_STATUSES = (
     "queued", "running", "done", "error", "orphaned", "quota_exhausted",
+    "cancelled",
 )
+
+# The whole life of a task, in one place. Every status change goes through
+# transition(), which refuses anything not listed here.
+TASK_TRANSITIONS = {
+    # claimed by the worker; abandoned unsent; cancelled before it started
+    "queued": ("running", "error", "cancelled"),
+    "running": ("queued", "done", "error", "orphaned", "quota_exhausted"),
+    # Not final: a result that turns up late adopts them (adopt_late_result).
+    "error": ("done",),
+    "orphaned": ("done",),
+    "done": (),
+    "quota_exhausted": (),
+    "cancelled": (),
+}
+
+# A task waiting on one of these can never be satisfied. `orphaned` is in the
+# list although a late result could still make it `done`: the dependent has not
+# been sent anywhere, so cancelling it is safe, and running it on an unknown
+# outcome is not.
+FAILED_DEPENDENCY_STATUSES = ("error", "orphaned", "quota_exhausted", "cancelled")
+
+MAX_DEPENDENCIES = 20
+WORKFLOW_ID_MAX_LENGTH = 100
+
+# What a transition may write alongside the status. A whitelist because the
+# names are spliced into the SQL.
+_TRANSITION_COLUMNS = frozenset({
+    "started_at", "finished_at", "result_text", "result_json", "error_text",
+    "recovered_at",
+})
 TASKS_LIMIT_DEFAULT = 20
 TASKS_LIMIT_MAX = 200
 
@@ -424,41 +478,86 @@ class IdempotencyConflictError(RuntimeError):
     pass
 
 
-def validate_idempotency_key(key):
-    """A caller-chosen key naming one logical operation across its retries."""
-    if key is None:
+def _validate_label(value, name, max_length):
+    """A caller-chosen string: present, bounded, and free of control characters."""
+    if value is None:
         return None
 
-    if not isinstance(key, str):
-        raise ValueError("idempotency_key must be a string")
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
 
-    key = key.strip()
+    value = value.strip()
 
-    if not key:
-        raise ValueError("idempotency_key cannot be empty")
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
 
-    if len(key) > 255:
-        raise ValueError("idempotency_key cannot exceed 255 characters")
+    if len(value) > max_length:
+        raise ValueError(f"{name} cannot exceed {max_length} characters")
 
-    if any(ord(char) < 32 or ord(char) == 127 for char in key):
-        raise ValueError("idempotency_key cannot contain control characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{name} cannot contain control characters")
 
-    return key
+    return value
 
 
-def request_fingerprint(task, agent, slurm_policy, timeout_ms):
+def validate_idempotency_key(key):
+    """A caller-chosen key naming one logical operation across its retries."""
+    return _validate_label(key, "idempotency_key", 255)
+
+
+def validate_workflow_id(workflow_id):
+    """A caller-chosen label grouping the tasks of one piece of work."""
+    return _validate_label(workflow_id, "workflow_id", WORKFLOW_ID_MAX_LENGTH)
+
+
+def validate_depends_on(depends_on):
+    """The task ids a new task waits on, de-duplicated, in the order given."""
+    if depends_on is None:
+        return ()
+
+    if not isinstance(depends_on, list):
+        raise ValueError("depends_on must be a list of task ids")
+
+    for task_id in depends_on:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("depends_on must contain only non-empty task ids")
+
+    unique = tuple(dict.fromkeys(t.strip() for t in depends_on))
+
+    if len(unique) > MAX_DEPENDENCIES:
+        raise ValueError(
+            f"depends_on cannot name more than {MAX_DEPENDENCIES} tasks"
+        )
+
+    return unique
+
+
+def request_fingerprint(task, agent, slurm_policy, timeout_ms, reroute="none",
+                        workflow_id=None, depends_on=()):
     """What makes two requests 'the same' for idempotency purposes.
 
     Built from what the caller *asked for*, not what the bridge resolved it
     to: the agent as named (or left unnamed), and the policy as given. A
     retry has to match even if the live agent set changed in between, or a
     harmless retry would be refused as a different request.
+
+    The options added since are part of it only when set, and as named keys so
+    that one cannot pose as another, so a key stored before they existed still
+    matches its own retries.
     """
-    canonical = json.dumps(
-        [task, agent, slurm_policy, timeout_ms],
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+    parts = [task, agent, slurm_policy, timeout_ms]
+
+    extras = {}
+    if reroute != "none":
+        extras["reroute"] = reroute
+    if workflow_id:
+        extras["workflow_id"] = workflow_id
+    if depends_on:
+        extras["depends_on"] = sorted(depends_on)
+    if extras:
+        parts.append(extras)
+
+    canonical = json.dumps(parts, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -524,6 +623,7 @@ def init_db():
                 timeout_ms INTEGER NOT NULL,
 
                 result_text TEXT,
+                result_json TEXT,
                 error_text TEXT,
 
                 slurm_policy TEXT,
@@ -531,7 +631,40 @@ def init_db():
                 idempotency_key TEXT,
                 request_fingerprint TEXT,
 
-                recovered_at TEXT
+                recovered_at TEXT,
+
+                reroute TEXT,
+                rerouted_from TEXT,
+
+                workflow_id TEXT
+            )
+        """)
+
+        # Every status change, written in the transaction that makes it. `seq`
+        # only ever grows, so a reader that remembers the last one it saw can
+        # ask for exactly what came after.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                workflow_id TEXT,
+                at TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_events_task "
+            "ON task_events(task_id)"
+        )
+
+        # Which tasks a task waits on. A separate table because the scheduler
+        # has to ask "is everything this waits on done?" in SQL.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_deps (
+                task_id TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                PRIMARY KEY (task_id, depends_on)
             )
         """)
 
@@ -552,6 +685,25 @@ def init_db():
 
         if "recovered_at" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN recovered_at TEXT")
+
+        # NULL reads as "none": rows from before the option were never
+        # re-pointed and still are not.
+        if "reroute" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN reroute TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN rerouted_from TEXT")
+
+        if "workflow_id" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN workflow_id TEXT")
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_workflow_id
+            ON tasks(workflow_id) WHERE workflow_id IS NOT NULL
+        """)
+
+        # Rows from before structured results stay NULL here: they were
+        # never claimed to be structured, so they read back as plain text.
+        if "result_json" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN result_json TEXT")
 
         if "idempotency_key" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
@@ -580,17 +732,129 @@ def init_db():
 
         # 如果 bridge 在一个任务执行期间崩溃，
         # 千万不要自动重新运行它，否则可能重复执行危险操作。
-        conn.execute("""
-            UPDATE tasks
-            SET
-                status = 'orphaned',
-                finished_at = ?,
-                error_text = COALESCE(
-                    error_text,
-                    'Bridge restarted while this task was running. Sentinel may have partially or fully executed it.'
-                )
-            WHERE status = 'running'
-        """, (now_iso(),))
+        _transition_where(conn, "orphaned", "running", {
+            "finished_at": now_iso(),
+            "error_text": (
+                "Bridge restarted while this task was running. Sentinel may "
+                "have partially or fully executed it."
+            ),
+        })
+
+
+class DependencyError(RuntimeError):
+    """A new task names a dependency that cannot be waited on.
+
+    `reason` is `unknown_dependency` (no such task) or `dependency_failed`
+    (it has already ended in a state it will not recover from).
+    """
+
+    def __init__(self, reason, task_ids):
+        self.reason = reason
+        self.task_ids = list(task_ids)
+        super().__init__(
+            "unknown task(s) named in depends_on: " + ", ".join(self.task_ids)
+            if reason == "unknown_dependency" else
+            "depends_on names task(s) that have already failed, so this "
+            "could never run: " + ", ".join(self.task_ids)
+        )
+
+
+def _check_dependencies(conn, depends_on):
+    """Refuse a dependency that does not exist or has already failed."""
+    if not depends_on:
+        return
+
+    marks = ", ".join("?" for _ in depends_on)
+    found = {
+        row["task_id"]: row["status"] for row in conn.execute(
+            f"SELECT task_id, status FROM tasks WHERE task_id IN ({marks})",
+            list(depends_on),
+        )
+    }
+
+    unknown = [t for t in depends_on if t not in found]
+    if unknown:
+        raise DependencyError("unknown_dependency", unknown)
+
+    failed = [
+        t for t in depends_on if found[t] in FAILED_DEPENDENCY_STATUSES
+    ]
+    if failed:
+        raise DependencyError("dependency_failed", failed)
+
+
+def list_dependencies(task_id):
+    """The task ids this task waits on, in the order they were given."""
+    with db_session() as conn:
+        return [
+            row["depends_on"] for row in conn.execute(
+                "SELECT depends_on FROM task_deps WHERE task_id = ? "
+                "ORDER BY rowid",
+                (task_id,),
+            )
+        ]
+
+
+def dependencies_of(task_ids):
+    """{task_id: [what it waits on]} for several tasks, in one query."""
+    found = {task_id: [] for task_id in task_ids}
+
+    if not found:
+        return found
+
+    marks = ", ".join("?" for _ in found)
+    with db_session() as conn:
+        for row in conn.execute(
+            f"SELECT task_id, depends_on FROM task_deps "
+            f"WHERE task_id IN ({marks}) ORDER BY rowid",
+            list(found),
+        ):
+            found[row["task_id"]].append(row["depends_on"])
+
+    return found
+
+
+def unmet_dependencies(task_id):
+    """(task_id, status) of everything this task waits on that is not done."""
+    with db_session() as conn:
+        return [
+            (row["task_id"], row["status"]) for row in conn.execute("""
+                SELECT u.task_id AS task_id, u.status AS status
+                FROM task_deps d JOIN tasks u ON u.task_id = d.depends_on
+                WHERE d.task_id = ? AND u.status != 'done'
+                ORDER BY d.rowid
+            """, (task_id,))
+        ]
+
+
+def list_workflow_tasks(workflow_id):
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE workflow_id = ? "
+            "ORDER BY created_at ASC, rowid ASC",
+            (workflow_id,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def workflow_state(counts):
+    """Where a workflow stands, from its tasks' statuses.
+
+    `in_progress` while anything can still move, then `done` only if every
+    task is, and otherwise `failed`: it stopped short of done.
+    """
+    if counts.get("queued") or counts.get("running"):
+        return "in_progress"
+
+    if set(counts) == {"done"}:
+        return "done"
+
+    # Stopped on purpose, nothing having gone wrong.
+    if set(counts) == {"cancelled"}:
+        return "cancelled"
+
+    return "failed"
 
 
 class QueueFullError(RuntimeError):
@@ -603,18 +867,130 @@ class QueueFullError(RuntimeError):
 
 
 def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None,
-                 idempotency_key=None, fingerprint=None):
+                 idempotency_key=None, fingerprint=None, reroute=None,
+                 workflow_id=None):
     conn.execute("""
         INSERT INTO tasks (
             task_id, task, agent, status, created_at, timeout_ms, slurm_policy,
-            idempotency_key, request_fingerprint
+            idempotency_key, request_fingerprint, reroute, workflow_id
         )
-        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
     """, (
         task_id, task, agent_name, now_iso(), timeout_ms,
         validate_slurm_policy(slurm_policy),
-        idempotency_key, fingerprint,
+        idempotency_key, fingerprint, validate_reroute(reroute), workflow_id,
     ))
+
+    _record_event(conn, task_id, workflow_id, None, "queued")
+
+
+# What the agent itself says about the work, as opposed to `status`, which says
+# whether the bridge delivered the result. A task can be `done` here and
+# `failed` there: one `done` must never stand in for both.
+RESULT_OUTCOMES = ("success", "partial", "failed", "blocked")
+_RESULT_LIST_FIELDS = ("job_ids", "artifacts", "warnings", "changed_files")
+
+# Agents wrap JSON in a markdown fence far more often than not.
+_FENCED_BLOCK = re.compile(r"^```[A-Za-z]*[ \t]*\n(.*?)\n?```$", re.DOTALL)
+
+
+def parse_structured_result(text):
+    """Read an agent's result as a JSON object, if that is what it wrote.
+
+    Returns (data, problem). Prose is not a problem: (None, None). Something
+    that tried to be an object and was not -- cut off, a field of the wrong
+    type -- is (None, why), so the caller can say so; it is never an error,
+    because the work was delivered and only the format slipped.
+    """
+    body = (text or "").strip()
+
+    fenced = _FENCED_BLOCK.match(body)
+    if fenced:
+        body = fenced.group(1).strip()
+
+    if not body.startswith("{"):
+        return None, None
+
+    try:
+        raw = json.loads(body)
+    except ValueError as e:
+        return None, f"could not parse as JSON ({e})"
+
+    summary = raw.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None, "'summary' is required and must be a non-empty string"
+
+    status = raw.get("status")
+    if status is not None and status not in RESULT_OUTCOMES:
+        return None, (
+            f"'status' must be one of {', '.join(RESULT_OUTCOMES)}, "
+            f"got {status!r}"
+        )
+
+    data = {"summary": summary, "status": status}
+
+    for field in _RESULT_LIST_FIELDS:
+        value = raw.get(field, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return None, f"'{field}' must be a list of strings"
+        data[field] = value
+
+    metrics = raw.get("metrics", {})
+    if not isinstance(metrics, dict) or not all(
+        isinstance(v, (str, int, float)) for v in metrics.values()
+    ):
+        return None, "'metrics' must be an object of numbers and strings"
+
+    # json.loads reads NaN and Infinity, and the API would write them back out
+    # as bare tokens that are not JSON, which a strict client rejects along
+    # with everything else in the reply.
+    if any(isinstance(v, float) and not math.isfinite(v) for v in metrics.values()):
+        return None, "'metrics' values must be finite numbers"
+    data["metrics"] = metrics
+
+    return data, None
+
+
+def _result_columns(result_text):
+    """The columns that record a result, plus a note if it fell short.
+
+    The text is always kept as delivered; the structured form is read out of
+    it, never put in its place.
+    """
+    data, problem = parse_structured_result(result_text)
+
+    columns = {
+        "result_text": result_text,
+        "result_json": json.dumps(data, ensure_ascii=False) if data else None,
+    }
+    note = (
+        f"Result kept as plain text, not read as structured JSON: {problem}."
+        if problem else None
+    )
+
+    return columns, note
+
+
+def task_view(row):
+    """A task row as the API serves it.
+
+    `result_json` is storage; callers get `result_data` and `result_format`
+    instead. A row without it is text, whatever its text looks like: it was
+    never claimed to be anything else.
+    """
+    view = dict(row)
+    raw = view.pop("result_json", None)
+
+    view["result_data"] = json.loads(raw) if raw else None
+
+    if raw:
+        view["result_format"] = "json"
+    elif view.get("result_text") is not None:
+        view["result_format"] = "text"
+    else:
+        view["result_format"] = None
+
+    return view
 
 
 # Task states in which a delivered result can still turn up. A queued or
@@ -653,19 +1029,16 @@ def adopt_late_result(task_id):
         f"waiting, and was recovered at {now_iso()}."
     )
 
-    with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'done',
-                result_text = ?,
-                recovered_at = ?,
-                error_text = CASE
-                    WHEN error_text IS NULL OR error_text = '' THEN ?
-                    ELSE error_text || char(10) || ?
-                END
-            WHERE task_id = ? AND status IN ('error', 'orphaned')
-        """, (content, now_iso(), note, note, task_id))
-        adopted = cursor.rowcount == 1
+    columns, format_note = _result_columns(content)
+
+    adopted = transition(
+        task_id, "done", LATE_RESULT_STATUSES,
+        recovered_at=now_iso(),
+        error_text="\n".join(
+            n for n in (task["error_text"], note, format_note) if n
+        ),
+        **columns,
+    )
 
     if not adopted:
         return None   # another caller got there first
@@ -722,6 +1095,7 @@ def record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
                 task_id, task, agent_name, status, now, now, now, timeout_ms,
                 error_text, validate_slurm_policy(slurm_policy),
             ))
+            _record_event(conn, task_id, None, None, status)
         return True
     except Exception as e:
         print(f"[ask {task_id}] could not record the failure: {e}")
@@ -761,11 +1135,14 @@ def check_replay(existing, fingerprint):
     return existing
 
 
-def create_task(task, timeout_ms, agent_name, slurm_policy=None):
+def create_task(task, timeout_ms, agent_name, slurm_policy=None, reroute=None):
     task_id = str(uuid.uuid4())
 
     with db_session() as conn:
-        _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy)
+        _insert_task(
+            conn, task_id, task, timeout_ms, agent_name, slurm_policy,
+            reroute=reroute,
+        )
 
     return task_id
 
@@ -778,7 +1155,8 @@ def create_task_if_queue_available(task, timeout_ms, agent_name, slurm_policy=No
 
 
 def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
-                 idempotency_key=None, fingerprint=None):
+                 idempotency_key=None, fingerprint=None, reroute=None,
+                 workflow_id=None, depends_on=()):
     """Atomically enforce the queue cap and enqueue one task.
 
     Returns (task_id, replayed).
@@ -806,6 +1184,9 @@ def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
             if row:
                 return check_replay(dict(row), fingerprint)["task_id"], True
 
+        # A mistake in the request, so it is reported ahead of a full queue.
+        _check_dependencies(conn, depends_on)
+
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM tasks WHERE status = 'queued'"
         ).fetchone()
@@ -816,7 +1197,12 @@ def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
 
         _insert_task(
             conn, task_id, task, timeout_ms, agent_name, slurm_policy,
-            idempotency_key, fingerprint,
+            idempotency_key, fingerprint, reroute, workflow_id,
+        )
+
+        conn.executemany(
+            "INSERT INTO task_deps (task_id, depends_on) VALUES (?, ?)",
+            [(task_id, dependency) for dependency in depends_on],
         )
 
     return task_id, False
@@ -868,14 +1254,215 @@ def validate_tasks_query(query):
     return limit, status
 
 
+def _transition_where(conn, to, expect, columns, task_id=None):
+    """Move every task in the `expect` state(s) to `to`; return how many moved.
+
+    The one place that writes a status. `expect` makes it a compare-and-set:
+    a task that is no longer in that state is left alone, which is how two
+    paths racing to finish the same task cannot both win. A move the table
+    does not allow is a bug in the caller rather than a lost race, and raises.
+    """
+    sources = (expect,) if isinstance(expect, str) else tuple(expect)
+
+    for source in sources:
+        if to not in TASK_TRANSITIONS.get(source, ()):
+            raise ValueError(f"illegal task transition: {source} -> {to}")
+
+    unknown = set(columns) - _TRANSITION_COLUMNS
+    if unknown:
+        raise ValueError(
+            f"a transition cannot set: {', '.join(sorted(unknown))}"
+        )
+
+    assignments = ", ".join(f"{name} = ?" for name in ("status", *columns))
+    where = f"status IN ({', '.join('?' for _ in sources)})"
+    match = list(sources)
+
+    if task_id is not None:
+        where += " AND task_id = ?"
+        match.append(task_id)
+
+    # Take the write lock before looking, so the rows seen are the rows moved
+    # and each event can name the status it really replaced.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+    moving = conn.execute(
+        f"SELECT task_id, workflow_id, status FROM tasks WHERE {where}", match
+    ).fetchall()
+
+    if not moving:
+        return 0
+
+    conn.execute(
+        f"UPDATE tasks SET {assignments} WHERE {where}",
+        [to, *columns.values(), *match],
+    )
+
+    for row in moving:
+        _record_event(conn, row["task_id"], row["workflow_id"], row["status"], to)
+
+    return len(moving)
+
+
+def _record_event(conn, task_id, workflow_id, from_status, to_status):
+    conn.execute(
+        "INSERT INTO task_events "
+        "(task_id, workflow_id, at, from_status, to_status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, workflow_id, now_iso(), from_status, to_status),
+    )
+
+
+EVENTS_LIMIT_DEFAULT = 100
+EVENTS_LIMIT_MAX = 500
+EVENTS_WAIT_MAX_SEC = 30
+EVENTS_POLL_SEC = 0.25
+EVENTS_CURSOR_MAX = 2**63 - 1
+
+
+def list_events(after=0, limit=EVENTS_LIMIT_DEFAULT, task_id=None,
+                workflow_id=None):
+    """Events with a `seq` greater than `after`, oldest first."""
+    clauses, params = ["seq > ?"], [after]
+
+    if task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+
+    if workflow_id is not None:
+        clauses.append("workflow_id = ?")
+        params.append(workflow_id)
+
+    with db_session() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM task_events WHERE {' AND '.join(clauses)} "
+            "ORDER BY seq ASC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def validate_events_query(query):
+    """(after, limit, wait, task_id, workflow_id) from a parsed query string."""
+    def first(name):
+        values = query.get(name)
+        return values[0] if values else None
+
+    after = int(first("after") or 0)
+    # The upper bound is SQLite's largest integer; beyond it the query raises
+    # rather than finds nothing.
+    if not (0 <= after <= EVENTS_CURSOR_MAX):
+        raise ValueError(
+            f"after must be between 0 and {EVENTS_CURSOR_MAX}, got {after}"
+        )
+
+    limit = EVENTS_LIMIT_DEFAULT
+    if first("limit") is not None:
+        limit = int(first("limit"))
+        if not (1 <= limit <= EVENTS_LIMIT_MAX):
+            raise ValueError(
+                f"limit must be between 1 and {EVENTS_LIMIT_MAX}, got {limit}"
+            )
+
+    wait = 0.0
+    if first("wait") is not None:
+        wait = float(first("wait"))
+        if not (0 <= wait <= EVENTS_WAIT_MAX_SEC):
+            raise ValueError(
+                f"wait must be between 0 and {EVENTS_WAIT_MAX_SEC} seconds, "
+                f"got {wait:g}"
+            )
+
+    return after, limit, wait, first("task_id"), first("workflow_id")
+
+
+def transition(task_id, to, expect, **columns):
+    """Atomically move one task from `expect` to `to`. True if it moved."""
+    with db_session() as conn:
+        return _transition_where(conn, to, expect, columns, task_id) == 1
+
+
 def abandon_task(task_id, error_text):
     """Fail a task that is still queued. Never touches one that has started."""
+    return transition(
+        task_id, "error", "queued",
+        error_text=error_text, finished_at=now_iso(),
+    )
+
+
+def cancel_task(task_id, reason="Cancelled before it started."):
+    """Cancel a task that is still queued. True if it was cancelled.
+
+    Nothing that has been sent to an agent can be called back: the bridge has
+    no way to stop one mid-task, so a started task is left alone.
+    """
+    return transition(
+        task_id, "cancelled", "queued",
+        error_text=f"{reason} It was never sent to any agent, so "
+                   "resubmitting is safe.",
+        finished_at=now_iso(),
+    )
+
+
+def cancel_blocked_tasks():
+    """Cancel queued tasks that wait on something that has failed.
+
+    Repeats until nothing more moves, so a failure reaches every descendant.
+    Returns how many were cancelled.
+    """
+    cancelled = 0
+    marks = ", ".join("?" for _ in FAILED_DEPENDENCY_STATUSES)
+
+    while True:
+        with db_session() as conn:
+            blocked = conn.execute(f"""
+                SELECT t.task_id AS task_id, u.task_id AS upstream,
+                       u.status AS upstream_status
+                FROM tasks t
+                JOIN task_deps d ON d.task_id = t.task_id
+                JOIN tasks u ON u.task_id = d.depends_on
+                WHERE t.status = 'queued' AND u.status IN ({marks})
+                GROUP BY t.task_id
+            """, FAILED_DEPENDENCY_STATUSES).fetchall()
+
+            moved = sum(
+                _transition_where(
+                    conn, "cancelled", "queued",
+                    {
+                        "error_text": (
+                            f"Cancelled before it started: it waits on "
+                            f"{row['upstream']}, which ended "
+                            f"{row['upstream_status']}. It was never sent to "
+                            "any agent, so resubmitting is safe."
+                        ),
+                        "finished_at": now_iso(),
+                    },
+                    task_id=row["task_id"],
+                )
+                for row in blocked
+            )
+
+        if not moved:
+            return cancelled
+
+        cancelled += moved
+
+
+def reroute_task(task_id, old_agent, new_agent):
+    """Point a queued task at a different agent. True if it moved.
+
+    Only while it is still queued: a task that has started was sent to its
+    agent, and is no longer the bridge's to redirect. The agent it was meant
+    for is kept in `rerouted_from`. Not a status change, so it stays off the
+    transition table.
+    """
     with db_session() as conn:
         cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'error', error_text = ?, finished_at = ?
-            WHERE task_id = ? AND status = 'queued'
-        """, (error_text, now_iso(), task_id))
+            UPDATE tasks SET agent = ?, rerouted_from = ?
+            WHERE task_id = ? AND status = 'queued' AND agent = ?
+        """, (new_agent, old_agent, task_id, old_agent))
 
         return cursor.rowcount == 1
 
@@ -910,10 +1497,18 @@ def peek_next_task(exclude_agents=()):
     placeholders = ", ".join("?" for _ in exclude_agents)
     where_agent = f"AND agent NOT IN ({placeholders})" if exclude_agents else ""
 
+    # A task is eligible only once everything it waits on is done. One that
+    # is not simply is not a candidate, so it never stands in front of a task
+    # that can run.
     with db_session() as conn:
         row = conn.execute(f"""
             SELECT * FROM tasks
             WHERE status = 'queued' {where_agent}
+            AND NOT EXISTS (
+                SELECT 1 FROM task_deps d
+                JOIN tasks upstream ON upstream.task_id = d.depends_on
+                WHERE d.task_id = tasks.task_id AND upstream.status != 'done'
+            )
             ORDER BY created_at ASC
             LIMIT 1
         """, exclude_agents).fetchone()
@@ -922,43 +1517,40 @@ def peek_next_task(exclude_agents=()):
 
 
 def claim_task(task_id):
-    with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'running', started_at = ?
-            WHERE task_id = ? AND status = 'queued'
-        """, (now_iso(), task_id))
-
-        return cursor.rowcount == 1
+    return transition(task_id, "running", "queued", started_at=now_iso())
 
 
 def requeue_task(task_id):
     """Return a claimed task to the queue when every fallback is busy."""
-    with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'queued', started_at = NULL, finished_at = NULL
-            WHERE task_id = ? AND status = 'running'
-        """, (task_id,))
-
-        return cursor.rowcount == 1
+    return transition(
+        task_id, "queued", "running", started_at=None, finished_at=None
+    )
 
 
 def complete_task(task_id, result_text, note=None):
-    # The task is over, so its progress no longer describes anything.
-    # Left in place, every finished task would leak one -- the same leak
-    # the result sweep had to be built for.
-    discard_progress_file(task_id)
+    """Finish a running task. False if it was no longer running.
 
-    # `note` rides in error_text, as a late delivery's does: a finished task
+    A task that is not running has already been settled some other way -- a
+    shutdown orphaned it, say, while the worker was still waiting on the agent.
+    Completing it anyway would overwrite that, and deleting the result file
+    would lose the only copy: it stays where adopt_late_result will find it.
+    """
+    columns, format_note = _result_columns(result_text)
+    columns["finished_at"] = now_iso()
+
+    # Notes ride in error_text, as a late delivery's does: a finished task
     # that still has something the reader should know.
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'done', result_text = ?,
-                error_text = COALESCE(?, error_text), finished_at = ?
-            WHERE task_id = ?
-        """, (result_text, note, now_iso(), task_id))
+    notes = "\n".join(n for n in (note, format_note) if n)
+    if notes:
+        columns["error_text"] = notes
+
+    if not transition(task_id, "done", "running", **columns):
+        return False
+
+    # The file is the recovery copy until the transaction commits.
+    discard_result_file(task_id)
+    discard_progress_file(task_id)
+    return True
 
 
 def routing_note(requested, used):
@@ -988,35 +1580,30 @@ def fail_task(task_id, error_text):
     # orphaned -- "may have run; do not retry" -- must not be overwritten by
     # the worker's own report of the same event: `error` says retrying is
     # safe, and which of the two arrived last was a race.
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'error', error_text = ?, finished_at = ?
-            WHERE task_id = ? AND status = 'running'
-        """, (error_text, now_iso(), task_id))
+    return transition(
+        task_id, "error", "running",
+        error_text=error_text, finished_at=now_iso(),
+    )
 
 
 def orphan_task(task_id, error_text):
     discard_progress_file(task_id)
 
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'orphaned', error_text = ?, finished_at = ?
-            WHERE task_id = ?
-        """, (error_text, now_iso(), task_id))
+    return transition(
+        task_id, "orphaned", "running",
+        error_text=error_text, finished_at=now_iso(),
+    )
 
 
 def quota_exhausted_task(task_id, error_text):
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'quota_exhausted', error_text = ?, finished_at = ?
-            WHERE task_id = ?
-        """, (error_text, now_iso(), task_id))
+    return transition(
+        task_id, "quota_exhausted", "running",
+        error_text=error_text, finished_at=now_iso(),
+    )
 
 
 def mark_agent_quota_blocked(agent_name, detail):
+    agent_name = live_agent_aliases(agent_name)[0]
     with db_session() as conn:
         conn.execute("""
             INSERT INTO quota_blocks (agent, detected_at, detail)
@@ -1062,24 +1649,22 @@ def _quota_block_expired(block):
 
 
 def get_agent_quota_block(agent_name):
+    aliases = live_agent_aliases(agent_name)
+    placeholders = ", ".join("?" for _ in aliases)
     with db_session() as conn:
-        row = conn.execute(
-            "SELECT * FROM quota_blocks WHERE agent = ?", (agent_name,)
-        ).fetchone()
-
-    if row is None:
-        return None
-
-    block = dict(row)
-
-    if _quota_block_expired(block):
-        # Drop it rather than just ignoring it, so /quota, the worker and
-        # the failover path cannot disagree about whether it still holds.
-        clear_agent_quota_blocks(agent_name)
-        return None
-
-    block["kind"] = provider_failure_kind(block.get("detail"))
-    return block
+        rows = conn.execute(
+            f"SELECT * FROM quota_blocks WHERE agent IN ({placeholders}) "
+            "ORDER BY detected_at DESC", aliases,
+        ).fetchall()
+        active = None
+        for row in rows:
+            block = dict(row)
+            if _quota_block_expired(block):
+                conn.execute("DELETE FROM quota_blocks WHERE agent = ?", (block["agent"],))
+            elif active is None:
+                block["kind"] = provider_failure_kind(block.get("detail"))
+                active = block
+    return active
 
 
 def list_agent_quota_blocks():
@@ -1092,7 +1677,9 @@ def list_agent_quota_blocks():
     for row in rows:
         block = dict(row)
         if _quota_block_expired(block):
-            clear_agent_quota_blocks(block["agent"])
+            # Expiring one legacy alias must not clear another active row.
+            with db_session() as conn:
+                conn.execute("DELETE FROM quota_blocks WHERE agent = ?", (block["agent"],))
             continue
         block["kind"] = provider_failure_kind(block.get("detail"))
         live.append(block)
@@ -1101,12 +1688,14 @@ def list_agent_quota_blocks():
 
 
 def clear_agent_quota_blocks(agent_name=None):
+    aliases = live_agent_aliases(agent_name) if agent_name is not None else None
     with db_session() as conn:
         if agent_name is None:
             cursor = conn.execute("DELETE FROM quota_blocks")
         else:
             cursor = conn.execute(
-                "DELETE FROM quota_blocks WHERE agent = ?", (agent_name,)
+                "DELETE FROM quota_blocks WHERE agent IN ("
+                + ", ".join("?" for _ in aliases) + ")", aliases,
             )
 
     return cursor.rowcount
@@ -1127,11 +1716,17 @@ AVAILABLE_STATES = {
 
 
 def get_agent_lock(agent_name):
+    # Include old queued rows, which can still carry a pane id alias.
+    aliases = live_agent_aliases(agent_name)
     with _agent_locks_guard:
-        lock = _agent_locks.get(agent_name)
+        lock = next((_agent_locks[alias] for alias in aliases
+                     if alias in _agent_locks), None)
         if lock is None:
             lock = threading.Lock()
-            _agent_locks[agent_name] = lock
+        # Remember both addresses so a temporary discovery outage, or a
+        # name disappearing, cannot give a known pane a second lock.
+        for alias in aliases:
+            _agent_locks[alias] = lock
         return lock
 
 
@@ -1176,6 +1771,34 @@ def agent_priority_rank(agent):
 def agent_identifiers(agent):
     """Every string herdr will accept as a target for this agent."""
     return [v for v in (agent.get("name"), agent.get("pane_id")) if v]
+
+
+def auto_pick_key(agent):
+    """Sort key for choosing an agent when the caller named none.
+
+    Being able to start now outranks being cheap, cost order decides among the
+    rest, and a stable identifier breaks the remaining ties so consecutive
+    defaults don't wander between agents for no visible reason.
+    """
+    return (
+        agent.get("agent_status") not in AVAILABLE_STATES,
+        agent_priority_rank(agent),
+        agent_identifiers(agent)[0],
+    )
+
+
+def live_agent_aliases(identifier):
+    """Canonical address first; keep offline circuits/rows addressable too."""
+    try:
+        agents, _ = list_agents()
+    except Exception:
+        agents = None
+    for agent in agents or ():
+        if isinstance(agent, dict):
+            aliases = agent_identifiers(agent)
+            if identifier in aliases:
+                return aliases
+    return [identifier]
 
 
 def describe_live_agents(agents):
@@ -1243,15 +1866,7 @@ def resolve_agent(identifier):
                 "work. Check `herdr agent list`."
             )
 
-        pick = min(
-            addressable,
-            key=lambda a: (
-                a.get("agent_status") not in AVAILABLE_STATES,
-                agent_priority_rank(a),
-                agent_identifiers(a)[0],
-            ),
-        )
-        return agent_identifiers(pick)[0]
+        return agent_identifiers(min(addressable, key=auto_pick_key))[0]
 
     if not agents:
         # herdr being down is a different failure with a different fix,
@@ -1261,7 +1876,7 @@ def resolve_agent(identifier):
 
     for agent in agents:
         if identifier in agent_identifiers(agent):
-            return identifier
+            return agent_identifiers(agent)[0]
 
     # Nothing matched exactly. A runtime family ("opencode", "claude")
     # outlives both the name and the pane id, so it is the one identifier
@@ -1495,45 +2110,76 @@ def ready_hint(agent_status):
     return None
 
 
-def abandon_unreachable_task(task_row):
-    """Fail a queued task whose target agent no longer exists. True if it did.
+def _reroute_target(live):
+    """The live agent an opted-in task should go to, or None.
+
+    The best one that can be addressed and whose provider is not blocked --
+    a task moved to an agent that would refuse it has gained nothing.
+    """
+    eligible = [
+        a for a in live
+        if agent_identifiers(a)
+        and not any(get_agent_quota_block(i) for i in agent_identifiers(a))
+    ]
+
+    if not eligible:
+        return None
+
+    return agent_identifiers(min(eligible, key=auto_pick_key))[0]
+
+
+def settle_unreachable_task(task_row):
+    """Deal with a queued task whose target agent no longer exists.
+
+    Returns "rerouted" or "abandoned", or None if the task was left alone.
 
     Conservative on every side: only after STALE_TARGET_SEC, only when herdr
     actually answered and listed no such agent (a herdr that cannot be asked
     proves nothing), and never for an agent that exists but is busy -- waiting
     for a free agent is the job, however long it takes.
 
-    It does not re-point the task at some other agent. resolve_agent() holds
-    that sending work to the wrong agent is worse than not sending it, and the
-    caller can choose. What it does do is say so, and say that nothing was sent.
+    By default it does not re-point the task at some other agent. resolve_agent()
+    holds that sending work to the wrong agent is worse than not sending it, and
+    the caller can choose. What it does do is say so, and say that nothing was
+    sent. A task submitted with reroute="any" is the caller choosing: it has
+    not started, so moving it cannot run anything twice.
     """
     age = _age_seconds(task_row["created_at"])
 
     if age is None or age < STALE_TARGET_SEC:
-        return False
+        return None
 
     try:
         agents, _ = list_agents()
     except Exception:
-        return False
+        return None
 
     if agents is None:
-        return False
+        return None
 
     live = [a for a in agents if isinstance(a, dict)]
     agent_name = task_row["agent"]
 
     if any(agent_name in agent_identifiers(a) for a in live):
-        return False
+        return None
 
-    return abandon_task(
+    if task_row.get("reroute") == "any":
+        target = _reroute_target(live)
+
+        if target and reroute_task(task_row["task_id"], agent_name, target):
+            return "rerouted"
+
+    if abandon_task(
         task_row["task_id"],
         f"The agent this task was queued for ('{agent_name}') no longer "
         f"exists -- herdr now lists {describe_live_agents(live)} -- so "
         "nothing could ever pick it up. It was never sent to any agent, so "
         "resubmitting is safe. (A herdr agent's name does not survive its "
         "process restarting; omit the agent and the bridge will choose one.)",
-    )
+    ):
+        return "abandoned"
+
+    return None
 
 
 def explain_queued(agent_name):
@@ -1684,6 +2330,13 @@ def result_dir_scope_warning():
     )
 
 
+def discard_result_file(task_id):
+    try:
+        os.remove(result_file_path(task_id))
+    except OSError:
+        pass
+
+
 def read_result_file(task_id, cleanup=True):
     """Return the agent's answer, or None if it never wrote one."""
     path = result_file_path(task_id)
@@ -1698,12 +2351,7 @@ def read_result_file(task_id, cleanup=True):
         return None
 
     if cleanup:
-        try:
-            os.remove(path)
-        except OSError:
-            # A leftover file is untidy, not a failure -- the content is
-            # already in hand and the name is task-unique either way.
-            pass
+        discard_result_file(task_id)
 
     return content or None
 
@@ -1857,8 +2505,9 @@ def quota_failover_candidates(primary_agent):
                 names.append(identifiers[0])
 
     candidates = []
+    primary_aliases = agent_identifiers(by_id.get(primary_agent, {}))
     for name in names:
-        if name == primary_agent or name not in by_id:
+        if name == primary_agent or name in primary_aliases or name not in by_id:
             continue
 
         # A configured allowlist is an operator's explicit decision to use
@@ -1869,7 +2518,9 @@ def quota_failover_candidates(primary_agent):
             if not primary_family or not family or family == primary_family:
                 continue
 
-        candidates.append(name)
+        canonical = agent_identifiers(by_id[name])[0]
+        if canonical not in candidates:
+            candidates.append(canonical)
 
     if QUOTA_FAILOVER_AGENTS:
         # An explicit allowlist is already an ordered operator decision.
@@ -2177,10 +2828,10 @@ def read_terminal(agent_name, read_lines, source=None, timeout=10):
     return screen, "visible", WORKING_READ_NOTE
 
 
-def _terminal_read(agent_name, read_lines):
+def _terminal_read(agent_name, read_lines, timeout=60):
     """(text, None) if the terminal could be read, else (None, why)."""
     try:
-        result, _, _ = read_terminal(agent_name, read_lines, timeout=60)
+        result, _, _ = read_terminal(agent_name, read_lines, timeout=timeout)
     except Exception as e:
         return None, f"unable to read terminal for diagnostics: {e}"
 
@@ -2205,6 +2856,8 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
                           slurm_policy=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
 
+    # Old terminal errors are not evidence that this request was refused.
+    before, _ = _terminal_read(agent_name, read_lines, 10)
     turn_began = time.monotonic()
     deliver_prompt(
         agent_name,
@@ -2214,15 +2867,17 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
     )
     turn_sec = time.monotonic() - turn_began
 
-    response = read_result_file(task_id)
+    response = read_result_file(task_id, cleanup=False)
 
     if response is None:
         terminal_tail = _read_terminal_tail(agent_name, read_lines)
 
-        # `ignore=task`: the terminal echoes the delegated task back, so
-        # without this a task about rate limits would read as the agent
-        # having hit one -- and that would durably circuit-break the agent.
-        detail = quota_error_detail(terminal_tail, ignore=task)
+        # Without a before snapshot, delivery remains uncertain: missing
+        # output must not send already-executed work to another agent.
+        detail = (
+            fresh_provider_refusal(before, terminal_tail, ignore=task)
+            if before is not None else None
+        )
         if detail:
             raise AgentQuotaExhaustedError(
                 agent_name, detail, raw_output=terminal_tail
@@ -2243,14 +2898,25 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
             f"sending reminder (agent={agent_name})"
         )
 
-        deliver_prompt(
-            agent_name,
-            build_result_reminder_prompt(task_id),
-            RESULT_REMINDER_TIMEOUT_MS,
-            task_id,
-        )
+        try:
+            deliver_prompt(
+                agent_name,
+                build_result_reminder_prompt(task_id),
+                RESULT_REMINDER_TIMEOUT_MS,
+                task_id,
+            )
+        except AgentQuotaExhaustedError as error:
+            # The original task may already have run. A refusal of its
+            # result-only reminder cannot justify replaying that task.
+            raise SentinelResultMissingError(
+                "The result-only reminder was refused by the provider. "
+                "The original task may already have executed; do not retry "
+                "it on another agent without checking its effects.",
+                raw_output=error.raw_output,
+                reason="result_delivery_refused",
+            ) from error
 
-        response = read_result_file(task_id)
+        response = read_result_file(task_id, cleanup=False)
 
     if response is None and turn_sec < QUICK_END_SEC:
         # Too quick to have run anything. Say that, instead of sending the
@@ -2421,6 +3087,7 @@ def task_worker(stop_event=None):
 
     while stop_event is None or not stop_event.is_set():
         try:
+            cancel_blocked_tasks()
             task_row = peek_next_task(exclude_agents=busy_this_pass)
 
             if task_row is None:
@@ -2465,10 +3132,16 @@ def task_worker(stop_event=None):
                             agent_name, operation, primary_locked=True
                         )
 
-                complete_task(
+                if complete_task(
                     task_id, result, note=routing_note(agent_name, used_agent)
-                )
-                print(f"[task {task_id}] done (agent={used_agent})")
+                ):
+                    print(f"[task {task_id}] done (agent={used_agent})")
+                else:
+                    print(
+                        f"[task {task_id}] finished on {used_agent} but is no "
+                        "longer running; its result file is left for late "
+                        "adoption"
+                    )
 
             except TimeoutError as e:
                 # The agent may still be executing, so it cannot safely be
@@ -2486,13 +3159,15 @@ def task_worker(stop_event=None):
                     print(f"[task {task_id}] quota exhausted: {e}")
 
             except (SentinelBusyError, SentinelUnavailableError) as unavailable:
-                if (
-                    isinstance(unavailable, SentinelUnavailableError)
+                settled = (
+                    settle_unreachable_task(task_row)
+                    if isinstance(unavailable, SentinelUnavailableError)
                     and not claimed
-                    and abandon_unreachable_task(task_row)
-                ):
+                    else None
+                )
+                if settled:
                     print(
-                        f"[task {task_id}] abandoned: its agent "
+                        f"[task {task_id}] {settled}: its agent "
                         f"({agent_name}) no longer exists"
                     )
                     continue
@@ -2577,7 +3252,9 @@ def build_delegation_prompt(task, task_id, slurm_policy=None):
 做完后把结果写入：
 {path}
 
-写清楚做了什么、结论是什么、有没有卡住或改动了什么。文件会被整份取走，别写凭据。
+推荐写成一个 JSON 对象，调用方能直接读到状态和 job ID（写纯文本也行，同样会被收下）：
+{{"status": "success|partial|failed|blocked", "summary": "做了什么、结论是什么、有没有卡住", "job_ids": [], "artifacts": [], "metrics": {{}}, "warnings": [], "changed_files": []}}
+只有 summary 必填；改动了什么写进 changed_files。文件会被整份取走，别写凭据。
 """.strip()
 
 _inflight = 0
@@ -2621,14 +3298,10 @@ def wait_for_inflight(grace_sec):
 
 def orphan_running_tasks(reason):
     with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'orphaned', finished_at = ?,
-                error_text = COALESCE(error_text, ?)
-            WHERE status = 'running'
-        """, (now_iso(), reason))
-
-    return cursor.rowcount
+        return _transition_where(
+            conn, "orphaned", "running",
+            {"finished_at": now_iso(), "error_text": reason},
+        )
 
 
 def graceful_shutdown(server, grace_sec=None, signame="signal"):
@@ -3026,13 +3699,80 @@ class Handler(BaseHTTPRequestHandler):
 
             # A late result may have arrived since anyone last looked.
             tasks = [
-                (adopt_late_result(t["task_id"]) or t)
-                if t["status"] in LATE_RESULT_STATUSES else t
+                task_view(
+                    (adopt_late_result(t["task_id"]) or t)
+                    if t["status"] in LATE_RESULT_STATUSES else t
+                )
                 for t in list_tasks(limit, status_filter)
             ]
 
             self.send_json({
                 "ok": True,
+                "tasks": tasks,
+            })
+            return
+
+        if path == "/events":
+            try:
+                after, limit, wait, task_id, workflow_id = validate_events_query(
+                    parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                )
+            except (TypeError, ValueError) as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"}, 400
+                )
+                return
+
+            # A long poll: hold the request until something happens or the
+            # wait runs out, so a watcher is told at once without asking in a
+            # tight loop.
+            deadline = time.monotonic() + wait
+            while True:
+                events = list_events(after, limit, task_id, workflow_id)
+
+                if events or _shutting_down or time.monotonic() >= deadline:
+                    break
+
+                time.sleep(EVENTS_POLL_SEC)
+
+            self.send_json({
+                "ok": True,
+                "events": events,
+                "next": events[-1]["seq"] if events else after,
+            })
+            return
+
+        if path.startswith("/workflows/"):
+            workflow_id = unquote(path[len("/workflows/"):])
+            rows = list_workflow_tasks(workflow_id)
+
+            if not rows:
+                self.send_json(
+                    {"ok": False, "error": "workflow not found"}, 404
+                )
+                return
+
+            waits_on = dependencies_of([row["task_id"] for row in rows])
+
+            tasks = []
+            for row in rows:
+                # A late result may have arrived since anyone last looked.
+                if row["status"] in LATE_RESULT_STATUSES:
+                    row = adopt_late_result(row["task_id"]) or row
+
+                view = task_view(row)
+                view["depends_on"] = waits_on[row["task_id"]]
+                tasks.append(view)
+
+            counts = {}
+            for view in tasks:
+                counts[view["status"]] = counts.get(view["status"], 0) + 1
+
+            self.send_json({
+                "ok": True,
+                "workflow_id": workflow_id,
+                "state": workflow_state(counts),
+                "counts": counts,
                 "tasks": tasks,
             })
             return
@@ -3051,6 +3791,8 @@ class Handler(BaseHTTPRequestHandler):
             if task["status"] in LATE_RESULT_STATUSES:
                 task = adopt_late_result(task_id) or task
 
+            task = task_view(task)
+
             # Read here rather than in get_task(): the worker calls that
             # on every poll and has no use for progress, so it should not
             # pay a file read per dispatch. A finished task has had its
@@ -3058,13 +3800,20 @@ class Handler(BaseHTTPRequestHandler):
             # states without needing a status check.
             task["progress"] = read_progress_file(task_id)
 
+            task["depends_on"] = list_dependencies(task_id)
+
             # Only while queued. A running task's reason would be stale
             # the moment it was read, and asking herdr on every poll of
             # every task would cost a call for nothing.
-            task["queued_reason"] = (
-                explain_queued(task["agent"])
-                if task["status"] == "queued" else None
-            )
+            task["queued_reason"] = None
+            if task["status"] == "queued":
+                waiting = unmet_dependencies(task_id)
+                task["queued_reason"] = (
+                    "Waiting for " + ", ".join(
+                        f"task {t} ({status})" for t, status in waiting
+                    ) + " to finish before it can start."
+                    if waiting else explain_queued(task["agent"])
+                )
 
             self.send_json({
                 "ok": True,
@@ -3120,6 +3869,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "unauthorized"}, 401)
             return
 
+        if path.startswith("/tasks/") and path.endswith("/cancel"):
+            # Nothing in the body is used. It is read so the connection can be
+            # closed with nothing left unread, which on Linux would otherwise
+            # reset it and could take the reply with it.
+            try:
+                self.read_json()
+            except ValueError:
+                pass
+
+            task_id = path[len("/tasks/"):-len("/cancel")]
+            task = get_task(task_id)
+
+            if task is None:
+                self.send_json({"ok": False, "error": "task not found"}, 404)
+                return
+
+            # Cancelling twice, or losing a race to another canceller, still
+            # ends with the task cancelled -- which is what was asked for.
+            if task["status"] == "cancelled" or cancel_task(task_id):
+                current = "cancelled"
+            else:
+                current = get_task(task_id)["status"]
+
+            if current == "cancelled":
+                self.send_json({
+                    "ok": True, "task_id": task_id, "status": "cancelled",
+                })
+                return
+
+            self.send_json({
+                "ok": False,
+                "task_id": task_id,
+                "status": current,
+                "error": (
+                    f"This task has already started or finished (status: "
+                    f"{current}), and the bridge cannot stop an agent "
+                    "mid-task. Only a task still queued can be cancelled."
+                ),
+            }, 409)
+            return
+
         if path == "/delegate":
             try:
                 body = self.read_json()
@@ -3130,6 +3920,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 slurm_policy = validate_slurm_policy(body.get("slurm_policy"))
+                reroute = validate_reroute(body.get("reroute"))
+                workflow_id = validate_workflow_id(body.get("workflow_id"))
+                depends_on = validate_depends_on(body.get("depends_on"))
                 idempotency_key = validate_idempotency_key(
                     body.get("idempotency_key")
                 )
@@ -3156,7 +3949,8 @@ class Handler(BaseHTTPRequestHandler):
                 # agent is resolved -- so a retry matches even if the live
                 # agent set changed in between.
                 fingerprint = request_fingerprint(
-                    task, agent_name, body.get("slurm_policy"), timeout_ms
+                    task, agent_name, body.get("slurm_policy"), timeout_ms,
+                    reroute, workflow_id, depends_on,
                 )
 
                 # A replay is served before anything else can refuse it. The
@@ -3192,7 +3986,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 task_id, replayed = enqueue_task(
                     task, timeout_ms, agent_name, slurm_policy,
-                    idempotency_key, fingerprint,
+                    idempotency_key, fingerprint, reroute,
+                    workflow_id, depends_on,
                 )
             except QueueFullError as e:
                 self.send_json(
@@ -3201,6 +3996,17 @@ class Handler(BaseHTTPRequestHandler):
                         "error": str(e),
                     },
                     429,
+                )
+                return
+            except DependencyError as e:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "reason": e.reason,
+                        "task_ids": e.task_ids,
+                        "error": str(e),
+                    },
+                    422,
                 )
                 return
             except IdempotencyConflictError as e:
@@ -3324,12 +4130,22 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
 
+            result_data, _ = parse_structured_result(result_text)
+
             self.send_json({
                 "ok": True,
                 "task_id": task_id,
                 "agent": used_agent,
-                "result": {"text": result_text},
+                "result": {
+                    "text": result_text,
+                    "format": "json" if result_data else "text",
+                    "data": result_data,
+                },
             })
+            # Synchronous asks have no completion transaction. Keep their
+            # recovery copy until the response has been written successfully.
+            discard_result_file(task_id)
+            discard_progress_file(task_id)
             return
 
         except QuotaFailoverExhaustedError as e:

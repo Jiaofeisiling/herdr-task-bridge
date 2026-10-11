@@ -1,0 +1,386 @@
+"""End-to-end tests: the real bridge process, real HTTP, a real SQLite file.
+
+Everything in test_bridge.py runs inside one process with the herdr call
+replaced. These tests start bridge.py as a process of its own, in front of the
+fake herdr in fake_herdr.py, so what is exercised is what actually happens
+around the code: a process killed without warning, a restart onto the same
+database, requests arriving at the same moment from several threads.
+
+Each scenario states what the claim is and what would have to be true for it
+to be broken.
+"""
+import http.client
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BRIDGE = os.path.join(HERE, "bridge.py")
+FAKE_HERDR = os.path.join(HERE, "fake_herdr.py")
+
+# Worker polls every two seconds, so anything that has to be picked up takes
+# at least that long; the ceiling is for a loaded CI machine, not the usual.
+PATIENCE = 40
+
+
+def wait_for(predicate, timeout=PATIENCE, interval=0.1, what="the condition"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Bridge:
+    """One running bridge.py process."""
+
+    def __init__(self, process, port, log_path):
+        self.process = process
+        self.port = port
+        self.log_path = log_path
+
+    def request(self, method, path, body=None, timeout=15):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            payload = json.dumps(body).encode("utf-8") if body is not None else None
+            conn.request(method, path, body=payload,
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            conn.close()
+
+    def get(self, path, **kw):
+        return self.request("GET", path, **kw)
+
+    def post(self, path, body=None, **kw):
+        return self.request("POST", path, {} if body is None else body, **kw)
+
+    def task(self, task_id):
+        return self.get(f"/tasks/{task_id}")[1]["task"]
+
+    def wait_status(self, task_id, *statuses):
+        return wait_for(
+            lambda: (t := self.task(task_id))["status"] in statuses and t,
+            what=f"task {task_id} to reach {statuses}",
+        )
+
+    def kill(self):
+        """Die without warning: no signal handler, no shutdown, nothing flushed."""
+        self.process.kill()
+        self.process.wait(timeout=10)
+
+    def log(self):
+        with open(self.log_path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+
+class World:
+    """A directory holding the fake herdr's state, the database and the results."""
+
+    def __init__(self, root):
+        self.root = root
+        self.fake = root / "fake"
+        self.results = root / "results"
+        self.db = root / "tasks.db"
+        self.bridges = []
+
+        self.fake.mkdir()
+        self.results.mkdir()
+        # `python agent ...` runs this file; see fake_herdr.py for why.
+        shutil.copy(FAKE_HERDR, self.fake / "agent")
+
+    def configure(self, agents, behavior=None):
+        listed = [
+            {"name": a["name"], "pane_id": a.get("pane_id", f"w1:p{i + 1}"),
+             "agent": a.get("agent", "opencode"),
+             "agent_status": a.get("agent_status", "idle"), "cwd": str(self.root)}
+            for i, a in enumerate(agents)
+        ]
+        with open(self.fake / "config.json", "w", encoding="utf-8") as f:
+            json.dump({"agents": listed, "behavior": behavior or {}}, f)
+
+    def prompts(self):
+        try:
+            with open(self.fake / "prompts.jsonl", encoding="utf-8") as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def start_bridge(self, **env):
+        port = _free_port()
+        environment = {
+            **os.environ,
+            "HERDR_BIN": sys.executable,
+            "FAKE_HERDR_DIR": str(self.fake),
+            "SENTINEL_BRIDGE_PORT": str(port),
+            "SENTINEL_DB": str(self.db),
+            "SENTINEL_RESULT_DIR": str(self.results),
+            "PYTHONUTF8": "1",
+            **{k: str(v) for k, v in env.items()},
+        }
+        for inherited in ("SENTINEL_AGENT", "SENTINEL_BRIDGE_TOKEN",
+                          "SENTINEL_QUOTA_FAILOVER_AGENTS", "SENTINEL_AGENT_PRIORITY"):
+            environment.pop(inherited, None)
+
+        log_path = self.root / f"bridge-{len(self.bridges)}.log"
+        # A file, not a pipe: nobody reads the bridge's output while a test
+        # runs, and a full pipe would block it.
+        log = open(log_path, "w", encoding="utf-8")
+        process = subprocess.Popen(
+            [sys.executable, BRIDGE], cwd=self.fake, env=environment,
+            stdout=log, stderr=subprocess.STDOUT,
+        )
+        log.close()
+
+        bridge = Bridge(process, port, log_path)
+        self.bridges.append(bridge)
+
+        def healthy():
+            if process.poll() is not None:
+                raise AssertionError("the bridge exited at startup:\n" + bridge.log())
+            try:
+                return bridge.get("/health", timeout=2)[0] == 200
+            except OSError:
+                return False
+
+        wait_for(healthy, what="the bridge to answer /health")
+        return bridge
+
+    def close(self):
+        for bridge in self.bridges:
+            if bridge.process.poll() is None:
+                bridge.process.kill()
+                bridge.process.wait(timeout=10)
+
+
+@pytest.fixture
+def world(tmp_path):
+    w = World(tmp_path)
+    yield w
+    w.close()
+
+
+ALPHA = {"name": "alpha", "agent": "opencode"}
+BETA = {"name": "beta", "agent": "claude"}
+
+
+def delegate(bridge, task, **extra):
+    status, body = bridge.post("/delegate", {"task": task, **extra})
+    assert status == 202, body
+    return body["task_id"]
+
+
+# -- the happy path, through every layer -----------------------------------
+
+
+def test_a_task_runs_through_the_real_process_and_its_structured_result_is_served(world):
+    result = {"status": "success", "summary": "disk is fine", "job_ids": ["4242"]}
+    world.configure([ALPHA], {"alpha": {"text": json.dumps(result)}})
+    bridge = world.start_bridge()
+
+    task_id = delegate(bridge, "check the disk")
+    task = bridge.wait_status(task_id, "done", "error")
+
+    assert task["status"] == "done"
+    assert task["result_format"] == "json"
+    assert task["result_data"]["job_ids"] == ["4242"]
+    assert len(world.prompts()) == 1
+
+
+# -- a process killed without warning --------------------------------------
+
+
+def test_a_killed_bridge_orphans_its_running_task_and_never_reruns_it(world):
+    # The claim: when the bridge dies mid-task the work may or may not have
+    # happened, so it must not be run again. It would be broken if the task
+    # came back as queued, or if the agent were prompted a second time.
+    world.configure([ALPHA], {"alpha": {"delay": 4, "text": "the answer"}})
+    first = world.start_bridge()
+    task_id = delegate(first, "a long job")
+    first.wait_status(task_id, "running")
+    # `running` only says the worker has claimed the task. Kill it before the
+    # prompt has left and nothing was ever sent -- a different case, and one
+    # with no agent to give an answer back.
+    wait_for(world.prompts, what="the prompt to reach the agent")
+
+    first.kill()
+    second = world.start_bridge()
+
+    task = second.task(task_id)
+    assert task["status"] == "orphaned"
+    assert "restarted" in task["error_text"]
+
+    # Give the worker several polls in which it could, wrongly, rerun it.
+    time.sleep(5)
+    assert second.task(task_id)["status"] in ("orphaned", "done")
+    assert len(world.prompts()) == 1
+
+
+def test_the_answer_of_a_killed_bridges_agent_is_recovered_after_the_restart(world):
+    # The claim: an agent that finishes after the bridge lost track of it does
+    # not lose its answer. Broken if the task stayed orphaned with no result.
+    world.configure([ALPHA], {"alpha": {"delay": 3, "text": "the late answer"}})
+    first = world.start_bridge()
+    task_id = delegate(first, "a long job")
+    first.wait_status(task_id, "running")
+    wait_for(world.prompts, what="the prompt to reach the agent")
+
+    first.kill()
+    second = world.start_bridge()
+    assert second.task(task_id)["status"] == "orphaned"
+
+    task = wait_for(
+        lambda: (t := second.task(task_id))["status"] == "done" and t,
+        what="the late result to be adopted",
+    )
+
+    assert task["result_text"] == "the late answer"
+    assert task["recovered_at"] is not None
+    # What went wrong is kept, not rewritten.
+    assert "restarted" in task["error_text"]
+    assert len(world.prompts()) == 1
+
+
+# -- the same request, many times at once -----------------------------------
+
+
+def test_concurrent_retries_with_one_idempotency_key_make_exactly_one_task(world):
+    # The claim: a retry storm cannot queue the work twice. Broken if two
+    # threads both found the key unclaimed, and so submitted two jobs.
+    world.configure([ALPHA], {"alpha": {"text": "ok"}})
+    bridge = world.start_bridge()
+    barrier = threading.Barrier(12)
+    replies = []
+
+    def retry():
+        barrier.wait()
+        replies.append(bridge.post("/delegate", {"task": "submit the job", "idempotency_key": "job-1"}))
+
+    threads = [threading.Thread(target=retry) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert {status for status, _ in replies} == {202}
+    assert len({body["task_id"] for _, body in replies}) == 1
+    assert sum(1 for _, body in replies if body.get("replayed")) == 11
+
+    bridge.wait_status(replies[0][1]["task_id"], "done")
+    assert len(world.prompts()) == 1
+    assert len(bridge.get("/tasks?limit=200")[1]["tasks"]) == 1
+
+
+def test_the_queue_limit_holds_when_requests_arrive_together(world):
+    # The claim: the cap cannot be overfilled by requests racing the count.
+    # The agent is held busy so nothing leaves the queue while it is filled.
+    world.configure([{**ALPHA, "agent_status": "working"}])
+    bridge = world.start_bridge(SENTINEL_MAX_QUEUE_DEPTH=5)
+    barrier = threading.Barrier(20)
+    statuses = []
+
+    def submit(i):
+        barrier.wait()
+        statuses.append(bridge.post("/delegate", {"task": f"job {i}", "agent": "alpha"})[0])
+
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(statuses) == [202] * 5 + [429] * 15
+    assert len(bridge.get("/tasks?status=queued&limit=200")[1]["tasks"]) == 5
+    assert world.prompts() == []
+
+
+# -- a provider that runs out ------------------------------------------------
+
+
+def test_a_quota_failure_moves_the_task_to_another_provider_and_says_so(world):
+    # The claim: running out of quota on one provider does not strand the task.
+    # Broken if it ended quota_exhausted although beta was free and idle.
+    world.configure(
+        [ALPHA, BETA],
+        {"alpha": {"mode": "quota"}, "beta": {"text": "answered by beta"}},
+    )
+    bridge = world.start_bridge()
+
+    task_id = delegate(bridge, "audit", agent="alpha")
+    task = bridge.wait_status(task_id, "done", "error", "quota_exhausted")
+
+    assert task["status"] == "done"
+    assert task["result_text"] == "answered by beta"
+    assert "beta" in task["error_text"] and "alpha" in task["error_text"]
+    assert [p["agent"] for p in world.prompts()] == ["alpha", "beta"]
+    assert "alpha" in json.dumps(bridge.get("/quota")[1])
+
+
+# -- workflows ----------------------------------------------------------------
+
+
+def test_a_chain_runs_in_dependency_order(world):
+    world.configure([ALPHA], {"alpha": {"text": "ok"}})
+    bridge = world.start_bridge()
+
+    a = delegate(bridge, "step one", workflow_id="run-1")
+    b = delegate(bridge, "step two", workflow_id="run-1", depends_on=[a])
+    c = delegate(bridge, "step three", workflow_id="run-1", depends_on=[b])
+
+    bridge.wait_status(c, "done", "error", "cancelled")
+
+    assert [("step one" in p["prompt"], "step two" in p["prompt"], "step three" in p["prompt"])
+            for p in world.prompts()] == [(True, False, False), (False, True, False), (False, False, True)]
+    assert bridge.get("/workflows/run-1")[1]["state"] == "done"
+
+
+def test_a_failure_cancels_what_follows_and_nothing_downstream_reaches_an_agent(world):
+    # The claim: work that depended on a failed step is never sent. Broken if
+    # any prompt after the first reached the agent.
+    world.configure([ALPHA], {"alpha": {"mode": "fail"}})
+    bridge = world.start_bridge()
+
+    a = delegate(bridge, "step one", workflow_id="run-1")
+    b = delegate(bridge, "step two", workflow_id="run-1", depends_on=[a])
+    c = delegate(bridge, "step three", workflow_id="run-1", depends_on=[b])
+
+    bridge.wait_status(c, "cancelled")
+
+    assert bridge.task(a)["status"] == "error"
+    assert bridge.task(b)["status"] == "cancelled"
+    assert "never sent" in bridge.task(c)["error_text"]
+    assert len(world.prompts()) == 1
+    assert bridge.get("/workflows/run-1")[1]["state"] == "failed"
+
+
+# -- the event stream ---------------------------------------------------------
+
+
+def test_the_event_stream_records_a_tasks_whole_life_over_http(world):
+    world.configure([ALPHA], {"alpha": {"text": "ok"}})
+    bridge = world.start_bridge()
+
+    task_id = delegate(bridge, "audit")
+    bridge.wait_status(task_id, "done")
+
+    events = bridge.get(f"/events?task_id={task_id}")[1]["events"]
+
+    assert [(e["from_status"], e["to_status"]) for e in events] == [
+        (None, "queued"), ("queued", "running"), ("running", "done"),
+    ]

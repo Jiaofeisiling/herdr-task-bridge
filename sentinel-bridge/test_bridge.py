@@ -973,6 +973,7 @@ def test_delegate_succeeds_again_once_queue_has_room(live_server, monkeypatch):
     blocked = _post(live_server, "/delegate", {"task": "task 2"})
     assert blocked[0] == 429
 
+    assert bridge.claim_task(first[1]["task_id"])
     bridge.complete_task(first[1]["task_id"], "done")
 
     status, body = _post(live_server, "/delegate", {"task": "task 3"})
@@ -1430,7 +1431,7 @@ def test_execute_sentinel_task_returns_the_file_contents(tmp_path, monkeypatch):
     assert result == "干净的结果，没有终端噪音"
 
 
-def test_execute_sentinel_task_never_reads_the_terminal_on_the_happy_path(tmp_path, monkeypatch):
+def test_execute_sentinel_task_only_reads_a_before_snapshot_on_success(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
 
     task_id = "66666666-6666-6666-6666-666666666666"
@@ -1438,15 +1439,16 @@ def test_execute_sentinel_task_never_reads_the_terminal_on_the_happy_path(tmp_pa
 
     def fake_run_herdr(*args, **kwargs):
         calls.append(args[1])
-        with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
-            f.write("ok")
+        if args[1] == "prompt":
+            with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+                f.write("ok")
         return {"ok": True, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr(bridge, "run_herdr", fake_run_herdr)
 
     bridge.execute_sentinel_task("sentinel", task_id, "task", 60000)
 
-    assert calls == ["prompt"]  # no "read" -- scraping is off the critical path
+    assert calls == ["read", "prompt"]  # snapshot, then file-based result
 
 
 def test_execute_sentinel_task_reminds_once_when_the_file_is_missing(tmp_path, monkeypatch):
@@ -1653,7 +1655,8 @@ def test_missing_result_quota_does_not_send_recovery_prompt(tmp_path, monkeypatc
         if args[1] == "read":
             return {
                 "ok": True,
-                "stdout": "OpenCode API: insufficient credits",
+                "stdout": "OpenCode API: insufficient credits" if any(
+                    call[1] == "prompt" for call in calls) else "",
                 "stderr": "",
             }
         return {"ok": True, "stdout": "", "stderr": ""}
@@ -1813,7 +1816,7 @@ def test_missing_result_diagnostics_cover_the_reminder_attempt(tmp_path, monkeyp
 
     # The whole question when this error fires is "what happened during the
     # reminder", so the attached tail has to be read after it, not before.
-    assert "#2" in exc_info.value.raw_output
+    assert "#3" in exc_info.value.raw_output  # before, missing file, after reminder
 
 
 # --- stale result files -------------------------------------------------
@@ -1959,6 +1962,157 @@ def test_resolve_agent_accepts_a_pane_id(monkeypatch):
     _live(monkeypatch, [{"agent": "claude", "pane_id": "w1:p3"}])
 
     assert bridge.resolve_agent("w1:p3") == "w1:p3"
+
+
+def test_named_agent_aliases_share_one_dispatch_lock(monkeypatch):
+    _live(monkeypatch, [{"name": "primary", "agent": "claude", "pane_id": "w1:p3"}])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    assert bridge.agent_or_auto("primary") == bridge.agent_or_auto("w1:p3")
+    # Also cover rows queued before aliases were canonicalized.
+    with bridge.acquire_agent_for_delegation("primary"):
+        with pytest.raises(bridge.SentinelBusyError):
+            with bridge.acquire_agent_for_delegation("w1:p3"):
+                pytest.fail("the same agent acquired two locks")
+        _live(monkeypatch, [], ok=False)
+        with pytest.raises(bridge.SentinelBusyError):
+            with bridge.acquire_agent_for_delegation("w1:p3"):
+                pytest.fail("discovery failure gave a known alias a second lock")
+
+
+def test_fallback_allowlist_excludes_primary_aliases_and_deduplicates(monkeypatch):
+    _live(monkeypatch, [
+        {"name": "primary", "agent": "claude", "pane_id": "w1:p3"},
+        {"name": "backup", "agent": "opencode", "pane_id": "w1:p1"},
+    ])
+    monkeypatch.setattr(bridge, "QUOTA_FAILOVER_AGENTS",
+                        ("w1:p3", "primary", "w1:p1", "backup"))
+    assert bridge.quota_failover_candidates("primary") == ["backup"]
+
+
+def test_expiring_legacy_quota_alias_keeps_active_circuit(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"name": "primary", "agent": "claude", "pane_id": "w1:p3"}])
+    old = (datetime_module.now(datetime_module_tz.utc) - datetime_module_delta(days=10)).isoformat()
+    with bridge.db_session() as conn:
+        conn.executemany("INSERT INTO quota_blocks VALUES (?, ?, ?)", [
+            ("primary", bridge.now_iso(), "insufficient credits"),
+            ("w1:p3", old, "insufficient credits"),
+        ])
+    assert [b["agent"] for b in bridge.list_agent_quota_blocks()] == ["primary"]
+    assert bridge.get_agent_quota_block("w1:p3") is not None
+
+
+def test_quota_circuit_and_reset_apply_to_all_live_aliases(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _live(monkeypatch, [{"name": "primary", "agent": "claude", "pane_id": "w1:p3"}])
+    # A circuit recorded by an older bridge under its pane id must hold too.
+    with bridge.db_session() as conn:
+        conn.execute("INSERT INTO quota_blocks VALUES (?, ?, ?)",
+                     ("w1:p3", bridge.now_iso(), "insufficient credits"))
+    assert bridge.get_agent_quota_block("primary") is not None
+    assert bridge.clear_agent_quota_blocks("primary") == 1
+    bridge.mark_agent_quota_blocked("primary", "insufficient credits")
+    assert bridge.get_agent_quota_block("w1:p3") is not None
+    assert bridge.clear_agent_quota_blocks("w1:p3") == 1
+
+
+def test_result_survives_failed_commit_and_restart(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 1000, "primary")
+    bridge.claim_task(task_id)
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("durable answer"))
+    answer = bridge.execute_sentinel_task("primary", task_id, "audit", 1000)
+    original_connect = bridge.db_connect
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(bridge, "db_connect", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        bridge.complete_task(task_id, answer)
+    assert os.path.exists(bridge.result_file_path(task_id))
+    monkeypatch.setattr(bridge, "db_connect", original_connect)
+    bridge.init_db()
+    recovered = bridge.adopt_late_result(task_id)
+    assert recovered["status"] == "done"
+    assert recovered["result_text"] == "durable answer"
+    assert not os.path.exists(bridge.result_file_path(task_id))
+
+
+def test_result_is_removed_only_after_successful_commit(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 1000, "primary")
+    bridge.claim_task(task_id)
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("durable answer"))
+    answer = bridge.execute_sentinel_task("primary", task_id, "audit", 1000)
+    assert os.path.exists(bridge.result_file_path(task_id))
+    bridge.complete_task(task_id, answer)
+    assert bridge.get_task(task_id)["result_text"] == "durable answer"
+    assert not os.path.exists(bridge.result_file_path(task_id))
+
+
+def test_old_terminal_quota_does_not_reroute_executed_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    _live(monkeypatch, [
+        {"name": "primary", "agent": "claude", "pane_id": "w1:p3"},
+        {"name": "backup", "agent": "opencode", "pane_id": "w1:p1"},
+    ])
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    history = "Yesterday: HTTP 429 Too Many Requests"
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: (history, {}))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: history)
+    task_id = "old-terminal-error"
+    calls = []
+
+    def deliver(target, prompt, timeout, token):
+        calls.append(target)
+        if len(calls) == 2:
+            with open(bridge.result_file_path(token), "w", encoding="utf-8") as f:
+                f.write("original task result")
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "deliver_prompt", deliver)
+    answer, used = bridge.run_with_quota_failover(
+        "primary", lambda target: bridge.execute_sentinel_task(target, task_id, "audit", 1000))
+    assert calls == ["primary", "primary"]  # task, then result-only reminder
+    assert used == "primary"
+    assert answer == "original task result"
+    assert bridge.list_agent_quota_blocks() == []
+
+
+def test_unreadable_terminal_before_task_cannot_prove_new_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: (None, {}))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: "HTTP 429 Too Many Requests")
+    monkeypatch.setattr(bridge, "deliver_prompt", lambda *a: {"ok": True})
+    with pytest.raises(bridge.SentinelResultMissingError):
+        bridge.execute_sentinel_task("primary", "no-snapshot", "audit", 1000)
+
+
+def test_quota_refusal_of_result_reminder_does_not_replay_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: ("", {}))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: "")
+    calls = []
+
+    def deliver(target, prompt, timeout, token):
+        calls.append(target)
+        if len(calls) == 2:
+            raise bridge.AgentQuotaExhaustedError(target, "insufficient credits")
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "deliver_prompt", deliver)
+    monkeypatch.setattr(bridge, "quota_failover_candidates", lambda *a: ["backup"])
+    with pytest.raises(bridge.SentinelResultMissingError) as failure:
+        bridge.run_with_quota_failover("primary", lambda target:
+            bridge.execute_sentinel_task(target, "reminder-refused", "audit", 1000))
+    assert calls == ["primary", "primary"]
+    assert failure.value.reason == "result_delivery_refused"
 
 
 def test_resolve_agent_falls_back_to_a_unique_runtime_family(monkeypatch):
@@ -2736,6 +2890,7 @@ def test_progress_file_is_removed_once_the_task_finishes(tmp_path, monkeypatch):
     with open(path, "w", encoding="utf-8") as f:
         f.write("working\n")
 
+    assert bridge.claim_task(task_id)
     bridge.complete_task(task_id, "done")
 
     # Otherwise every finished task leaves one behind, which is the leak
@@ -3864,7 +4019,7 @@ def test_a_size_limit_is_reported_as_one_not_as_a_missing_file(tmp_path, monkeyp
         if args[1] == "prompt":
             prompts.append(args)
         if args[1] == "read":
-            return {"ok": True, "stdout": SIZE_LIMIT_TAIL, "stderr": ""}
+            return {"ok": True, "stdout": SIZE_LIMIT_TAIL if prompts else "", "stderr": ""}
         return {"ok": True, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr(bridge, "run_herdr", fake)
@@ -4234,6 +4389,7 @@ def test_a_task_whose_herdr_call_is_killed_ends_orphaned_not_error(tmp_path, mon
 def test_an_error_never_overwrites_an_orphaned_task(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
     task_id = bridge.create_task("audit", 60000, "w1:p3")
+    assert bridge.claim_task(task_id)
     bridge.orphan_task(task_id, "stopped while running")
 
     # `orphaned` says "may have run; do not retry". Whichever of the shutdown
@@ -4502,3 +4658,1528 @@ def test_an_agent_that_is_listed_but_cannot_be_queried_keeps_its_tasks(tmp_path,
     _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
 
     assert bridge.get_task(task_id)["status"] == "queued"
+
+
+# --- the task state machine: one table, one door -------------------------
+#
+# A task's status used to be rewritten by seven separate UPDATE statements,
+# of which only some checked what the status was. complete_task, orphan_task
+# and quota_exhausted_task would overwrite anything -- including a task that
+# had already finished -- so whether a result survived depended on which of two
+# racing paths got there last.
+
+import itertools
+
+
+def _task_in_state(status):
+    task_id = bridge.create_task("t", 60000, "w1:p3")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (status, task_id))
+    return task_id
+
+
+def test_every_status_has_a_row_in_the_transition_table():
+    assert set(bridge.TASK_TRANSITIONS) == set(bridge.TASK_STATUSES)
+
+    for targets in bridge.TASK_TRANSITIONS.values():
+        assert set(targets) <= set(bridge.TASK_STATUSES)
+
+
+def test_only_done_quota_exhausted_and_cancelled_are_final():
+    final = {s for s, targets in bridge.TASK_TRANSITIONS.items() if not targets}
+
+    # error and orphaned are deliberately not final: a result file that turns
+    # up late turns them into done (adopt_late_result).
+    assert final == {"done", "quota_exhausted", "cancelled"}
+
+
+@pytest.mark.parametrize(
+    "source,target", list(itertools.product(bridge.TASK_STATUSES, repeat=2))
+)
+def test_transition_follows_the_table(tmp_path, monkeypatch, source, target):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state(source)
+
+    if target in bridge.TASK_TRANSITIONS[source]:
+        assert bridge.transition(task_id, target, expect=source) is True
+        assert bridge.get_task(task_id)["status"] == target
+    else:
+        # A transition the table does not allow is a bug in the caller, not a
+        # lost race, and is loud about it.
+        with pytest.raises(ValueError):
+            bridge.transition(task_id, target, expect=source)
+        assert bridge.get_task(task_id)["status"] == source
+
+
+def test_transition_is_a_no_op_when_the_task_is_not_in_the_expected_state(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("queued")
+
+    # running -> done is legal, but this task is not running: a lost race.
+    assert bridge.transition(task_id, "done", expect="running") is False
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+def test_transition_writes_its_columns_in_the_same_statement(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+
+    assert bridge.transition(task_id, "error", expect="running",
+                             error_text="boom", finished_at="2026-01-01T00:00:00+00:00")
+
+    row = bridge.get_task(task_id)
+    assert row["error_text"] == "boom"
+    assert row["finished_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_transition_rejects_a_column_it_does_not_know(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+
+    with pytest.raises(ValueError):
+        bridge.transition(task_id, "error", expect="running", bogus="x")
+
+
+_FINISHERS = {
+    "complete": lambda t: bridge.complete_task(t, "r"),
+    "fail": lambda t: bridge.fail_task(t, "e"),
+    "orphan": lambda t: bridge.orphan_task(t, "e"),
+    "quota": lambda t: bridge.quota_exhausted_task(t, "e"),
+}
+_FINISHER_RESULT = {
+    "complete": "done", "fail": "error", "orphan": "orphaned", "quota": "quota_exhausted",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FINISHERS))
+def test_a_finisher_moves_a_running_task_and_says_so(tmp_path, monkeypatch, name):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+
+    assert _FINISHERS[name](task_id) is True
+    assert bridge.get_task(task_id)["status"] == _FINISHER_RESULT[name]
+
+
+@pytest.mark.parametrize("name", sorted(_FINISHERS))
+@pytest.mark.parametrize("state", ["queued", "done", "error", "orphaned", "quota_exhausted"])
+def test_a_finisher_never_touches_a_task_that_is_not_running(tmp_path, monkeypatch, name, state):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state(state)
+    before = bridge.get_task(task_id)
+
+    assert _FINISHERS[name](task_id) is False
+    assert bridge.get_task(task_id) == before
+
+
+def test_a_refused_completion_keeps_the_result_for_late_adoption(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    assert bridge.claim_task(task_id)
+
+    # A shutdown marks the running task orphaned while the worker is still
+    # waiting on the agent ...
+    assert bridge.orphan_task(task_id, "bridge is stopping")
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write("the answer")
+
+    # ... and then the worker gets its answer. The task is no longer running,
+    # so it must not be completed behind the orphaning's back, and -- the point
+    # -- the file is the only copy, so it must not be deleted either.
+    assert bridge.complete_task(task_id, "the answer") is False
+    assert os.path.exists(bridge.result_file_path(task_id))
+
+    adopted = bridge.adopt_late_result(task_id)
+    assert adopted["status"] == "done"
+    assert adopted["result_text"] == "the answer"
+    assert adopted["recovered_at"] is not None
+
+
+def test_only_one_of_several_racing_finishers_wins(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+    barrier = threading_module.Barrier(len(_FINISHERS))
+    outcomes = {}
+
+    def race(name):
+        barrier.wait()
+        outcomes[name] = _FINISHERS[name](task_id)
+
+    threads = [threading_module.Thread(target=race, args=(n,)) for n in _FINISHERS]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    winners = [name for name, won in outcomes.items() if won]
+    assert len(winners) == 1
+    assert bridge.get_task(task_id)["status"] == _FINISHER_RESULT[winners[0]]
+
+
+def test_status_is_only_rewritten_through_the_transition_door():
+    # Keeps the next UPDATE from quietly bypassing the table.
+    with open(bridge.__file__, encoding="utf-8") as f:
+        source = f.read()
+
+    assert re.findall(r"SET\s+status\s*=", source) == []
+
+
+def test_the_worker_does_not_log_done_for_a_task_it_could_not_complete(tmp_path, monkeypatch, capsys):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+
+    def shutdown_lands_mid_task(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        # The shutdown orphans the running task while the worker still waits.
+        assert bridge.orphan_task(task_id, "bridge is stopping")
+        return "an answer that arrives too late"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", shutdown_lands_mid_task)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] not in ("queued", "running"))
+
+    assert bridge.get_task(task_id)["status"] == "orphaned"
+    out = capsys.readouterr().out
+    assert f"[task {task_id}] done" not in out
+    assert f"[task {task_id}]" in out   # but it does say what happened
+
+
+# --- structured results ---------------------------------------------------
+#
+# A result used to be whatever prose the agent wrote. A caller wanting the job
+# ID, or wanting to know whether the work actually succeeded, had to read it
+# out of that prose. An agent may now write a JSON object instead; plain text
+# is still accepted, unchanged, so no agent and no stored row stops working.
+
+STRUCTURED = {
+    "status": "partial",
+    "summary": "built the env; training job queued",
+    "job_ids": ["12345678"],
+    "artifacts": ["/scratch/run1/log.txt"],
+    "metrics": {"val_loss": 0.42, "epochs": 3, "split": "dev"},
+    "warnings": ["cuda module deprecated"],
+    "changed_files": ["env/setup.sh"],
+}
+
+
+def test_plain_text_is_not_structured_and_not_a_problem():
+    assert bridge.parse_structured_result("all done, nothing to report") == (None, None)
+    # Prose that merely mentions braces is still prose.
+    assert bridge.parse_structured_result("set {a,b} to 1") == (None, None)
+    # So is JSON that is not an object: there is nothing to read fields from.
+    assert bridge.parse_structured_result('["a", "b"]') == (None, None)
+
+
+def test_a_minimal_object_needs_only_a_summary():
+    data, problem = bridge.parse_structured_result('{"summary": "done"}')
+
+    assert problem is None
+    assert data == {
+        "summary": "done", "status": None, "job_ids": [], "artifacts": [],
+        "metrics": {}, "warnings": [], "changed_files": [],
+    }
+
+
+def test_a_full_object_is_read_field_for_field():
+    data, problem = bridge.parse_structured_result(json_module.dumps(STRUCTURED))
+
+    assert problem is None
+    assert data == STRUCTURED
+
+
+def test_a_fenced_block_is_accepted():
+    # Agents wrap JSON in a markdown fence far more often than not.
+    text = "```json\n" + json_module.dumps(STRUCTURED) + "\n```"
+
+    data, problem = bridge.parse_structured_result("  \n" + text + "\n  ")
+
+    assert problem is None
+    assert data["job_ids"] == ["12345678"]
+
+
+def test_unknown_keys_are_ignored_not_rejected():
+    data, problem = bridge.parse_structured_result(
+        '{"summary": "done", "mood": "cheerful"}'
+    )
+
+    assert problem is None
+    assert "mood" not in data
+
+
+@pytest.mark.parametrize("text,fragment", [
+    ('{"summary": "done"', "parse"),                          # truncated
+    ('{"status": "success"}', "summary"),                     # required field missing
+    ('{"summary": ""}', "summary"),
+    ('{"summary": 5}', "summary"),
+    ('{"summary": "x", "status": "great"}', "status"),        # not one of the four
+    ('{"summary": "x", "job_ids": "123"}', "job_ids"),        # not a list
+    ('{"summary": "x", "job_ids": [123]}', "job_ids"),        # not strings
+    ('{"summary": "x", "metrics": {"a": [1]}}', "metrics"),   # nested value
+    ('{"summary": "x", "metrics": []}', "metrics"),
+])
+def test_a_malformed_object_is_refused_with_the_reason(text, fragment):
+    data, problem = bridge.parse_structured_result(text)
+
+    assert data is None
+    assert fragment in problem
+
+
+def _running_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    assert bridge.claim_task(task_id)
+    return task_id
+
+
+def test_a_structured_result_is_stored_and_served_as_data(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    raw = json_module.dumps(STRUCTURED)
+
+    assert bridge.complete_task(task_id, raw)
+
+    view = bridge.task_view(bridge.get_task(task_id))
+    assert view["status"] == "done"
+    assert view["result_format"] == "json"
+    assert view["result_data"] == STRUCTURED
+    # The original text is never replaced, so nothing that read it breaks ...
+    assert view["result_text"] == raw
+    # ... and the storage column is an implementation detail.
+    assert "result_json" not in view
+
+
+def test_a_text_result_is_served_as_text(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    bridge.complete_task(task_id, "just prose")
+
+    view = bridge.task_view(bridge.get_task(task_id))
+
+    assert view["result_format"] == "text"
+    assert view["result_data"] is None
+    assert view["error_text"] is None   # plain text is not a problem to report
+
+
+def test_a_task_without_a_result_has_no_format(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+
+    view = bridge.task_view(bridge.get_task(task_id))
+
+    assert view["result_format"] is None
+    assert view["result_data"] is None
+
+
+def test_broken_json_degrades_to_text_and_says_why(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    raw = '{"summary": "did the thing", "job_ids": ["1"'    # cut off mid-write
+
+    assert bridge.complete_task(task_id, raw)
+
+    view = bridge.task_view(bridge.get_task(task_id))
+    # The work was delivered; a format slip must not fail it.
+    assert view["status"] == "done"
+    assert view["result_text"] == raw
+    assert view["result_format"] == "text"
+    # But an agent that keeps getting it wrong should be able to find out.
+    assert "structured" in view["error_text"].lower()
+    assert "parse" in view["error_text"]
+
+
+def test_the_note_about_the_format_does_not_displace_the_routing_note(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+
+    bridge.complete_task(task_id, '{"status": "success"}', note="Ran on w1:p1, not w1:p3")
+
+    error_text = bridge.get_task(task_id)["error_text"]
+    assert "Ran on w1:p1" in error_text
+    assert "summary" in error_text
+
+
+def test_an_agent_that_reports_failure_does_not_fail_the_bridge_task(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+
+    bridge.complete_task(task_id, '{"status": "failed", "summary": "sbatch rejected the script"}')
+
+    view = bridge.task_view(bridge.get_task(task_id))
+    # Two different facts, reported separately: the bridge delivered the
+    # result (done); the work behind it did not succeed (failed). One `done`
+    # must never stand in for both.
+    assert view["status"] == "done"
+    assert view["result_data"]["status"] == "failed"
+
+
+def test_a_late_structured_result_is_parsed_too(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    assert bridge.orphan_task(task_id, "bridge is stopping")
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write(json_module.dumps(STRUCTURED))
+
+    adopted = bridge.task_view(bridge.adopt_late_result(task_id))
+
+    assert adopted["status"] == "done"
+    assert adopted["result_data"] == STRUCTURED
+
+
+def test_a_database_from_before_structured_results_gains_the_column(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, timeout_ms INTEGER NOT NULL, result_text TEXT,
+            error_text TEXT, slurm_policy TEXT, idempotency_key TEXT,
+            request_fingerprint TEXT, recovered_at TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks VALUES ('old', 't', 'a', 'done', 'x', NULL, NULL, 1, "
+        "'{\"summary\": \"looks structured\"}', NULL, NULL, NULL, NULL, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    # A row stored before the feature stays what it was: text. It is not
+    # re-read as something its agent never claimed to write.
+    view = bridge.task_view(bridge.get_task("old"))
+    assert view["result_format"] == "text"
+    assert view["result_data"] is None
+
+
+def test_the_task_endpoints_serve_structured_results(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    assert bridge.claim_task(task_id)
+    bridge.complete_task(task_id, json_module.dumps(STRUCTURED))
+
+    _, one = _get(live_server, f"/tasks/{task_id}")
+    _, many = _get(live_server, "/tasks")
+
+    for task in (one["task"], many["tasks"][0]):
+        assert task["result_format"] == "json"
+        assert task["result_data"] == STRUCTURED
+        assert "result_json" not in task
+
+
+def test_ask_returns_the_structured_form_beside_the_text(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    raw = json_module.dumps(STRUCTURED)
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent(raw))
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 200
+    assert body["result"]["text"] == raw           # the shape clients already read
+    assert body["result"]["format"] == "json"
+    assert body["result"]["data"] == STRUCTURED
+
+
+def test_ask_marks_prose_as_text(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("总结完成"))
+
+    _, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert body["result"]["format"] == "text"
+    assert body["result"]["data"] is None
+
+
+def test_the_delegation_prompt_offers_the_structured_form():
+    prompt = bridge.build_delegation_prompt("检查磁盘", "11111111-2222-3333-4444-555555555555")
+
+    for field in ("summary", "status", "job_ids", "artifacts", "metrics",
+                  "warnings", "changed_files"):
+        assert field in prompt
+    # Still an offer, not a demand: prose must remain a valid answer.
+    assert "纯文本" in prompt
+
+
+# --- re-pointing a task whose agent is gone (opt-in) ----------------------
+#
+# The default stays as it was: a task queued for an agent that no longer exists
+# is failed, never sent anywhere else, because sending work to the wrong agent
+# is worse than not sending it. A caller who does not care which agent runs a
+# task can say so with reroute="any". The task has not started, so nothing can
+# run twice; the row records where it was meant to go.
+
+
+def test_reroute_defaults_to_none_and_rejects_anything_unknown():
+    assert bridge.validate_reroute(None) == "none"
+    assert bridge.validate_reroute("none") == "none"
+    assert bridge.validate_reroute("any") == "any"
+
+    # Not a quiet fallback to the default: a typo would otherwise change what
+    # the caller asked for without telling them.
+    with pytest.raises(ValueError) as error:
+        bridge.validate_reroute("same_family")
+    assert "reroute" in str(error.value)
+
+
+def test_delegate_stores_the_reroute_policy(live_server):
+    _, asked = _post(live_server, "/delegate", {"task": "x", "reroute": "any"})
+    _, default = _post(live_server, "/delegate", {"task": "y"})
+
+    assert bridge.get_task(asked["task_id"])["reroute"] == "any"
+    assert bridge.get_task(default["task_id"])["reroute"] == "none"
+
+
+def test_delegate_refuses_an_unknown_reroute_policy(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "x", "reroute": "yes"})
+
+    assert status == 400
+    assert "reroute" in body["error"]
+
+
+def test_a_request_that_does_not_reroute_keeps_its_old_fingerprint():
+    import hashlib
+
+    old = hashlib.sha256(json_module.dumps(
+        ["t", "a", "submit", 1000], ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")).hexdigest()
+
+    # Otherwise every idempotency key stored before this existed would stop
+    # matching its own retries.
+    assert bridge.request_fingerprint("t", "a", "submit", 1000) == old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none") == old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "any") != old
+
+
+def test_the_same_key_with_a_different_reroute_is_a_different_request(live_server):
+    first = _post(live_server, "/delegate", {"task": "x", "idempotency_key": "k1"})
+    explicit_default = _post(
+        live_server, "/delegate",
+        {"task": "x", "idempotency_key": "k1", "reroute": "none"},
+    )
+    changed = _post(
+        live_server, "/delegate",
+        {"task": "x", "idempotency_key": "k1", "reroute": "any"},
+    )
+
+    assert first[0] == 202
+    assert explicit_default[1]["replayed"] is True     # saying "none" is saying nothing
+    assert changed[0] == 422
+
+
+def test_a_database_from_before_reroute_gains_its_columns(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, timeout_ms INTEGER NOT NULL, result_text TEXT,
+            error_text TEXT, slurm_policy TEXT, idempotency_key TEXT,
+            request_fingerprint TEXT, recovered_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    with bridge.db_session() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert {"reroute", "rerouted_from"} <= columns
+
+
+def _gone_task(tmp_path, monkeypatch, reroute, age=3600, agents=LIVE):
+    """A task queued for `sentinel-claude`, which herdr no longer lists."""
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, agents)
+    monkeypatch.setattr(bridge, "STALE_TARGET_SEC", 600)
+    task_id = bridge.create_task("audit", 60000, "sentinel-claude", reroute=reroute)
+    _age_task(task_id, age)
+    return task_id
+
+
+def _settled(task_id):
+    return lambda: bridge.get_task(task_id)["status"] not in ("queued", "running")
+
+
+def test_an_opted_in_task_for_a_gone_agent_is_re_pointed_and_runs(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any")
+    ran_on = []
+
+    def fake_execute(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        ran_on.append(agent_name)
+        return "ran elsewhere"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", fake_execute)
+
+    _run_worker_until(_settled(task_id))
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "done"
+    assert ran_on == ["w1:p3"]
+    assert row["agent"] == "w1:p3"
+    # The row says where it was meant to go, so the move is not a mystery.
+    assert row["rerouted_from"] == "sentinel-claude"
+
+
+def test_without_the_opt_in_a_task_for_a_gone_agent_is_still_failed(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, None)
+
+    _run_worker_until(_settled(task_id))
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "error"
+    assert row["agent"] == "sentinel-claude"
+    assert row["rerouted_from"] is None
+
+
+def test_a_young_task_is_not_re_pointed_while_its_agent_may_be_restarting(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any", age=5)
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "queued"
+    assert row["agent"] == "sentinel-claude"
+
+
+def test_a_task_is_not_re_pointed_when_herdr_cannot_be_asked(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any")
+    monkeypatch.setattr(bridge, "list_agents", lambda: (None, {"ok": False}))
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    # A herdr that cannot answer proves nothing about the agent.
+    row = bridge.get_task(task_id)
+    assert row["status"] == "queued"
+    assert row["agent"] == "sentinel-claude"
+
+
+def test_nothing_is_re_pointed_to_an_agent_whose_provider_is_blocked(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any")
+    bridge.mark_agent_quota_blocked("w1:p3", "usage limit reached")
+
+    _run_worker_until(_settled(task_id))
+
+    # The only live agent is out of quota: better told so than sent there.
+    row = bridge.get_task(task_id)
+    assert row["status"] == "error"
+    assert row["rerouted_from"] is None
+
+
+def test_with_no_agent_at_all_an_opted_in_task_is_failed_not_kept(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any", agents=[])
+
+    _run_worker_until(_settled(task_id))
+
+    assert bridge.get_task(task_id)["status"] == "error"
+
+
+def test_re_pointing_prefers_an_agent_that_can_take_work_now(tmp_path, monkeypatch):
+    agents = [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "working"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+    ]
+    task_id = _gone_task(tmp_path, monkeypatch, "any", agents=agents)
+    monkeypatch.setattr(bridge, "execute_sentinel_task", lambda *a, **k: "ok")
+
+    _run_worker_until(_settled(task_id))
+
+    assert bridge.get_task(task_id)["rerouted_from"] == "sentinel-claude"
+    assert bridge.get_task(task_id)["agent"] == "w1:p3"
+
+
+def test_a_task_that_has_started_is_never_re_pointed(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "sentinel-claude", reroute="any")
+    assert bridge.claim_task(task_id)
+
+    assert bridge.reroute_task(task_id, "sentinel-claude", "w1:p3") is False
+    assert bridge.get_task(task_id)["agent"] == "sentinel-claude"
+
+
+# --- workflows: cancelling, and tasks that wait on other tasks -----------
+#
+# A task may name other tasks it depends on. Until every one of them is `done`
+# it stays queued, and the worker moves on to whatever else can run. A task can
+# only depend on one that already exists, so the dependency graph is acyclic by
+# construction and needs no cycle check. If something it waits on fails, it is
+# cancelled rather than left to wait forever: it was never sent to any agent,
+# so resubmitting it is safe.
+
+
+def _submit(live_server, task, **extra):
+    status, body = _post(live_server, "/delegate", {"task": task, **extra})
+    assert status == 202, body
+    return body["task_id"]
+
+
+def _queued_after(*dependencies, tmp_path=None, workflow_id=None):
+    """A queued task that waits on `dependencies`, created directly."""
+    return bridge.enqueue_task(
+        "step", 60000, "w1:p1", depends_on=list(dependencies), workflow_id=workflow_id
+    )[0]
+
+
+def test_cancelled_is_final_and_reachable_only_from_a_queued_task():
+    assert "cancelled" in bridge.TASK_STATUSES
+    assert "cancelled" in bridge.TASK_TRANSITIONS["queued"]
+    assert bridge.TASK_TRANSITIONS["cancelled"] == ()
+
+    # Nothing that has been sent to an agent can be cancelled: the bridge has
+    # no way to stop one mid-task.
+    for started in ("running", "done", "error", "orphaned", "quota_exhausted"):
+        assert "cancelled" not in bridge.TASK_TRANSITIONS[started]
+
+
+def test_cancelling_a_queued_task_says_nothing_was_sent(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    assert bridge.cancel_task(task_id) is True
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "cancelled"
+    assert row["finished_at"] is not None
+    assert "never sent" in row["error_text"]
+
+
+def test_a_task_that_has_started_cannot_be_cancelled(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    assert bridge.claim_task(task_id)
+
+    assert bridge.cancel_task(task_id) is False
+    assert bridge.get_task(task_id)["status"] == "running"
+
+
+def test_the_cancel_endpoint_cancels_a_queued_task(live_server):
+    task_id = _submit(live_server, "audit")
+
+    status, body = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 200
+    assert body["status"] == "cancelled"
+    assert bridge.get_task(task_id)["status"] == "cancelled"
+
+
+def test_cancelling_twice_is_not_an_error(live_server):
+    task_id = _submit(live_server, "audit")
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    status, body = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 200
+    assert body["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("state", ["running", "done", "error", "orphaned", "quota_exhausted"])
+def test_the_cancel_endpoint_refuses_a_task_that_already_started(live_server, state):
+    task_id = _submit(live_server, "audit")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (state, task_id))
+
+    status, body = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 409
+    assert body["status"] == state
+    assert bridge.get_task(task_id)["status"] == state
+    # The reason a caller most needs: why it cannot simply be stopped.
+    assert "started" in body["error"] or "finished" in body["error"]
+
+
+def test_the_cancel_endpoint_does_not_know_a_task_that_does_not_exist(live_server):
+    status, body = _post(live_server, "/tasks/no-such-task/cancel", {})
+
+    # Not merely "no such route": the route exists and the task does not.
+    assert status == 404
+    assert body["error"] == "task not found"
+
+
+def test_cancelled_tasks_can_be_listed_by_status(live_server):
+    task_id = _submit(live_server, "audit")
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    status, body = _get(live_server, "/tasks?status=cancelled")
+
+    assert status == 200
+    assert [t["task_id"] for t in body["tasks"]] == [task_id]
+
+
+# -- dependencies ----------------------------------------------------------
+
+
+def test_a_task_records_its_workflow_and_what_it_waits_on(live_server):
+    first = _submit(live_server, "build", workflow_id="run-7")
+    second = _submit(live_server, "train", workflow_id="run-7", depends_on=[first])
+
+    assert bridge.get_task(second)["workflow_id"] == "run-7"
+    assert bridge.list_dependencies(second) == [first]
+    assert bridge.list_dependencies(first) == []
+
+
+def test_depending_on_a_task_that_does_not_exist_is_refused(live_server):
+    status, body = _post(
+        live_server, "/delegate", {"task": "train", "depends_on": ["no-such-task"]}
+    )
+
+    assert status == 422
+    assert body["reason"] == "unknown_dependency"
+    assert body["task_ids"] == ["no-such-task"]
+
+
+@pytest.mark.parametrize("state", ["error", "orphaned", "quota_exhausted", "cancelled"])
+def test_depending_on_a_task_that_has_already_failed_is_refused(live_server, state):
+    first = _submit(live_server, "build")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (state, first))
+
+    status, body = _post(live_server, "/delegate", {"task": "train", "depends_on": [first]})
+
+    # Better told now than cancelled a moment later.
+    assert status == 422
+    assert body["reason"] == "dependency_failed"
+    assert body["task_ids"] == [first]
+
+
+def test_depending_on_a_finished_task_is_fine_and_runs_straight_away(live_server):
+    first = _submit(live_server, "build")
+    assert bridge.claim_task(first)
+    bridge.complete_task(first, "built")
+
+    second = _submit(live_server, "train", depends_on=[first])
+
+    assert bridge.list_dependencies(second) == [first]
+    assert bridge.peek_next_task()["task_id"] == second
+
+
+@pytest.mark.parametrize("bad", ["abc", [1], [""], [["x"]], [None]])
+def test_a_malformed_depends_on_is_a_bad_request(live_server, bad):
+    status, body = _post(live_server, "/delegate", {"task": "t", "depends_on": bad})
+
+    assert status == 400
+    assert "depends_on" in body["error"]
+
+
+def test_depends_on_has_a_ceiling(live_server):
+    status, body = _post(
+        live_server, "/delegate",
+        {"task": "t", "depends_on": [f"id-{i}" for i in range(bridge.MAX_DEPENDENCIES + 1)]},
+    )
+
+    assert status == 400
+    assert "depends_on" in body["error"]
+
+
+def test_a_repeated_dependency_counts_once(live_server):
+    first = _submit(live_server, "build")
+
+    second = _submit(live_server, "train", depends_on=[first, first])
+
+    assert bridge.list_dependencies(second) == [first]
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "x" * 101, "bad\nid", 5])
+def test_a_malformed_workflow_id_is_a_bad_request(live_server, bad):
+    status, body = _post(live_server, "/delegate", {"task": "t", "workflow_id": bad})
+
+    assert status == 400
+    assert "workflow_id" in body["error"]
+
+
+# -- scheduling ------------------------------------------------------------
+
+
+def test_a_task_waits_until_everything_it_depends_on_is_done(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("build", 60000, "w1:p1")
+    second = _queued_after(first)
+
+    assert bridge.claim_task(first)
+    # `first` is running: `second` is not yet eligible, and nothing else is.
+    assert bridge.peek_next_task() is None
+
+    bridge.complete_task(first, "built")
+    assert bridge.peek_next_task()["task_id"] == second
+
+
+def test_a_blocked_task_does_not_hold_up_one_that_can_run(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("build", 60000, "w1:p1")
+    assert bridge.claim_task(first)
+    blocked = _queued_after(first)
+    free = bridge.create_task("unrelated", 60000, "w1:p1")
+
+    # `blocked` is older than `free`, and still does not stand in its way.
+    assert bridge.peek_next_task()["task_id"] == free
+
+
+def test_every_dependency_must_be_done_not_just_one(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    a = bridge.create_task("a", 60000, "w1:p1")
+    b = bridge.create_task("b", 60000, "w1:p1")
+    join = _queued_after(a, b)
+    for t in (a, b):
+        assert bridge.claim_task(t)
+
+    bridge.complete_task(a, "a")
+    assert bridge.peek_next_task() is None
+
+    bridge.complete_task(b, "b")
+    assert bridge.peek_next_task()["task_id"] == join
+
+
+def test_the_worker_runs_a_chain_in_order(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    order = []
+
+    def fake_execute(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        order.append(task)
+        return f"{task} done"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", fake_execute)
+    c = None
+    a = bridge.enqueue_task("A", 60000, "w1:p1")[0]
+    b = bridge.enqueue_task("B", 60000, "w1:p1", depends_on=[a])[0]
+    c = bridge.enqueue_task("C", 60000, "w1:p1", depends_on=[b])[0]
+
+    _run_worker_until(lambda: bridge.get_task(c)["status"] == "done")
+
+    assert order == ["A", "B", "C"]
+
+
+# -- failure cascades ------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", ["error", "orphaned", "quota_exhausted", "cancelled"])
+def test_a_task_is_cancelled_when_something_it_waits_on_fails(tmp_path, monkeypatch, state):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("build", 60000, "w1:p1")
+    second = _queued_after(first)
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (state, first))
+
+    assert bridge.cancel_blocked_tasks() == 1
+
+    row = bridge.get_task(second)
+    assert row["status"] == "cancelled"
+    assert first in row["error_text"] and state in row["error_text"]
+    assert "never sent" in row["error_text"]
+
+
+def test_a_cascade_reaches_every_descendant(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    a = bridge.create_task("a", 60000, "w1:p1")
+    b = _queued_after(a)
+    c = _queued_after(b)
+    d = _queued_after(a, c)
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (a,))
+
+    assert bridge.cancel_blocked_tasks() == 3
+
+    assert [bridge.get_task(t)["status"] for t in (b, c, d)] == ["cancelled"] * 3
+
+
+def test_a_cascade_leaves_alone_what_is_not_blocked_by_the_failure(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    failed = bridge.create_task("a", 60000, "w1:p1")
+    healthy = bridge.create_task("h", 60000, "w1:p1")
+    on_healthy = _queued_after(healthy)
+    unrelated = bridge.create_task("u", 60000, "w1:p1")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (failed,))
+
+    assert bridge.cancel_blocked_tasks() == 0
+
+    assert bridge.get_task(on_healthy)["status"] == "queued"
+    assert bridge.get_task(unrelated)["status"] == "queued"
+
+
+def test_a_dependent_that_has_started_is_not_cancelled(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("a", 60000, "w1:p1")
+    second = _queued_after(first)
+    assert bridge.claim_task(first)
+    bridge.complete_task(first, "ok")
+    assert bridge.claim_task(second)
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (first,))
+
+    assert bridge.cancel_blocked_tasks() == 0
+    assert bridge.get_task(second)["status"] == "running"
+
+
+def test_cancelling_a_task_cancels_what_waits_on_it(live_server):
+    first = _submit(live_server, "build")
+    second = _submit(live_server, "train", depends_on=[first])
+
+    _post(live_server, f"/tasks/{first}/cancel", {})
+    bridge.cancel_blocked_tasks()
+
+    assert bridge.get_task(second)["status"] == "cancelled"
+
+
+def test_the_worker_cancels_the_dependents_of_a_failed_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+
+    def fails(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        raise RuntimeError("the build broke")
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", fails)
+    first = bridge.enqueue_task("build", 60000, "w1:p1")[0]
+    second = bridge.enqueue_task("train", 60000, "w1:p1", depends_on=[first])[0]
+
+    _run_worker_until(lambda: bridge.get_task(second)["status"] == "cancelled")
+
+    assert bridge.get_task(first)["status"] == "error"
+    assert bridge.get_task(second)["status"] == "cancelled"
+
+
+# -- seeing it -------------------------------------------------------------
+
+
+def test_a_waiting_task_says_what_it_is_waiting_for(live_server):
+    first = _submit(live_server, "build")
+    second = _submit(live_server, "train", depends_on=[first])
+
+    _, body = _get(live_server, f"/tasks/{second}")
+
+    task = body["task"]
+    assert task["depends_on"] == [first]
+    assert first in task["queued_reason"]
+    assert "waiting" in task["queued_reason"].lower()
+
+
+def test_a_task_with_nothing_to_wait_for_keeps_its_ordinary_reason(live_server):
+    task_id = _submit(live_server, "build")
+
+    _, body = _get(live_server, f"/tasks/{task_id}")
+
+    assert body["task"]["depends_on"] == []
+    assert "waiting for task" not in (body["task"]["queued_reason"] or "").lower()
+
+
+def test_a_workflow_lists_its_tasks_and_how_far_along_it_is(live_server):
+    a = _submit(live_server, "build", workflow_id="run-7")
+    b = _submit(live_server, "train", workflow_id="run-7", depends_on=[a])
+    _submit(live_server, "elsewhere", workflow_id="run-8")
+
+    status, body = _get(live_server, "/workflows/run-7")
+
+    assert status == 200
+    assert body["workflow_id"] == "run-7"
+    assert [t["task_id"] for t in body["tasks"]] == [a, b]
+    assert body["tasks"][1]["depends_on"] == [a]
+    assert body["counts"] == {"queued": 2}
+    assert body["state"] == "in_progress"
+
+
+def test_a_workflow_is_done_when_every_task_is(live_server):
+    a = _submit(live_server, "build", workflow_id="run-7")
+    assert bridge.claim_task(a)
+    bridge.complete_task(a, "ok")
+
+    _, body = _get(live_server, "/workflows/run-7")
+
+    assert body["state"] == "done"
+    assert body["counts"] == {"done": 1}
+
+
+def test_a_workflow_has_failed_when_it_has_stopped_short_of_done(live_server):
+    a = _submit(live_server, "build", workflow_id="run-7")
+    b = _submit(live_server, "train", workflow_id="run-7", depends_on=[a])
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (a,))
+    bridge.cancel_blocked_tasks()
+
+    _, body = _get(live_server, "/workflows/run-7")
+
+    assert body["state"] == "failed"
+    assert body["counts"] == {"error": 1, "cancelled": 1}
+
+
+def test_an_unknown_workflow_is_not_found(live_server):
+    status, body = _get(live_server, "/workflows/never-heard-of-it")
+
+    assert status == 404
+    assert body["error"] == "workflow not found"
+
+
+# -- retries and old databases ---------------------------------------------
+
+
+def test_a_request_without_a_workflow_keeps_its_old_fingerprint():
+    import hashlib
+
+    old = hashlib.sha256(json_module.dumps(
+        ["t", "a", "submit", 1000], ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")).hexdigest()
+
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none", None, ()) == old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none", "w", ()) != old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none", None, ("x",)) != old
+    # Which of the two extras is set must matter, or one could pose as the other.
+    assert (
+        bridge.request_fingerprint("t", "a", "submit", 1000, "any", None, ())
+        != bridge.request_fingerprint("t", "a", "submit", 1000, "none", "any", ())
+    )
+
+
+def test_the_same_key_with_different_dependencies_is_a_different_request(live_server):
+    first = _submit(live_server, "build")
+
+    one = _post(live_server, "/delegate", {"task": "t", "idempotency_key": "k"})
+    two = _post(live_server, "/delegate", {"task": "t", "idempotency_key": "k", "depends_on": [first]})
+
+    assert one[0] == 202
+    assert two[0] == 422
+
+
+def test_a_database_from_before_workflows_gains_what_it_needs(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, timeout_ms INTEGER NOT NULL, result_text TEXT,
+            error_text TEXT, slurm_policy TEXT, idempotency_key TEXT,
+            request_fingerprint TEXT, recovered_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    with bridge.db_session() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "workflow_id" in columns
+    assert "task_deps" in tables
+
+
+# --- the event stream -----------------------------------------------------
+#
+# Polling /tasks/<id> shows where a task is now, not that it moved, and a
+# caller that looks away misses anything that came and went. Every status
+# change is also written as an event, in the same transaction as the change, so
+# there is never a change without its event or an event without its change. A
+# caller keeps the last `seq` it saw and asks for what came after; reconnecting
+# neither misses nor repeats anything.
+
+
+def _events(after=0, **filters):
+    return bridge.list_events(after=after, **filters)
+
+
+def _moves(events):
+    return [(e["from_status"], e["to_status"]) for e in events]
+
+
+def test_creating_a_task_is_an_event(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    [event] = _events()
+
+    assert event["task_id"] == task_id
+    assert event["from_status"] is None
+    assert event["to_status"] == "queued"
+    assert event["at"]
+
+
+def test_every_status_change_is_an_event_in_order(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    bridge.claim_task(task_id)
+    bridge.complete_task(task_id, "done")
+
+    events = _events()
+
+    assert _moves(events) == [(None, "queued"), ("queued", "running"), ("running", "done")]
+    assert [e["seq"] for e in events] == sorted(e["seq"] for e in events)
+    assert len({e["seq"] for e in events}) == 3
+
+
+def test_a_lost_race_leaves_no_event(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    before = len(_events())
+
+    # Not running, so there is nothing to complete -- and nothing to announce.
+    assert bridge.complete_task(task_id, "x") is False
+
+    assert len(_events()) == before
+
+
+def test_an_illegal_transition_leaves_no_event(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("done")
+    before = len(_events())
+
+    with pytest.raises(ValueError):
+        bridge.transition(task_id, "queued", expect="done")
+
+    assert len(_events()) == before
+
+
+def test_the_event_and_the_change_stand_or_fall_together(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("could not write the event")
+
+    monkeypatch.setattr(bridge, "_record_event", boom)
+
+    with pytest.raises(RuntimeError):
+        bridge.claim_task(task_id)
+
+    # The status change rolled back with the event that failed.
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+def test_an_event_names_the_workflow_it_belongs_to(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.enqueue_task("audit", 60000, "w1:p1", workflow_id="run-7")[0]
+    bridge.claim_task(task_id)
+
+    assert {e["workflow_id"] for e in _events()} == {"run-7"}
+
+
+def test_shutting_down_announces_every_task_it_orphans(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    ids = [bridge.create_task(f"t{i}", 60000, "w1:p1") for i in range(3)]
+    for task_id in ids[:2]:
+        assert bridge.claim_task(task_id)
+    mark = max(e["seq"] for e in _events())
+
+    assert bridge.orphan_running_tasks("bridge is stopping") == 2
+
+    after = _events(after=mark)
+    assert sorted(e["task_id"] for e in after) == sorted(ids[:2])
+    assert set(_moves(after)) == {("running", "orphaned")}
+
+
+def test_a_restart_announces_the_tasks_it_found_running(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    bridge.claim_task(task_id)
+    mark = max(e["seq"] for e in _events())
+
+    bridge.init_db()      # what a restart does
+
+    [event] = _events(after=mark)
+    assert (event["task_id"], event["from_status"], event["to_status"]) == (task_id, "running", "orphaned")
+
+
+def test_a_late_result_is_announced_with_what_it_replaced(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    bridge.claim_task(task_id)
+    bridge.orphan_task(task_id, "stopped")
+    mark = max(e["seq"] for e in _events())
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write("the answer")
+
+    bridge.adopt_late_result(task_id)
+
+    assert _moves(_events(after=mark)) == [("orphaned", "done")]
+
+
+def test_a_cascade_cancellation_is_announced(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("a", 60000, "w1:p1")
+    second = bridge.enqueue_task("b", 60000, "w1:p1", depends_on=[first])[0]
+    bridge.claim_task(first)
+    bridge.fail_task(first, "broke")
+    mark = max(e["seq"] for e in _events())
+
+    bridge.cancel_blocked_tasks()
+
+    [event] = _events(after=mark)
+    assert (event["task_id"], event["from_status"], event["to_status"]) == (second, "queued", "cancelled")
+
+
+def test_a_synchronous_ask_that_leaves_a_row_announces_it(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    bridge.record_sync_failure("t-sync", "audit", 1000, "w1:p1", None, "orphaned", "timed out")
+
+    [event] = _events()
+    assert (event["task_id"], event["from_status"], event["to_status"]) == ("t-sync", None, "orphaned")
+
+
+def test_events_can_be_filtered_by_task_and_workflow(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    a = bridge.enqueue_task("a", 60000, "w1:p1", workflow_id="run-7")[0]
+    b = bridge.enqueue_task("b", 60000, "w1:p1", workflow_id="run-8")[0]
+
+    assert {e["task_id"] for e in _events(workflow_id="run-7")} == {a}
+    assert {e["task_id"] for e in _events(task_id=b)} == {b}
+
+
+def test_a_database_from_before_events_gains_the_table(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, task TEXT NOT NULL, "
+        "agent TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "started_at TEXT, finished_at TEXT, timeout_ms INTEGER NOT NULL, "
+        "result_text TEXT, error_text TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    assert _events() == []
+    bridge.create_task("audit", 60000, "w1:p1")
+    assert len(_events()) == 1
+
+
+# -- over HTTP -------------------------------------------------------------
+
+
+def test_the_events_endpoint_returns_events_and_a_cursor(live_server):
+    task_id = _submit(live_server, "audit")
+
+    status, body = _get(live_server, "/events")
+
+    assert status == 200
+    assert [e["task_id"] for e in body["events"]] == [task_id]
+    assert body["next"] == body["events"][-1]["seq"]
+
+
+def test_resuming_from_the_cursor_neither_misses_nor_repeats(live_server):
+    ids = [_submit(live_server, f"t{i}") for i in range(5)]
+    for task_id in ids:
+        bridge.claim_task(task_id)
+
+    everything = _get(live_server, "/events?limit=500")[1]["events"]
+    assert len(everything) == 10
+
+    seen, cursor = [], 0
+    while True:
+        _, page = _get(live_server, f"/events?after={cursor}&limit=3")
+        if not page["events"]:
+            break
+        seen += page["events"]
+        cursor = page["next"]
+
+    assert [e["seq"] for e in seen] == [e["seq"] for e in everything]
+
+
+def test_an_empty_poll_hands_back_the_cursor_it_was_given(live_server):
+    _submit(live_server, "audit")
+    cursor = _get(live_server, "/events")[1]["next"]
+
+    status, body = _get(live_server, f"/events?after={cursor}")
+
+    assert status == 200
+    assert body["events"] == []
+    assert body["next"] == cursor
+
+
+def test_the_events_endpoint_filters(live_server):
+    a = _submit(live_server, "a", workflow_id="run-7")
+    _submit(live_server, "b", workflow_id="run-8")
+
+    by_workflow = _get(live_server, "/events?workflow_id=run-7")[1]["events"]
+    by_task = _get(live_server, f"/events?task_id={a}")[1]["events"]
+
+    assert {e["task_id"] for e in by_workflow} == {a}
+    assert {e["task_id"] for e in by_task} == {a}
+
+
+@pytest.mark.parametrize("query", [
+    "after=-1", "after=abc", "limit=0", "limit=100000", "limit=x", "wait=-1", "wait=1000", "wait=x",
+])
+def test_the_events_endpoint_refuses_a_bad_query(live_server, query):
+    status, body = _get(live_server, f"/events?{query}")
+
+    assert status == 400
+    assert not body["ok"]
+
+
+def test_a_long_poll_returns_as_soon_as_something_happens(live_server):
+    task_id = _submit(live_server, "audit")
+    cursor = _get(live_server, "/events")[1]["next"]
+    answer = {}
+
+    def poll():
+        started = time.monotonic()
+        answer["body"] = _get(live_server, f"/events?after={cursor}&wait=8")[1]
+        answer["took"] = time.monotonic() - started
+
+    poller = threading_module.Thread(target=poll)
+    poller.start()
+    time.sleep(0.4)
+    bridge.claim_task(task_id)
+    poller.join(timeout=10)
+
+    assert [(e["from_status"], e["to_status"]) for e in answer["body"]["events"]] == [("queued", "running")]
+    assert answer["took"] < 5     # it did not sit out the whole wait
+
+
+def test_a_long_poll_with_nothing_to_report_gives_up_when_the_wait_is_over(live_server):
+    cursor = _get(live_server, "/events")[1]["next"]
+
+    started = time.monotonic()
+    status, body = _get(live_server, f"/events?after={cursor}&wait=1")
+    took = time.monotonic() - started
+
+    assert status == 200
+    assert body["events"] == [] and body["next"] == cursor
+    assert 0.8 <= took < 4
+
+
+def test_a_long_poll_does_not_hold_up_a_shutdown(live_server, monkeypatch):
+    cursor = _get(live_server, "/events")[1]["next"]
+    # A watcher parked for half a minute would otherwise outlast the grace
+    # period, and the bridge would be stopped with a request still open.
+    monkeypatch.setattr(bridge, "_shutting_down", True)
+
+    started = time.monotonic()
+    status, body = _get(live_server, f"/events?after={cursor}&wait=8")
+    took = time.monotonic() - started
+
+    assert status == 200
+    assert body["events"] == []
+    assert took < 2
+
+
+# --- the newer endpoints are behind the token like the rest ----------------
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/events"),
+    ("GET", "/workflows/run-7"),
+    ("POST", "/tasks/some-task/cancel"),
+])
+def test_the_workflow_and_event_endpoints_refuse_a_caller_without_the_token(live_server, monkeypatch, method, path):
+    # A route added later is the easiest place to forget the check, and these
+    # expose task text, results and the means to cancel work.
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request(method, path, body=b"{}" if method == "POST" else None)
+    response = conn.getresponse()
+    response.read()
+    conn.close()
+
+    assert response.status == 401
+
+
+def test_the_workflow_and_event_endpoints_accept_the_token(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("GET", "/events", headers={"X-Sentinel-Token": "s3cret"})
+    response = conn.getresponse()
+    response.read()
+    conn.close()
+
+    assert response.status == 200
+
+
+# --- found in review ------------------------------------------------------
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_a_non_finite_metric_is_not_accepted_as_structured(token):
+    # json.loads reads these, and the API would then write them back out as bare
+    # tokens that are not JSON: a strict parser (Windows PowerShell 5.1's
+    # ConvertFrom-Json among them) rejects the whole reply, status included.
+    data, problem = bridge.parse_structured_result(
+        '{"summary": "diverged", "metrics": {"loss": ' + token + "}}"
+    )
+
+    assert data is None
+    assert "finite" in problem
+
+
+def test_a_task_with_a_non_finite_metric_is_still_served_as_valid_json(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("train", 60000, "w1:p1")
+    assert bridge.claim_task(task_id)
+    bridge.complete_task(task_id, '{"summary": "diverged", "metrics": {"loss": NaN}}')
+
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("GET", f"/tasks/{task_id}")
+    raw = conn.getresponse().read().decode("utf-8")
+    conn.close()
+
+    def strict(token):
+        raise ValueError(f"not JSON: {token}")
+
+    # Parsed the way a strict client would: no NaN or Infinity allowed.
+    assert json_module.loads(raw, parse_constant=strict)["task"]["result_format"] == "text"
+
+
+def test_an_event_cursor_beyond_what_the_database_can_hold_is_a_bad_request(live_server):
+    status, body = _get(live_server, "/events?after=99999999999999999999")
+
+    assert status == 400
+    assert "after" in body["error"]
+
+
+def test_a_workflow_whose_tasks_were_all_cancelled_is_cancelled_not_failed():
+    assert bridge.workflow_state({"cancelled": 3}) == "cancelled"
+    # Cancelled alongside work that finished or broke is still a stop short of done.
+    assert bridge.workflow_state({"done": 1, "cancelled": 2}) == "failed"
+    assert bridge.workflow_state({"error": 1, "cancelled": 2}) == "failed"
+
+
+def test_the_workflow_endpoint_reports_a_fully_cancelled_workflow(live_server):
+    task_id = _submit(live_server, "audit", workflow_id="run-9")
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert _get(live_server, "/workflows/run-9")[1]["state"] == "cancelled"
+
+
+def test_reading_a_workflow_does_not_cost_a_connection_per_task(live_server, monkeypatch):
+    def connections_to_read(workflow_id):
+        opened = []
+        real = bridge.db_connect
+        monkeypatch.setattr(bridge, "db_connect", lambda: opened.append(1) or real())
+        _get(live_server, f"/workflows/{workflow_id}")
+        monkeypatch.setattr(bridge, "db_connect", real)
+        return len(opened)
+
+    _submit(live_server, "only", workflow_id="small")
+    for i in range(6):
+        _submit(live_server, f"step {i}", workflow_id="large")
+
+    assert connections_to_read("large") == connections_to_read("small")
+
+
+def test_the_cancel_endpoint_consumes_the_request_body(live_server, monkeypatch):
+    # Closing a socket with unread data can reset the connection on Linux and
+    # take the reply with it, so a cancel that worked would look like a failure.
+    reads = []
+    real = bridge.Handler.read_json
+    monkeypatch.setattr(bridge.Handler, "read_json", lambda self: reads.append(1) or real(self))
+    task_id = _submit(live_server, "audit")
+    reads.clear()           # the submit above read a body of its own
+
+    status, _ = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 200
+    assert reads
+
+
+def test_workflow_and_idempotency_labels_are_judged_alike():
+    # One rule for what a caller-chosen label may look like.
+    for bad in ("", "   ", "bad\nlabel", "x" * 256):
+        with pytest.raises(ValueError):
+            bridge.validate_idempotency_key(bad)
+        with pytest.raises(ValueError):
+            bridge.validate_workflow_id(bad)
