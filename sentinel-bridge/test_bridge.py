@@ -4685,12 +4685,12 @@ def test_every_status_has_a_row_in_the_transition_table():
         assert set(targets) <= set(bridge.TASK_STATUSES)
 
 
-def test_only_done_and_quota_exhausted_are_final():
+def test_only_done_quota_exhausted_and_cancelled_are_final():
     final = {s for s, targets in bridge.TASK_TRANSITIONS.items() if not targets}
 
     # error and orphaned are deliberately not final: a result file that turns
     # up late turns them into done (adopt_late_result).
-    assert final == {"done", "quota_exhausted"}
+    assert final == {"done", "quota_exhausted", "cancelled"}
 
 
 @pytest.mark.parametrize(
@@ -5298,6 +5298,473 @@ def test_a_task_that_has_started_is_never_re_pointed(tmp_path, monkeypatch):
     assert bridge.get_task(task_id)["agent"] == "sentinel-claude"
 
 
+# --- workflows: cancelling, and tasks that wait on other tasks -----------
+#
+# A task may name other tasks it depends on. Until every one of them is `done`
+# it stays queued, and the worker moves on to whatever else can run. A task can
+# only depend on one that already exists, so the dependency graph is acyclic by
+# construction and needs no cycle check. If something it waits on fails, it is
+# cancelled rather than left to wait forever: it was never sent to any agent,
+# so resubmitting it is safe.
+
+
+def _submit(live_server, task, **extra):
+    status, body = _post(live_server, "/delegate", {"task": task, **extra})
+    assert status == 202, body
+    return body["task_id"]
+
+
+def _queued_after(*dependencies, tmp_path=None, workflow_id=None):
+    """A queued task that waits on `dependencies`, created directly."""
+    return bridge.enqueue_task(
+        "step", 60000, "w1:p1", depends_on=list(dependencies), workflow_id=workflow_id
+    )[0]
+
+
+def test_cancelled_is_final_and_reachable_only_from_a_queued_task():
+    assert "cancelled" in bridge.TASK_STATUSES
+    assert "cancelled" in bridge.TASK_TRANSITIONS["queued"]
+    assert bridge.TASK_TRANSITIONS["cancelled"] == ()
+
+    # Nothing that has been sent to an agent can be cancelled: the bridge has
+    # no way to stop one mid-task.
+    for started in ("running", "done", "error", "orphaned", "quota_exhausted"):
+        assert "cancelled" not in bridge.TASK_TRANSITIONS[started]
+
+
+def test_cancelling_a_queued_task_says_nothing_was_sent(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    assert bridge.cancel_task(task_id) is True
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "cancelled"
+    assert row["finished_at"] is not None
+    assert "never sent" in row["error_text"]
+
+
+def test_a_task_that_has_started_cannot_be_cancelled(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    assert bridge.claim_task(task_id)
+
+    assert bridge.cancel_task(task_id) is False
+    assert bridge.get_task(task_id)["status"] == "running"
+
+
+def test_the_cancel_endpoint_cancels_a_queued_task(live_server):
+    task_id = _submit(live_server, "audit")
+
+    status, body = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 200
+    assert body["status"] == "cancelled"
+    assert bridge.get_task(task_id)["status"] == "cancelled"
+
+
+def test_cancelling_twice_is_not_an_error(live_server):
+    task_id = _submit(live_server, "audit")
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    status, body = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 200
+    assert body["status"] == "cancelled"
+
+
+@pytest.mark.parametrize("state", ["running", "done", "error", "orphaned", "quota_exhausted"])
+def test_the_cancel_endpoint_refuses_a_task_that_already_started(live_server, state):
+    task_id = _submit(live_server, "audit")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (state, task_id))
+
+    status, body = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 409
+    assert body["status"] == state
+    assert bridge.get_task(task_id)["status"] == state
+    # The reason a caller most needs: why it cannot simply be stopped.
+    assert "started" in body["error"] or "finished" in body["error"]
+
+
+def test_the_cancel_endpoint_does_not_know_a_task_that_does_not_exist(live_server):
+    status, body = _post(live_server, "/tasks/no-such-task/cancel", {})
+
+    # Not merely "no such route": the route exists and the task does not.
+    assert status == 404
+    assert body["error"] == "task not found"
+
+
+def test_cancelled_tasks_can_be_listed_by_status(live_server):
+    task_id = _submit(live_server, "audit")
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    status, body = _get(live_server, "/tasks?status=cancelled")
+
+    assert status == 200
+    assert [t["task_id"] for t in body["tasks"]] == [task_id]
+
+
+# -- dependencies ----------------------------------------------------------
+
+
+def test_a_task_records_its_workflow_and_what_it_waits_on(live_server):
+    first = _submit(live_server, "build", workflow_id="run-7")
+    second = _submit(live_server, "train", workflow_id="run-7", depends_on=[first])
+
+    assert bridge.get_task(second)["workflow_id"] == "run-7"
+    assert bridge.list_dependencies(second) == [first]
+    assert bridge.list_dependencies(first) == []
+
+
+def test_depending_on_a_task_that_does_not_exist_is_refused(live_server):
+    status, body = _post(
+        live_server, "/delegate", {"task": "train", "depends_on": ["no-such-task"]}
+    )
+
+    assert status == 422
+    assert body["reason"] == "unknown_dependency"
+    assert body["task_ids"] == ["no-such-task"]
+
+
+@pytest.mark.parametrize("state", ["error", "orphaned", "quota_exhausted", "cancelled"])
+def test_depending_on_a_task_that_has_already_failed_is_refused(live_server, state):
+    first = _submit(live_server, "build")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (state, first))
+
+    status, body = _post(live_server, "/delegate", {"task": "train", "depends_on": [first]})
+
+    # Better told now than cancelled a moment later.
+    assert status == 422
+    assert body["reason"] == "dependency_failed"
+    assert body["task_ids"] == [first]
+
+
+def test_depending_on_a_finished_task_is_fine_and_runs_straight_away(live_server):
+    first = _submit(live_server, "build")
+    assert bridge.claim_task(first)
+    bridge.complete_task(first, "built")
+
+    second = _submit(live_server, "train", depends_on=[first])
+
+    assert bridge.list_dependencies(second) == [first]
+    assert bridge.peek_next_task()["task_id"] == second
+
+
+@pytest.mark.parametrize("bad", ["abc", [1], [""], [["x"]], [None]])
+def test_a_malformed_depends_on_is_a_bad_request(live_server, bad):
+    status, body = _post(live_server, "/delegate", {"task": "t", "depends_on": bad})
+
+    assert status == 400
+    assert "depends_on" in body["error"]
+
+
+def test_depends_on_has_a_ceiling(live_server):
+    status, body = _post(
+        live_server, "/delegate",
+        {"task": "t", "depends_on": [f"id-{i}" for i in range(bridge.MAX_DEPENDENCIES + 1)]},
+    )
+
+    assert status == 400
+    assert "depends_on" in body["error"]
+
+
+def test_a_repeated_dependency_counts_once(live_server):
+    first = _submit(live_server, "build")
+
+    second = _submit(live_server, "train", depends_on=[first, first])
+
+    assert bridge.list_dependencies(second) == [first]
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "x" * 101, "bad\nid", 5])
+def test_a_malformed_workflow_id_is_a_bad_request(live_server, bad):
+    status, body = _post(live_server, "/delegate", {"task": "t", "workflow_id": bad})
+
+    assert status == 400
+    assert "workflow_id" in body["error"]
+
+
+# -- scheduling ------------------------------------------------------------
+
+
+def test_a_task_waits_until_everything_it_depends_on_is_done(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("build", 60000, "w1:p1")
+    second = _queued_after(first)
+
+    assert bridge.claim_task(first)
+    # `first` is running: `second` is not yet eligible, and nothing else is.
+    assert bridge.peek_next_task() is None
+
+    bridge.complete_task(first, "built")
+    assert bridge.peek_next_task()["task_id"] == second
+
+
+def test_a_blocked_task_does_not_hold_up_one_that_can_run(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("build", 60000, "w1:p1")
+    assert bridge.claim_task(first)
+    blocked = _queued_after(first)
+    free = bridge.create_task("unrelated", 60000, "w1:p1")
+
+    # `blocked` is older than `free`, and still does not stand in its way.
+    assert bridge.peek_next_task()["task_id"] == free
+
+
+def test_every_dependency_must_be_done_not_just_one(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    a = bridge.create_task("a", 60000, "w1:p1")
+    b = bridge.create_task("b", 60000, "w1:p1")
+    join = _queued_after(a, b)
+    for t in (a, b):
+        assert bridge.claim_task(t)
+
+    bridge.complete_task(a, "a")
+    assert bridge.peek_next_task() is None
+
+    bridge.complete_task(b, "b")
+    assert bridge.peek_next_task()["task_id"] == join
+
+
+def test_the_worker_runs_a_chain_in_order(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+    order = []
+
+    def fake_execute(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        order.append(task)
+        return f"{task} done"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", fake_execute)
+    c = None
+    a = bridge.enqueue_task("A", 60000, "w1:p1")[0]
+    b = bridge.enqueue_task("B", 60000, "w1:p1", depends_on=[a])[0]
+    c = bridge.enqueue_task("C", 60000, "w1:p1", depends_on=[b])[0]
+
+    _run_worker_until(lambda: bridge.get_task(c)["status"] == "done")
+
+    assert order == ["A", "B", "C"]
+
+
+# -- failure cascades ------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", ["error", "orphaned", "quota_exhausted", "cancelled"])
+def test_a_task_is_cancelled_when_something_it_waits_on_fails(tmp_path, monkeypatch, state):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("build", 60000, "w1:p1")
+    second = _queued_after(first)
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (state, first))
+
+    assert bridge.cancel_blocked_tasks() == 1
+
+    row = bridge.get_task(second)
+    assert row["status"] == "cancelled"
+    assert first in row["error_text"] and state in row["error_text"]
+    assert "never sent" in row["error_text"]
+
+
+def test_a_cascade_reaches_every_descendant(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    a = bridge.create_task("a", 60000, "w1:p1")
+    b = _queued_after(a)
+    c = _queued_after(b)
+    d = _queued_after(a, c)
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (a,))
+
+    assert bridge.cancel_blocked_tasks() == 3
+
+    assert [bridge.get_task(t)["status"] for t in (b, c, d)] == ["cancelled"] * 3
+
+
+def test_a_cascade_leaves_alone_what_is_not_blocked_by_the_failure(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    failed = bridge.create_task("a", 60000, "w1:p1")
+    healthy = bridge.create_task("h", 60000, "w1:p1")
+    on_healthy = _queued_after(healthy)
+    unrelated = bridge.create_task("u", 60000, "w1:p1")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (failed,))
+
+    assert bridge.cancel_blocked_tasks() == 0
+
+    assert bridge.get_task(on_healthy)["status"] == "queued"
+    assert bridge.get_task(unrelated)["status"] == "queued"
+
+
+def test_a_dependent_that_has_started_is_not_cancelled(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("a", 60000, "w1:p1")
+    second = _queued_after(first)
+    assert bridge.claim_task(first)
+    bridge.complete_task(first, "ok")
+    assert bridge.claim_task(second)
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (first,))
+
+    assert bridge.cancel_blocked_tasks() == 0
+    assert bridge.get_task(second)["status"] == "running"
+
+
+def test_cancelling_a_task_cancels_what_waits_on_it(live_server):
+    first = _submit(live_server, "build")
+    second = _submit(live_server, "train", depends_on=[first])
+
+    _post(live_server, f"/tasks/{first}/cancel", {})
+    bridge.cancel_blocked_tasks()
+
+    assert bridge.get_task(second)["status"] == "cancelled"
+
+
+def test_the_worker_cancels_the_dependents_of_a_failed_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
+
+    def fails(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        raise RuntimeError("the build broke")
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", fails)
+    first = bridge.enqueue_task("build", 60000, "w1:p1")[0]
+    second = bridge.enqueue_task("train", 60000, "w1:p1", depends_on=[first])[0]
+
+    _run_worker_until(lambda: bridge.get_task(second)["status"] == "cancelled")
+
+    assert bridge.get_task(first)["status"] == "error"
+    assert bridge.get_task(second)["status"] == "cancelled"
+
+
+# -- seeing it -------------------------------------------------------------
+
+
+def test_a_waiting_task_says_what_it_is_waiting_for(live_server):
+    first = _submit(live_server, "build")
+    second = _submit(live_server, "train", depends_on=[first])
+
+    _, body = _get(live_server, f"/tasks/{second}")
+
+    task = body["task"]
+    assert task["depends_on"] == [first]
+    assert first in task["queued_reason"]
+    assert "waiting" in task["queued_reason"].lower()
+
+
+def test_a_task_with_nothing_to_wait_for_keeps_its_ordinary_reason(live_server):
+    task_id = _submit(live_server, "build")
+
+    _, body = _get(live_server, f"/tasks/{task_id}")
+
+    assert body["task"]["depends_on"] == []
+    assert "waiting for task" not in (body["task"]["queued_reason"] or "").lower()
+
+
+def test_a_workflow_lists_its_tasks_and_how_far_along_it_is(live_server):
+    a = _submit(live_server, "build", workflow_id="run-7")
+    b = _submit(live_server, "train", workflow_id="run-7", depends_on=[a])
+    _submit(live_server, "elsewhere", workflow_id="run-8")
+
+    status, body = _get(live_server, "/workflows/run-7")
+
+    assert status == 200
+    assert body["workflow_id"] == "run-7"
+    assert [t["task_id"] for t in body["tasks"]] == [a, b]
+    assert body["tasks"][1]["depends_on"] == [a]
+    assert body["counts"] == {"queued": 2}
+    assert body["state"] == "in_progress"
+
+
+def test_a_workflow_is_done_when_every_task_is(live_server):
+    a = _submit(live_server, "build", workflow_id="run-7")
+    assert bridge.claim_task(a)
+    bridge.complete_task(a, "ok")
+
+    _, body = _get(live_server, "/workflows/run-7")
+
+    assert body["state"] == "done"
+    assert body["counts"] == {"done": 1}
+
+
+def test_a_workflow_has_failed_when_it_has_stopped_short_of_done(live_server):
+    a = _submit(live_server, "build", workflow_id="run-7")
+    b = _submit(live_server, "train", workflow_id="run-7", depends_on=[a])
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = 'error' WHERE task_id = ?", (a,))
+    bridge.cancel_blocked_tasks()
+
+    _, body = _get(live_server, "/workflows/run-7")
+
+    assert body["state"] == "failed"
+    assert body["counts"] == {"error": 1, "cancelled": 1}
+
+
+def test_an_unknown_workflow_is_not_found(live_server):
+    status, body = _get(live_server, "/workflows/never-heard-of-it")
+
+    assert status == 404
+    assert body["error"] == "workflow not found"
+
+
+# -- retries and old databases ---------------------------------------------
+
+
+def test_a_request_without_a_workflow_keeps_its_old_fingerprint():
+    import hashlib
+
+    old = hashlib.sha256(json_module.dumps(
+        ["t", "a", "submit", 1000], ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")).hexdigest()
+
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none", None, ()) == old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none", "w", ()) != old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none", None, ("x",)) != old
+    # Which of the two extras is set must matter, or one could pose as the other.
+    assert (
+        bridge.request_fingerprint("t", "a", "submit", 1000, "any", None, ())
+        != bridge.request_fingerprint("t", "a", "submit", 1000, "none", "any", ())
+    )
+
+
+def test_the_same_key_with_different_dependencies_is_a_different_request(live_server):
+    first = _submit(live_server, "build")
+
+    one = _post(live_server, "/delegate", {"task": "t", "idempotency_key": "k"})
+    two = _post(live_server, "/delegate", {"task": "t", "idempotency_key": "k", "depends_on": [first]})
+
+    assert one[0] == 202
+    assert two[0] == 422
+
+
+def test_a_database_from_before_workflows_gains_what_it_needs(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, timeout_ms INTEGER NOT NULL, result_text TEXT,
+            error_text TEXT, slurm_policy TEXT, idempotency_key TEXT,
+            request_fingerprint TEXT, recovered_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    with bridge.db_session() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "workflow_id" in columns
+    assert "task_deps" in tables
+
+
 # --- found in review ------------------------------------------------------
 
 
@@ -5332,3 +5799,55 @@ def test_a_task_with_a_non_finite_metric_is_still_served_as_valid_json(live_serv
     assert json_module.loads(raw, parse_constant=strict)["task"]["result_format"] == "text"
 
 
+def test_a_workflow_whose_tasks_were_all_cancelled_is_cancelled_not_failed():
+    assert bridge.workflow_state({"cancelled": 3}) == "cancelled"
+    # Cancelled alongside work that finished or broke is still a stop short of done.
+    assert bridge.workflow_state({"done": 1, "cancelled": 2}) == "failed"
+    assert bridge.workflow_state({"error": 1, "cancelled": 2}) == "failed"
+
+
+def test_the_workflow_endpoint_reports_a_fully_cancelled_workflow(live_server):
+    task_id = _submit(live_server, "audit", workflow_id="run-9")
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert _get(live_server, "/workflows/run-9")[1]["state"] == "cancelled"
+
+
+def test_reading_a_workflow_does_not_cost_a_connection_per_task(live_server, monkeypatch):
+    def connections_to_read(workflow_id):
+        opened = []
+        real = bridge.db_connect
+        monkeypatch.setattr(bridge, "db_connect", lambda: opened.append(1) or real())
+        _get(live_server, f"/workflows/{workflow_id}")
+        monkeypatch.setattr(bridge, "db_connect", real)
+        return len(opened)
+
+    _submit(live_server, "only", workflow_id="small")
+    for i in range(6):
+        _submit(live_server, f"step {i}", workflow_id="large")
+
+    assert connections_to_read("large") == connections_to_read("small")
+
+
+def test_the_cancel_endpoint_consumes_the_request_body(live_server, monkeypatch):
+    # Closing a socket with unread data can reset the connection on Linux and
+    # take the reply with it, so a cancel that worked would look like a failure.
+    reads = []
+    real = bridge.Handler.read_json
+    monkeypatch.setattr(bridge.Handler, "read_json", lambda self: reads.append(1) or real(self))
+    task_id = _submit(live_server, "audit")
+    reads.clear()           # the submit above read a body of its own
+
+    status, _ = _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert status == 200
+    assert reads
+
+
+def test_workflow_and_idempotency_labels_are_judged_alike():
+    # One rule for what a caller-chosen label may look like.
+    for bad in ("", "   ", "bad\nlabel", "x" * 256):
+        with pytest.raises(ValueError):
+            bridge.validate_idempotency_key(bad)
+        with pytest.raises(ValueError):
+            bridge.validate_workflow_id(bad)

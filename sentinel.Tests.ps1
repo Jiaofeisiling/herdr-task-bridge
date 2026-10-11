@@ -1113,3 +1113,173 @@ Describe "listing tasks beyond the newest twenty" {
         finally { $stub.Listener.Stop() }
     }
 }
+
+
+Describe "workflows" {
+    # A task can wait on others, and be cancelled while it still waits. The
+    # client has to say so in an exit code of its own: `cancelled` is neither a
+    # failure nor an unknown state, and a caller scripting around `wait` needs
+    # to tell it from both.
+
+    It "exits 6 when the task was cancelled, and says why" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("wait", "t1")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true
+                task = @{ status = "cancelled"; error_text = "Cancelled before it started: it waits on t0" }
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 6
+            $result.StdErr | Should -Match "waits on t0"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "accepts cancelled as a status to list" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("tasks", "-Status", "cancelled")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true; tasks = @() }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.QueryString["status"] | Should -Be "cancelled"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "sends the workflow and what the task waits on with a delegate" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("delegate", "-WorkflowId", "run-7", "-DependsOn", "a1,b2", "train", "it")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 202 -Payload @{
+                ok = $true; task_id = "t1"; status = "queued"
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Body.workflow_id | Should -Be "run-7"
+            @($req.Body.depends_on) | Should -Be @("a1", "b2")
+            $req.Body.task | Should -Be "train it"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "sends neither when they were not asked for" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("delegate", "check", "disk")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 202 -Payload @{
+                ok = $true; task_id = "t1"; status = "queued"
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Body.PSObject.Properties.Name | Should -Not -Contain "workflow_id"
+            $req.Body.PSObject.Properties.Name | Should -Not -Contain "depends_on"
+            $req.Body.PSObject.Properties.Name | Should -Not -Contain "reroute"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "sends -Reroute with a delegate" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("delegate", "-Reroute", "any", "check", "disk")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 202 -Payload @{
+                ok = $true; task_id = "t1"; status = "queued"
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Body.reroute | Should -Be "any"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "cancels a task with a POST to its cancel route" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("cancel", "t1")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; task_id = "t1"; status = "cancelled"
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $req.Method | Should -Be "POST"
+            $req.Path | Should -Be "/tasks/t1/cancel"
+            $result.ExitCode | Should -Be 0
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "exits 1 and relays the reason when a task cannot be cancelled" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("cancel", "t1")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 409 -Payload @{
+                ok = $false; task_id = "t1"; status = "running"
+                error = "This task has already started or finished"
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 1
+            $result.StdOut | Should -Match "already started"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "reads a workflow from its route" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("workflow", "run-7")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; workflow_id = "run-7"; state = "in_progress"; counts = @{ queued = 2 }; tasks = @()
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $req.Method | Should -Be "GET"
+            $req.Path | Should -Be "/workflows/run-7"
+            $result.ExitCode | Should -Be 0
+            $result.StdOut | Should -Match "in_progress"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "exits 1 for a workflow the bridge does not know" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("workflow", "nope")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 404 -Payload @{ ok = $false; error = "workflow not found" }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 1
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}
+

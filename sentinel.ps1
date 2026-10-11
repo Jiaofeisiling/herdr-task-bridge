@@ -13,7 +13,9 @@ param(
         "health",
         "agents",
         "quota",
-        "quota-reset"
+        "quota-reset",
+        "cancel",
+        "workflow"
     )]
     [string]$Command,
 
@@ -33,7 +35,7 @@ param(
     # For `tasks`: list only tasks in this state, and how many. Without them
     # it is the newest twenty of everything, which is how two tasks stuck in
     # the queue for three weeks were never seen.
-    [ValidateSet("queued", "running", "done", "error", "orphaned", "quota_exhausted")]
+    [ValidateSet("queued", "running", "done", "error", "orphaned", "quota_exhausted", "cancelled")]
     [string]$Status,
 
     [ValidateRange(1, 200)]
@@ -57,7 +59,20 @@ param(
     # generated; on a failure the client prints it, so a retry can pass it
     # back and the bridge collapses the repeat into the original task
     # instead of queueing a second copy.
-    [string]$IdempotencyKey
+    [string]$IdempotencyKey,
+
+    # For `delegate`: a label grouping the tasks of one piece of work (read
+    # back with `workflow <id>`), and the task ids this one waits on. It stays
+    # queued until every one of them is done, and is cancelled if one fails.
+    # Separate several ids with commas.
+    [string]$WorkflowId,
+    [string[]]$DependsOn,
+
+    # For `delegate`: what may become of the task if its agent no longer
+    # exists by the time it would run. `none` (the default) fails it, unsent;
+    # `any` lets the bridge send it to another live agent instead.
+    [ValidateSet("none", "any")]
+    [string]$Reroute
 )
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -561,6 +576,19 @@ switch ($Command) {
             $payload["slurm_policy"] = $SlurmPolicy
         }
 
+        if ($PSBoundParameters.ContainsKey("Reroute")) {
+            $payload["reroute"] = $Reroute
+        }
+
+        if ($PSBoundParameters.ContainsKey("WorkflowId")) {
+            $payload["workflow_id"] = $WorkflowId
+        }
+
+        if ($PSBoundParameters.ContainsKey("DependsOn")) {
+            # `-File` hands "a,b" over as one string, so split it here.
+            $payload["depends_on"] = @($DependsOn | ForEach-Object { $_ -split '[,\s]+' } | Where-Object { $_ })
+        }
+
         # One key per logical delegate, reused by any retry. A caller who
         # supplies none still gets one, because the point is to be able to
         # print it when a reply is lost.
@@ -613,6 +641,40 @@ switch ($Command) {
         $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$encodedTaskId"
         $result | ConvertTo-Json -Depth 20
 
+
+        if (-not $result.ok) {
+            exit 1
+        }
+    }
+
+    "cancel" {
+        $taskId = Join-TaskText
+
+        if (-not $taskId) {
+            Write-Error "Task id cannot be empty."
+            exit 1
+        }
+
+        $encodedTaskId = [uri]::EscapeDataString($taskId)
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$encodedTaskId/cancel" -Method Post -Body "{}"
+        $result | ConvertTo-Json -Depth 20
+
+        if (-not $result.ok) {
+            exit 1
+        }
+    }
+
+    "workflow" {
+        $workflowId = Join-TaskText
+
+        if (-not $workflowId) {
+            Write-Error "Workflow id cannot be empty."
+            exit 1
+        }
+
+        $encodedWorkflowId = [uri]::EscapeDataString($workflowId)
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/workflows/$encodedWorkflowId"
+        $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {
             exit 1
@@ -726,6 +788,13 @@ switch ($Command) {
                 "quota_exhausted" {
                     Write-Error $task.error_text
                     exit 3
+                }
+
+                "cancelled" {
+                    # Neither a failure nor unknown: it was stopped before it
+                    # started, so nothing ran. Its own code lets a script tell.
+                    Write-Error $task.error_text
+                    exit 6
                 }
 
                 default {

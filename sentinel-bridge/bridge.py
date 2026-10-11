@@ -15,7 +15,7 @@ import uuid
 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 
 HOST = "127.0.0.1"
@@ -335,19 +335,31 @@ STALE_TARGET_SEC = int(os.environ.get("SENTINEL_STALE_TARGET_SEC", "600"))
 
 TASK_STATUSES = (
     "queued", "running", "done", "error", "orphaned", "quota_exhausted",
+    "cancelled",
 )
 
 # The whole life of a task, in one place. Every status change goes through
 # transition(), which refuses anything not listed here.
 TASK_TRANSITIONS = {
-    "queued": ("running", "error"),   # claimed by the worker; abandoned unsent
+    # claimed by the worker; abandoned unsent; cancelled before it started
+    "queued": ("running", "error", "cancelled"),
     "running": ("queued", "done", "error", "orphaned", "quota_exhausted"),
     # Not final: a result that turns up late adopts them (adopt_late_result).
     "error": ("done",),
     "orphaned": ("done",),
     "done": (),
     "quota_exhausted": (),
+    "cancelled": (),
 }
+
+# A task waiting on one of these can never be satisfied. `orphaned` is in the
+# list although a late result could still make it `done`: the dependent has not
+# been sent anywhere, so cancelling it is safe, and running it on an unknown
+# outcome is not.
+FAILED_DEPENDENCY_STATUSES = ("error", "orphaned", "quota_exhausted", "cancelled")
+
+MAX_DEPENDENCIES = 20
+WORKFLOW_ID_MAX_LENGTH = 100
 
 # What a transition may write alongside the status. A whitelist because the
 # names are spliced into the SQL.
@@ -466,29 +478,62 @@ class IdempotencyConflictError(RuntimeError):
     pass
 
 
-def validate_idempotency_key(key):
-    """A caller-chosen key naming one logical operation across its retries."""
-    if key is None:
+def _validate_label(value, name, max_length):
+    """A caller-chosen string: present, bounded, and free of control characters."""
+    if value is None:
         return None
 
-    if not isinstance(key, str):
-        raise ValueError("idempotency_key must be a string")
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
 
-    key = key.strip()
+    value = value.strip()
 
-    if not key:
-        raise ValueError("idempotency_key cannot be empty")
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
 
-    if len(key) > 255:
-        raise ValueError("idempotency_key cannot exceed 255 characters")
+    if len(value) > max_length:
+        raise ValueError(f"{name} cannot exceed {max_length} characters")
 
-    if any(ord(char) < 32 or ord(char) == 127 for char in key):
-        raise ValueError("idempotency_key cannot contain control characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{name} cannot contain control characters")
 
-    return key
+    return value
 
 
-def request_fingerprint(task, agent, slurm_policy, timeout_ms, reroute="none"):
+def validate_idempotency_key(key):
+    """A caller-chosen key naming one logical operation across its retries."""
+    return _validate_label(key, "idempotency_key", 255)
+
+
+def validate_workflow_id(workflow_id):
+    """A caller-chosen label grouping the tasks of one piece of work."""
+    return _validate_label(workflow_id, "workflow_id", WORKFLOW_ID_MAX_LENGTH)
+
+
+def validate_depends_on(depends_on):
+    """The task ids a new task waits on, de-duplicated, in the order given."""
+    if depends_on is None:
+        return ()
+
+    if not isinstance(depends_on, list):
+        raise ValueError("depends_on must be a list of task ids")
+
+    for task_id in depends_on:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("depends_on must contain only non-empty task ids")
+
+    unique = tuple(dict.fromkeys(t.strip() for t in depends_on))
+
+    if len(unique) > MAX_DEPENDENCIES:
+        raise ValueError(
+            f"depends_on cannot name more than {MAX_DEPENDENCIES} tasks"
+        )
+
+    return unique
+
+
+def request_fingerprint(task, agent, slurm_policy, timeout_ms, reroute="none",
+                        workflow_id=None, depends_on=()):
     """What makes two requests 'the same' for idempotency purposes.
 
     Built from what the caller *asked for*, not what the bridge resolved it
@@ -496,12 +541,21 @@ def request_fingerprint(task, agent, slurm_policy, timeout_ms, reroute="none"):
     retry has to match even if the live agent set changed in between, or a
     harmless retry would be refused as a different request.
 
-    `reroute` is part of it only when it is not the default, so a key stored
-    before the option existed still matches its own retries.
+    The options added since are part of it only when set, and as named keys so
+    that one cannot pose as another, so a key stored before they existed still
+    matches its own retries.
     """
     parts = [task, agent, slurm_policy, timeout_ms]
+
+    extras = {}
     if reroute != "none":
-        parts.append(reroute)
+        extras["reroute"] = reroute
+    if workflow_id:
+        extras["workflow_id"] = workflow_id
+    if depends_on:
+        extras["depends_on"] = sorted(depends_on)
+    if extras:
+        parts.append(extras)
 
     canonical = json.dumps(parts, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -580,7 +634,19 @@ def init_db():
                 recovered_at TEXT,
 
                 reroute TEXT,
-                rerouted_from TEXT
+                rerouted_from TEXT,
+
+                workflow_id TEXT
+            )
+        """)
+
+        # Which tasks a task waits on. A separate table because the scheduler
+        # has to ask "is everything this waits on done?" in SQL.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_deps (
+                task_id TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                PRIMARY KEY (task_id, depends_on)
             )
         """)
 
@@ -607,6 +673,14 @@ def init_db():
         if "reroute" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN reroute TEXT")
             conn.execute("ALTER TABLE tasks ADD COLUMN rerouted_from TEXT")
+
+        if "workflow_id" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN workflow_id TEXT")
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_workflow_id
+            ON tasks(workflow_id) WHERE workflow_id IS NOT NULL
+        """)
 
         # Rows from before structured results stay NULL here: they were
         # never claimed to be structured, so they read back as plain text.
@@ -649,6 +723,122 @@ def init_db():
         })
 
 
+class DependencyError(RuntimeError):
+    """A new task names a dependency that cannot be waited on.
+
+    `reason` is `unknown_dependency` (no such task) or `dependency_failed`
+    (it has already ended in a state it will not recover from).
+    """
+
+    def __init__(self, reason, task_ids):
+        self.reason = reason
+        self.task_ids = list(task_ids)
+        super().__init__(
+            "unknown task(s) named in depends_on: " + ", ".join(self.task_ids)
+            if reason == "unknown_dependency" else
+            "depends_on names task(s) that have already failed, so this "
+            "could never run: " + ", ".join(self.task_ids)
+        )
+
+
+def _check_dependencies(conn, depends_on):
+    """Refuse a dependency that does not exist or has already failed."""
+    if not depends_on:
+        return
+
+    marks = ", ".join("?" for _ in depends_on)
+    found = {
+        row["task_id"]: row["status"] for row in conn.execute(
+            f"SELECT task_id, status FROM tasks WHERE task_id IN ({marks})",
+            list(depends_on),
+        )
+    }
+
+    unknown = [t for t in depends_on if t not in found]
+    if unknown:
+        raise DependencyError("unknown_dependency", unknown)
+
+    failed = [
+        t for t in depends_on if found[t] in FAILED_DEPENDENCY_STATUSES
+    ]
+    if failed:
+        raise DependencyError("dependency_failed", failed)
+
+
+def list_dependencies(task_id):
+    """The task ids this task waits on, in the order they were given."""
+    with db_session() as conn:
+        return [
+            row["depends_on"] for row in conn.execute(
+                "SELECT depends_on FROM task_deps WHERE task_id = ? "
+                "ORDER BY rowid",
+                (task_id,),
+            )
+        ]
+
+
+def dependencies_of(task_ids):
+    """{task_id: [what it waits on]} for several tasks, in one query."""
+    found = {task_id: [] for task_id in task_ids}
+
+    if not found:
+        return found
+
+    marks = ", ".join("?" for _ in found)
+    with db_session() as conn:
+        for row in conn.execute(
+            f"SELECT task_id, depends_on FROM task_deps "
+            f"WHERE task_id IN ({marks}) ORDER BY rowid",
+            list(found),
+        ):
+            found[row["task_id"]].append(row["depends_on"])
+
+    return found
+
+
+def unmet_dependencies(task_id):
+    """(task_id, status) of everything this task waits on that is not done."""
+    with db_session() as conn:
+        return [
+            (row["task_id"], row["status"]) for row in conn.execute("""
+                SELECT u.task_id AS task_id, u.status AS status
+                FROM task_deps d JOIN tasks u ON u.task_id = d.depends_on
+                WHERE d.task_id = ? AND u.status != 'done'
+                ORDER BY d.rowid
+            """, (task_id,))
+        ]
+
+
+def list_workflow_tasks(workflow_id):
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE workflow_id = ? "
+            "ORDER BY created_at ASC, rowid ASC",
+            (workflow_id,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def workflow_state(counts):
+    """Where a workflow stands, from its tasks' statuses.
+
+    `in_progress` while anything can still move, then `done` only if every
+    task is, and otherwise `failed`: it stopped short of done.
+    """
+    if counts.get("queued") or counts.get("running"):
+        return "in_progress"
+
+    if set(counts) == {"done"}:
+        return "done"
+
+    # Stopped on purpose, nothing having gone wrong.
+    if set(counts) == {"cancelled"}:
+        return "cancelled"
+
+    return "failed"
+
+
 class QueueFullError(RuntimeError):
     def __init__(self, queued, maximum):
         self.queued = queued
@@ -659,17 +849,18 @@ class QueueFullError(RuntimeError):
 
 
 def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None,
-                 idempotency_key=None, fingerprint=None, reroute=None):
+                 idempotency_key=None, fingerprint=None, reroute=None,
+                 workflow_id=None):
     conn.execute("""
         INSERT INTO tasks (
             task_id, task, agent, status, created_at, timeout_ms, slurm_policy,
-            idempotency_key, request_fingerprint, reroute
+            idempotency_key, request_fingerprint, reroute, workflow_id
         )
-        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
     """, (
         task_id, task, agent_name, now_iso(), timeout_ms,
         validate_slurm_policy(slurm_policy),
-        idempotency_key, fingerprint, validate_reroute(reroute),
+        idempotency_key, fingerprint, validate_reroute(reroute), workflow_id,
     ))
 
 
@@ -943,7 +1134,8 @@ def create_task_if_queue_available(task, timeout_ms, agent_name, slurm_policy=No
 
 
 def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
-                 idempotency_key=None, fingerprint=None, reroute=None):
+                 idempotency_key=None, fingerprint=None, reroute=None,
+                 workflow_id=None, depends_on=()):
     """Atomically enforce the queue cap and enqueue one task.
 
     Returns (task_id, replayed).
@@ -971,6 +1163,9 @@ def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
             if row:
                 return check_replay(dict(row), fingerprint)["task_id"], True
 
+        # A mistake in the request, so it is reported ahead of a full queue.
+        _check_dependencies(conn, depends_on)
+
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM tasks WHERE status = 'queued'"
         ).fetchone()
@@ -981,7 +1176,12 @@ def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
 
         _insert_task(
             conn, task_id, task, timeout_ms, agent_name, slurm_policy,
-            idempotency_key, fingerprint, reroute,
+            idempotency_key, fingerprint, reroute, workflow_id,
+        )
+
+        conn.executemany(
+            "INSERT INTO task_deps (task_id, depends_on) VALUES (?, ?)",
+            [(task_id, dependency) for dependency in depends_on],
         )
 
     return task_id, False
@@ -1080,6 +1280,64 @@ def abandon_task(task_id, error_text):
     )
 
 
+def cancel_task(task_id, reason="Cancelled before it started."):
+    """Cancel a task that is still queued. True if it was cancelled.
+
+    Nothing that has been sent to an agent can be called back: the bridge has
+    no way to stop one mid-task, so a started task is left alone.
+    """
+    return transition(
+        task_id, "cancelled", "queued",
+        error_text=f"{reason} It was never sent to any agent, so "
+                   "resubmitting is safe.",
+        finished_at=now_iso(),
+    )
+
+
+def cancel_blocked_tasks():
+    """Cancel queued tasks that wait on something that has failed.
+
+    Repeats until nothing more moves, so a failure reaches every descendant.
+    Returns how many were cancelled.
+    """
+    cancelled = 0
+    marks = ", ".join("?" for _ in FAILED_DEPENDENCY_STATUSES)
+
+    while True:
+        with db_session() as conn:
+            blocked = conn.execute(f"""
+                SELECT t.task_id AS task_id, u.task_id AS upstream,
+                       u.status AS upstream_status
+                FROM tasks t
+                JOIN task_deps d ON d.task_id = t.task_id
+                JOIN tasks u ON u.task_id = d.depends_on
+                WHERE t.status = 'queued' AND u.status IN ({marks})
+                GROUP BY t.task_id
+            """, FAILED_DEPENDENCY_STATUSES).fetchall()
+
+            moved = sum(
+                _transition_where(
+                    conn, "cancelled", "queued",
+                    {
+                        "error_text": (
+                            f"Cancelled before it started: it waits on "
+                            f"{row['upstream']}, which ended "
+                            f"{row['upstream_status']}. It was never sent to "
+                            "any agent, so resubmitting is safe."
+                        ),
+                        "finished_at": now_iso(),
+                    },
+                    task_id=row["task_id"],
+                )
+                for row in blocked
+            )
+
+        if not moved:
+            return cancelled
+
+        cancelled += moved
+
+
 def reroute_task(task_id, old_agent, new_agent):
     """Point a queued task at a different agent. True if it moved.
 
@@ -1127,10 +1385,18 @@ def peek_next_task(exclude_agents=()):
     placeholders = ", ".join("?" for _ in exclude_agents)
     where_agent = f"AND agent NOT IN ({placeholders})" if exclude_agents else ""
 
+    # A task is eligible only once everything it waits on is done. One that
+    # is not simply is not a candidate, so it never stands in front of a task
+    # that can run.
     with db_session() as conn:
         row = conn.execute(f"""
             SELECT * FROM tasks
             WHERE status = 'queued' {where_agent}
+            AND NOT EXISTS (
+                SELECT 1 FROM task_deps d
+                JOIN tasks upstream ON upstream.task_id = d.depends_on
+                WHERE d.task_id = tasks.task_id AND upstream.status != 'done'
+            )
             ORDER BY created_at ASC
             LIMIT 1
         """, exclude_agents).fetchone()
@@ -2709,6 +2975,7 @@ def task_worker(stop_event=None):
 
     while stop_event is None or not stop_event.is_set():
         try:
+            cancel_blocked_tasks()
             task_row = peek_next_task(exclude_agents=busy_this_pass)
 
             if task_row is None:
@@ -3333,6 +3600,41 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if path.startswith("/workflows/"):
+            workflow_id = unquote(path[len("/workflows/"):])
+            rows = list_workflow_tasks(workflow_id)
+
+            if not rows:
+                self.send_json(
+                    {"ok": False, "error": "workflow not found"}, 404
+                )
+                return
+
+            waits_on = dependencies_of([row["task_id"] for row in rows])
+
+            tasks = []
+            for row in rows:
+                # A late result may have arrived since anyone last looked.
+                if row["status"] in LATE_RESULT_STATUSES:
+                    row = adopt_late_result(row["task_id"]) or row
+
+                view = task_view(row)
+                view["depends_on"] = waits_on[row["task_id"]]
+                tasks.append(view)
+
+            counts = {}
+            for view in tasks:
+                counts[view["status"]] = counts.get(view["status"], 0) + 1
+
+            self.send_json({
+                "ok": True,
+                "workflow_id": workflow_id,
+                "state": workflow_state(counts),
+                "counts": counts,
+                "tasks": tasks,
+            })
+            return
+
         if path.startswith("/tasks/"):
             task_id = path[len("/tasks/"):]
             task = get_task(task_id)
@@ -3356,13 +3658,20 @@ class Handler(BaseHTTPRequestHandler):
             # states without needing a status check.
             task["progress"] = read_progress_file(task_id)
 
+            task["depends_on"] = list_dependencies(task_id)
+
             # Only while queued. A running task's reason would be stale
             # the moment it was read, and asking herdr on every poll of
             # every task would cost a call for nothing.
-            task["queued_reason"] = (
-                explain_queued(task["agent"])
-                if task["status"] == "queued" else None
-            )
+            task["queued_reason"] = None
+            if task["status"] == "queued":
+                waiting = unmet_dependencies(task_id)
+                task["queued_reason"] = (
+                    "Waiting for " + ", ".join(
+                        f"task {t} ({status})" for t, status in waiting
+                    ) + " to finish before it can start."
+                    if waiting else explain_queued(task["agent"])
+                )
 
             self.send_json({
                 "ok": True,
@@ -3418,6 +3727,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "unauthorized"}, 401)
             return
 
+        if path.startswith("/tasks/") and path.endswith("/cancel"):
+            # Nothing in the body is used. It is read so the connection can be
+            # closed with nothing left unread, which on Linux would otherwise
+            # reset it and could take the reply with it.
+            try:
+                self.read_json()
+            except ValueError:
+                pass
+
+            task_id = path[len("/tasks/"):-len("/cancel")]
+            task = get_task(task_id)
+
+            if task is None:
+                self.send_json({"ok": False, "error": "task not found"}, 404)
+                return
+
+            # Cancelling twice, or losing a race to another canceller, still
+            # ends with the task cancelled -- which is what was asked for.
+            if task["status"] == "cancelled" or cancel_task(task_id):
+                current = "cancelled"
+            else:
+                current = get_task(task_id)["status"]
+
+            if current == "cancelled":
+                self.send_json({
+                    "ok": True, "task_id": task_id, "status": "cancelled",
+                })
+                return
+
+            self.send_json({
+                "ok": False,
+                "task_id": task_id,
+                "status": current,
+                "error": (
+                    f"This task has already started or finished (status: "
+                    f"{current}), and the bridge cannot stop an agent "
+                    "mid-task. Only a task still queued can be cancelled."
+                ),
+            }, 409)
+            return
+
         if path == "/delegate":
             try:
                 body = self.read_json()
@@ -3429,6 +3779,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 slurm_policy = validate_slurm_policy(body.get("slurm_policy"))
                 reroute = validate_reroute(body.get("reroute"))
+                workflow_id = validate_workflow_id(body.get("workflow_id"))
+                depends_on = validate_depends_on(body.get("depends_on"))
                 idempotency_key = validate_idempotency_key(
                     body.get("idempotency_key")
                 )
@@ -3456,7 +3808,7 @@ class Handler(BaseHTTPRequestHandler):
                 # agent set changed in between.
                 fingerprint = request_fingerprint(
                     task, agent_name, body.get("slurm_policy"), timeout_ms,
-                    reroute,
+                    reroute, workflow_id, depends_on,
                 )
 
                 # A replay is served before anything else can refuse it. The
@@ -3493,6 +3845,7 @@ class Handler(BaseHTTPRequestHandler):
                 task_id, replayed = enqueue_task(
                     task, timeout_ms, agent_name, slurm_policy,
                     idempotency_key, fingerprint, reroute,
+                    workflow_id, depends_on,
                 )
             except QueueFullError as e:
                 self.send_json(
@@ -3501,6 +3854,17 @@ class Handler(BaseHTTPRequestHandler):
                         "error": str(e),
                     },
                     429,
+                )
+                return
+            except DependencyError as e:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "reason": e.reason,
+                        "task_ids": e.task_ids,
+                        "error": str(e),
+                    },
+                    422,
                 )
                 return
             except IdempotencyConflictError as e:
