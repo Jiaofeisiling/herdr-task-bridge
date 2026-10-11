@@ -8,7 +8,12 @@ on:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    name: pytest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -17,12 +22,24 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install pytest
+        run: pip install pytest pytest-cov
 
+      # The bridge runs on Linux, so every test file runs there, with coverage.
+      # (__main__ runs in a subprocess in test_e2e.py and is not counted.)
       - name: Run test suite
+        if: runner.os == 'Linux'
         run: |
           cd sentinel-bridge
-          python -m pytest -v
+          python -m pytest -v --cov=bridge --cov-report=term-missing:skip-covered
+
+      # The client and the people developing the bridge are on Windows. The
+      # deployment-script tests need a bash that is not a WSL stub, so they are
+      # left to the Linux job.
+      - name: Run test suite (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd sentinel-bridge
+          python -m pytest -v test_bridge.py test_e2e.py
 
   pester-windows-powershell:
     name: pester (powershell)
