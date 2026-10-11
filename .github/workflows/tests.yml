@@ -22,7 +22,7 @@ jobs:
       - name: Run test suite
         run: |
           cd sentinel-bridge
-          python -m pytest test_bridge.py -v
+          python -m pytest -v
 
   pester-windows-powershell:
     name: pester (powershell)
