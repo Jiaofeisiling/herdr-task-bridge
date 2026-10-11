@@ -236,6 +236,27 @@ def validate_slurm_policy(policy):
 
     return policy
 
+# What may become of a queued task whose agent no longer exists. `none` is the
+# default and fails it, since sending work to the wrong agent is worse than not
+# sending it; `any` is the caller saying it does not care which agent runs it.
+REROUTE_POLICIES = ("none", "any")
+
+
+def validate_reroute(policy):
+    if policy is None:
+        return "none"
+
+    if policy not in REROUTE_POLICIES:
+        # Never a quiet fallback to the default, for the same reason as
+        # validate_slurm_policy: a typo must not change what was asked for.
+        raise ValueError(
+            f"reroute must be one of {', '.join(REROUTE_POLICIES)}, "
+            f"got {policy!r}"
+        )
+
+    return policy
+
+
 # Wordings of "this request is over a size its model or provider accepts". Kept apart
 # from the quota wordings because the remedy differs: a quota waits for a
 # reset, a size limit is cured by shrinking the session, and waiting never
@@ -467,19 +488,22 @@ def validate_idempotency_key(key):
     return key
 
 
-def request_fingerprint(task, agent, slurm_policy, timeout_ms):
+def request_fingerprint(task, agent, slurm_policy, timeout_ms, reroute="none"):
     """What makes two requests 'the same' for idempotency purposes.
 
     Built from what the caller *asked for*, not what the bridge resolved it
     to: the agent as named (or left unnamed), and the policy as given. A
     retry has to match even if the live agent set changed in between, or a
     harmless retry would be refused as a different request.
+
+    `reroute` is part of it only when it is not the default, so a key stored
+    before the option existed still matches its own retries.
     """
-    canonical = json.dumps(
-        [task, agent, slurm_policy, timeout_ms],
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+    parts = [task, agent, slurm_policy, timeout_ms]
+    if reroute != "none":
+        parts.append(reroute)
+
+    canonical = json.dumps(parts, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -553,7 +577,10 @@ def init_db():
                 idempotency_key TEXT,
                 request_fingerprint TEXT,
 
-                recovered_at TEXT
+                recovered_at TEXT,
+
+                reroute TEXT,
+                rerouted_from TEXT
             )
         """)
 
@@ -574,6 +601,12 @@ def init_db():
 
         if "recovered_at" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN recovered_at TEXT")
+
+        # NULL reads as "none": rows from before the option were never
+        # re-pointed and still are not.
+        if "reroute" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN reroute TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN rerouted_from TEXT")
 
         # Rows from before structured results stay NULL here: they were
         # never claimed to be structured, so they read back as plain text.
@@ -626,17 +659,17 @@ class QueueFullError(RuntimeError):
 
 
 def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None,
-                 idempotency_key=None, fingerprint=None):
+                 idempotency_key=None, fingerprint=None, reroute=None):
     conn.execute("""
         INSERT INTO tasks (
             task_id, task, agent, status, created_at, timeout_ms, slurm_policy,
-            idempotency_key, request_fingerprint
+            idempotency_key, request_fingerprint, reroute
         )
-        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
     """, (
         task_id, task, agent_name, now_iso(), timeout_ms,
         validate_slurm_policy(slurm_policy),
-        idempotency_key, fingerprint,
+        idempotency_key, fingerprint, validate_reroute(reroute),
     ))
 
 
@@ -890,11 +923,14 @@ def check_replay(existing, fingerprint):
     return existing
 
 
-def create_task(task, timeout_ms, agent_name, slurm_policy=None):
+def create_task(task, timeout_ms, agent_name, slurm_policy=None, reroute=None):
     task_id = str(uuid.uuid4())
 
     with db_session() as conn:
-        _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy)
+        _insert_task(
+            conn, task_id, task, timeout_ms, agent_name, slurm_policy,
+            reroute=reroute,
+        )
 
     return task_id
 
@@ -907,7 +943,7 @@ def create_task_if_queue_available(task, timeout_ms, agent_name, slurm_policy=No
 
 
 def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
-                 idempotency_key=None, fingerprint=None):
+                 idempotency_key=None, fingerprint=None, reroute=None):
     """Atomically enforce the queue cap and enqueue one task.
 
     Returns (task_id, replayed).
@@ -945,7 +981,7 @@ def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
 
         _insert_task(
             conn, task_id, task, timeout_ms, agent_name, slurm_policy,
-            idempotency_key, fingerprint,
+            idempotency_key, fingerprint, reroute,
         )
 
     return task_id, False
@@ -1042,6 +1078,23 @@ def abandon_task(task_id, error_text):
         task_id, "error", "queued",
         error_text=error_text, finished_at=now_iso(),
     )
+
+
+def reroute_task(task_id, old_agent, new_agent):
+    """Point a queued task at a different agent. True if it moved.
+
+    Only while it is still queued: a task that has started was sent to its
+    agent, and is no longer the bridge's to redirect. The agent it was meant
+    for is kept in `rerouted_from`. Not a status change, so it stays off the
+    transition table.
+    """
+    with db_session() as conn:
+        cursor = conn.execute("""
+            UPDATE tasks SET agent = ?, rerouted_from = ?
+            WHERE task_id = ? AND status = 'queued' AND agent = ?
+        """, (new_agent, old_agent, task_id, old_agent))
+
+        return cursor.rowcount == 1
 
 
 def _age_seconds(iso_stamp):
@@ -1342,6 +1395,20 @@ def agent_identifiers(agent):
     return [v for v in (agent.get("name"), agent.get("pane_id")) if v]
 
 
+def auto_pick_key(agent):
+    """Sort key for choosing an agent when the caller named none.
+
+    Being able to start now outranks being cheap, cost order decides among the
+    rest, and a stable identifier breaks the remaining ties so consecutive
+    defaults don't wander between agents for no visible reason.
+    """
+    return (
+        agent.get("agent_status") not in AVAILABLE_STATES,
+        agent_priority_rank(agent),
+        agent_identifiers(agent)[0],
+    )
+
+
 def live_agent_aliases(identifier):
     """Canonical address first; keep offline circuits/rows addressable too."""
     try:
@@ -1421,15 +1488,7 @@ def resolve_agent(identifier):
                 "work. Check `herdr agent list`."
             )
 
-        pick = min(
-            addressable,
-            key=lambda a: (
-                a.get("agent_status") not in AVAILABLE_STATES,
-                agent_priority_rank(a),
-                agent_identifiers(a)[0],
-            ),
-        )
-        return agent_identifiers(pick)[0]
+        return agent_identifiers(min(addressable, key=auto_pick_key))[0]
 
     if not agents:
         # herdr being down is a different failure with a different fix,
@@ -1673,45 +1732,76 @@ def ready_hint(agent_status):
     return None
 
 
-def abandon_unreachable_task(task_row):
-    """Fail a queued task whose target agent no longer exists. True if it did.
+def _reroute_target(live):
+    """The live agent an opted-in task should go to, or None.
+
+    The best one that can be addressed and whose provider is not blocked --
+    a task moved to an agent that would refuse it has gained nothing.
+    """
+    eligible = [
+        a for a in live
+        if agent_identifiers(a)
+        and not any(get_agent_quota_block(i) for i in agent_identifiers(a))
+    ]
+
+    if not eligible:
+        return None
+
+    return agent_identifiers(min(eligible, key=auto_pick_key))[0]
+
+
+def settle_unreachable_task(task_row):
+    """Deal with a queued task whose target agent no longer exists.
+
+    Returns "rerouted" or "abandoned", or None if the task was left alone.
 
     Conservative on every side: only after STALE_TARGET_SEC, only when herdr
     actually answered and listed no such agent (a herdr that cannot be asked
     proves nothing), and never for an agent that exists but is busy -- waiting
     for a free agent is the job, however long it takes.
 
-    It does not re-point the task at some other agent. resolve_agent() holds
-    that sending work to the wrong agent is worse than not sending it, and the
-    caller can choose. What it does do is say so, and say that nothing was sent.
+    By default it does not re-point the task at some other agent. resolve_agent()
+    holds that sending work to the wrong agent is worse than not sending it, and
+    the caller can choose. What it does do is say so, and say that nothing was
+    sent. A task submitted with reroute="any" is the caller choosing: it has
+    not started, so moving it cannot run anything twice.
     """
     age = _age_seconds(task_row["created_at"])
 
     if age is None or age < STALE_TARGET_SEC:
-        return False
+        return None
 
     try:
         agents, _ = list_agents()
     except Exception:
-        return False
+        return None
 
     if agents is None:
-        return False
+        return None
 
     live = [a for a in agents if isinstance(a, dict)]
     agent_name = task_row["agent"]
 
     if any(agent_name in agent_identifiers(a) for a in live):
-        return False
+        return None
 
-    return abandon_task(
+    if task_row.get("reroute") == "any":
+        target = _reroute_target(live)
+
+        if target and reroute_task(task_row["task_id"], agent_name, target):
+            return "rerouted"
+
+    if abandon_task(
         task_row["task_id"],
         f"The agent this task was queued for ('{agent_name}') no longer "
         f"exists -- herdr now lists {describe_live_agents(live)} -- so "
         "nothing could ever pick it up. It was never sent to any agent, so "
         "resubmitting is safe. (A herdr agent's name does not survive its "
         "process restarting; omit the agent and the bridge will choose one.)",
-    )
+    ):
+        return "abandoned"
+
+    return None
 
 
 def explain_queued(agent_name):
@@ -2690,13 +2780,15 @@ def task_worker(stop_event=None):
                     print(f"[task {task_id}] quota exhausted: {e}")
 
             except (SentinelBusyError, SentinelUnavailableError) as unavailable:
-                if (
-                    isinstance(unavailable, SentinelUnavailableError)
+                settled = (
+                    settle_unreachable_task(task_row)
+                    if isinstance(unavailable, SentinelUnavailableError)
                     and not claimed
-                    and abandon_unreachable_task(task_row)
-                ):
+                    else None
+                )
+                if settled:
                     print(
-                        f"[task {task_id}] abandoned: its agent "
+                        f"[task {task_id}] {settled}: its agent "
                         f"({agent_name}) no longer exists"
                     )
                     continue
@@ -3336,6 +3428,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 slurm_policy = validate_slurm_policy(body.get("slurm_policy"))
+                reroute = validate_reroute(body.get("reroute"))
                 idempotency_key = validate_idempotency_key(
                     body.get("idempotency_key")
                 )
@@ -3362,7 +3455,8 @@ class Handler(BaseHTTPRequestHandler):
                 # agent is resolved -- so a retry matches even if the live
                 # agent set changed in between.
                 fingerprint = request_fingerprint(
-                    task, agent_name, body.get("slurm_policy"), timeout_ms
+                    task, agent_name, body.get("slurm_policy"), timeout_ms,
+                    reroute,
                 )
 
                 # A replay is served before anything else can refuse it. The
@@ -3398,7 +3492,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 task_id, replayed = enqueue_task(
                     task, timeout_ms, agent_name, slurm_policy,
-                    idempotency_key, fingerprint,
+                    idempotency_key, fingerprint, reroute,
                 )
             except QueueFullError as e:
                 self.send_json(

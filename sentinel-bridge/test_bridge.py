@@ -5099,6 +5099,205 @@ def test_the_delegation_prompt_offers_the_structured_form():
     assert "纯文本" in prompt
 
 
+# --- re-pointing a task whose agent is gone (opt-in) ----------------------
+#
+# The default stays as it was: a task queued for an agent that no longer exists
+# is failed, never sent anywhere else, because sending work to the wrong agent
+# is worse than not sending it. A caller who does not care which agent runs a
+# task can say so with reroute="any". The task has not started, so nothing can
+# run twice; the row records where it was meant to go.
+
+
+def test_reroute_defaults_to_none_and_rejects_anything_unknown():
+    assert bridge.validate_reroute(None) == "none"
+    assert bridge.validate_reroute("none") == "none"
+    assert bridge.validate_reroute("any") == "any"
+
+    # Not a quiet fallback to the default: a typo would otherwise change what
+    # the caller asked for without telling them.
+    with pytest.raises(ValueError) as error:
+        bridge.validate_reroute("same_family")
+    assert "reroute" in str(error.value)
+
+
+def test_delegate_stores_the_reroute_policy(live_server):
+    _, asked = _post(live_server, "/delegate", {"task": "x", "reroute": "any"})
+    _, default = _post(live_server, "/delegate", {"task": "y"})
+
+    assert bridge.get_task(asked["task_id"])["reroute"] == "any"
+    assert bridge.get_task(default["task_id"])["reroute"] == "none"
+
+
+def test_delegate_refuses_an_unknown_reroute_policy(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "x", "reroute": "yes"})
+
+    assert status == 400
+    assert "reroute" in body["error"]
+
+
+def test_a_request_that_does_not_reroute_keeps_its_old_fingerprint():
+    import hashlib
+
+    old = hashlib.sha256(json_module.dumps(
+        ["t", "a", "submit", 1000], ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")).hexdigest()
+
+    # Otherwise every idempotency key stored before this existed would stop
+    # matching its own retries.
+    assert bridge.request_fingerprint("t", "a", "submit", 1000) == old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "none") == old
+    assert bridge.request_fingerprint("t", "a", "submit", 1000, "any") != old
+
+
+def test_the_same_key_with_a_different_reroute_is_a_different_request(live_server):
+    first = _post(live_server, "/delegate", {"task": "x", "idempotency_key": "k1"})
+    explicit_default = _post(
+        live_server, "/delegate",
+        {"task": "x", "idempotency_key": "k1", "reroute": "none"},
+    )
+    changed = _post(
+        live_server, "/delegate",
+        {"task": "x", "idempotency_key": "k1", "reroute": "any"},
+    )
+
+    assert first[0] == 202
+    assert explicit_default[1]["replayed"] is True     # saying "none" is saying nothing
+    assert changed[0] == 422
+
+
+def test_a_database_from_before_reroute_gains_its_columns(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, timeout_ms INTEGER NOT NULL, result_text TEXT,
+            error_text TEXT, slurm_policy TEXT, idempotency_key TEXT,
+            request_fingerprint TEXT, recovered_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    with bridge.db_session() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert {"reroute", "rerouted_from"} <= columns
+
+
+def _gone_task(tmp_path, monkeypatch, reroute, age=3600, agents=LIVE):
+    """A task queued for `sentinel-claude`, which herdr no longer lists."""
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, agents)
+    monkeypatch.setattr(bridge, "STALE_TARGET_SEC", 600)
+    task_id = bridge.create_task("audit", 60000, "sentinel-claude", reroute=reroute)
+    _age_task(task_id, age)
+    return task_id
+
+
+def _settled(task_id):
+    return lambda: bridge.get_task(task_id)["status"] not in ("queued", "running")
+
+
+def test_an_opted_in_task_for_a_gone_agent_is_re_pointed_and_runs(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any")
+    ran_on = []
+
+    def fake_execute(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        ran_on.append(agent_name)
+        return "ran elsewhere"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", fake_execute)
+
+    _run_worker_until(_settled(task_id))
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "done"
+    assert ran_on == ["w1:p3"]
+    assert row["agent"] == "w1:p3"
+    # The row says where it was meant to go, so the move is not a mystery.
+    assert row["rerouted_from"] == "sentinel-claude"
+
+
+def test_without_the_opt_in_a_task_for_a_gone_agent_is_still_failed(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, None)
+
+    _run_worker_until(_settled(task_id))
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "error"
+    assert row["agent"] == "sentinel-claude"
+    assert row["rerouted_from"] is None
+
+
+def test_a_young_task_is_not_re_pointed_while_its_agent_may_be_restarting(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any", age=5)
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    row = bridge.get_task(task_id)
+    assert row["status"] == "queued"
+    assert row["agent"] == "sentinel-claude"
+
+
+def test_a_task_is_not_re_pointed_when_herdr_cannot_be_asked(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any")
+    monkeypatch.setattr(bridge, "list_agents", lambda: (None, {"ok": False}))
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
+
+    # A herdr that cannot answer proves nothing about the agent.
+    row = bridge.get_task(task_id)
+    assert row["status"] == "queued"
+    assert row["agent"] == "sentinel-claude"
+
+
+def test_nothing_is_re_pointed_to_an_agent_whose_provider_is_blocked(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any")
+    bridge.mark_agent_quota_blocked("w1:p3", "usage limit reached")
+
+    _run_worker_until(_settled(task_id))
+
+    # The only live agent is out of quota: better told so than sent there.
+    row = bridge.get_task(task_id)
+    assert row["status"] == "error"
+    assert row["rerouted_from"] is None
+
+
+def test_with_no_agent_at_all_an_opted_in_task_is_failed_not_kept(tmp_path, monkeypatch):
+    task_id = _gone_task(tmp_path, monkeypatch, "any", agents=[])
+
+    _run_worker_until(_settled(task_id))
+
+    assert bridge.get_task(task_id)["status"] == "error"
+
+
+def test_re_pointing_prefers_an_agent_that_can_take_work_now(tmp_path, monkeypatch):
+    agents = [
+        {"agent": "opencode", "pane_id": "w1:p1", "agent_status": "working"},
+        {"agent": "claude", "pane_id": "w1:p3", "agent_status": "idle"},
+    ]
+    task_id = _gone_task(tmp_path, monkeypatch, "any", agents=agents)
+    monkeypatch.setattr(bridge, "execute_sentinel_task", lambda *a, **k: "ok")
+
+    _run_worker_until(_settled(task_id))
+
+    assert bridge.get_task(task_id)["rerouted_from"] == "sentinel-claude"
+    assert bridge.get_task(task_id)["agent"] == "w1:p3"
+
+
+def test_a_task_that_has_started_is_never_re_pointed(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "sentinel-claude", reroute="any")
+    assert bridge.claim_task(task_id)
+
+    assert bridge.reroute_task(task_id, "sentinel-claude", "w1:p3") is False
+    assert bridge.get_task(task_id)["agent"] == "sentinel-claude"
+
+
 # --- found in review ------------------------------------------------------
 
 
