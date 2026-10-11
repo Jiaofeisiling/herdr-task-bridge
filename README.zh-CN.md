@@ -11,7 +11,7 @@
 
 `herdr-task-bridge` 是面向远程科研计算的执行网关。它让用户只需操作 Windows 上的 ChatGPT、Claude、Cursor 或其他智能开发工具，就能把需要 Linux/NeSI 环境的命令、验证和 Slurm 工作交给持久运行的 Herdr agent，不必亲自登录服务器处理日常操作。
 
-当前 v4 已提供 Windows CLI、SSH 隧道后的 HTTP bridge、SQLite 异步任务队列、多 Herdr agent 路由、互斥保护与保守恢复。下面的“目标架构”还包括尚待实现的 Windows Gateway、事件流、主动通知和专用监控 worker；文档会明确区分现状与规划。
+当前 v4 已提供 Windows CLI、SSH 隧道后的 HTTP bridge、SQLite 异步任务队列（含任务依赖）、多 Herdr agent 路由、互斥保护与保守恢复。下面的“目标架构”还包括尚待实现的 Windows Gateway、主动通知和专用监控 worker（它们要消费的事件流在 bridge 侧已经具备）；文档会明确区分现状与规划。
 
 ## 项目定位
 
@@ -79,7 +79,7 @@ reporting: 需要返回的日志、产物、指标、限制和证据
 
 因此：**bridge task `done` 不等于 Slurm 作业完成，Slurm `COMPLETED` 也不等于科研结果有效。** `orphaned` 只表示 bridge 已失去可靠跟踪，远端动作可能仍在继续；必须先检查实际影响，绝不能盲目重试。
 
-主动报告应采用持久事件流，而不是让 Windows 端无限轮询一整段终端文本。目标设计是远端以事务方式写入 `task_events`，Windows Gateway 使用游标长轮询或订阅；状态不变时保持安静，在 `needs_input`、`error`、`orphaned`、任务完成或出现新 artifact 时通知用户。建议的关联标识为：
+主动报告应采用持久事件流，而不是让 Windows 端无限轮询一整段终端文本。远端现在已以事务方式写入 `task_events`（见 [事件流](#事件流)）；目标设计是 Windows Gateway 用游标长轮询或订阅来消费它；状态不变时保持安静，在 `needs_input`、`error`、`orphaned`、任务完成或出现新 artifact 时通知用户。建议的关联标识为：
 
 ```text
 workflow_id → task_id → command_run_id → slurm_job_id → artifact_id
@@ -99,16 +99,20 @@ workflow_id → task_id → command_run_id → slurm_job_id → artifact_id
 - [x] bridge supervisor、部署别名、pytest/Pester/CI 基线。
 - [x] 角色、代码所有权、目标架构、工作流和证据边界文档。
 - [x] **可靠的结果提取**：agent 通过逐任务的结果文件返回结果，不再从终端文本里刮，backend 的终端渲染方式（Claude Code vs OpenCode）不再决定结果能否被读出来。
+- [x] **结构化结果**：agent 可以把结果写成 JSON 对象（`status`、`summary`、`job_ids`、`artifacts`、`metrics`、`warnings`、`changed_files`），调用方从 `result_data` 直接读字段；纯文本依旧原样接收。见 [结构化结果](#结构化结果)。
+- [x] **单一的任务状态机**：一张迁移表、一条写状态的代码路径，两条路径同时抢着结束同一个任务时不会都成功。见 [状态机](#状态机)。
+- [x] **Workflow**：`workflow_id`、`depends_on`、取消排队中的任务，以及上游失败时取消其下游全部任务。见 [Workflow 与依赖](#workflow-与依赖)。
+- [x] **可选的改派**：排队任务的 agent 已不存在时，可用 `reroute: any` 让桥改派；默认仍然是原样失败、不发送。
 
 ### 主开发阻塞项
 
-- [ ] **Workflow 与执行合同**：增加 `workflow_id`、执行合同 schema、来源 client、权限/coding policy、幂等键与关联 ID。
-- [ ] **持久事件流**：实现事务性 `task_events`、单调 `event_seq`、cursor/long-poll API，以及重连后不漏报、不重报。
+- [ ] **Workflow 与执行合同**：`workflow_id`、任务依赖和幂等键已具备；尚缺执行合同 schema、来源 client、权限/coding policy 与关联 ID。
+- [x] **持久事件流**：每一次状态变更都在引起它的同一事务里写成一行 `task_events`，带单调的 `seq`，通过 `GET /events` 以游标加长轮询读取。见 [事件流](#事件流)。消费它并去通知的部分——下面的 Gateway 与主动通知两项——尚未实现。
 - [ ] **Windows Gateway**：把共享客户端、SSH 隧道生命周期、重连、订阅和 ChatGPT/Claude/Cursor 适配从单次 CLI 中抽出。
 - [ ] **主动通知**：仅在完成、失败、需授权、`orphaned` 或有关键新证据时通知；支持去重、静默未变化状态和终态自动停止。
 - [ ] **独立监控 worker**：分别跟踪 bridge task、Herdr agent、Slurm job 和 artifacts，且不长期占用执行 agent。
 - [x] **Slurm 安全门控**：逐任务策略（`submit` / `test_only` / `dry_run_only`）写进 prompt 并记录在任务上，每种策略都要求回报 job ID，不明状态下绝不自动重投。属声明式而非强制——bridge 不在执行路径上，无法拦截 `sbatch`。
-- [ ] **结构化远端报告**：支持 progress、`needs_input`、artifact、metric、warning 和 final report，而不只依赖终端文本抽取。
+- [ ] **结构化远端报告**：最终报告已结构化（artifacts、metrics、warnings、job ID），进度走文件通道；尚缺 `needs_input` 状态与实时进度事件。
 - [ ] **受控并发与写入隔离**：按 agent 并发执行异步任务，并对同项目写操作实施 single-writer 或 branch/worktree 隔离与显式交接。
 - [ ] **安全默认值**：生产部署 token 默认开启，增加 secret 管理、命令/目录 allowlist、任务级权限和审计记录。
 - [ ] **可复现证据包**：最终报告固定包含 commit、workdir、命令、环境、job/task ID、日志/产物路径、指标配置、样本数及“可说/不可说”。
@@ -172,14 +176,17 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `read` | GET | `/read` | 读取最近的 agent 终端画面，并附带 `agent_status`，供诊断使用。`source` 取 `recent-unwrapped`（默认，遵循 `lines`）或 `visible`（当前屏幕）；agent 正在工作而又没指定来源时，会退回到 `visible`，并在 `note` 里说明。终端是快照，任务完成后仍显示旧画面；忙闲一律以 `agent_status` 为准。 |
 | `quota` | GET | `/quota` | 列出因模型提供商额度或余额错误而被临时阻断的 agent。 |
 | `quota-reset` | POST | `/quota/reset` | 使用 `-Agent` 清除一个 agent 的额度熔断；刻意不传时清除全部熔断。 |
-| `delegate <task>` | POST | `/delegate` | 将任务加入队列并返回 `task_id`；服务端默认超时为 6 小时。 |
-| `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态，附带执行中的 `progress`；处于 `queued` 时还会给出 `queued_reason`，说明它在等什么。 |
+| `delegate <task>` | POST | `/delegate` | 将任务加入队列并返回 `task_id`；服务端默认超时为 6 小时。可选 `-WorkflowId`、`-DependsOn <id,id>` 和 `-Reroute none\|any`（见 [Workflow 与依赖](#workflow-与依赖)）。 |
+| `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态，附带执行中的 `progress`、`depends_on`、有结构化结果时的 `result_data`；处于 `queued` 时还会给出 `queued_reason`，说明它在等什么。 |
 | `wait <task_id>` | GET | `/tasks/<id>` | 每 3 秒轮询至终态，再输出结果或错误。 |
-| `tasks` | GET | `/tasks` | 列出最近 20 个任务。`status`（`queued`、`running`、`done`、`error`、`orphaned`、`quota_exhausted`）和 `limit`（1–200）可以缩小或放宽范围——`tasks -Status queued` 就是找出正在等待的任务的办法。 |
+| `events [task_id]` | GET | `/events` | 游标（`-After <seq>`）之后的状态变更，可选择最多挂起 30 秒（`-WaitSec`）直到有事发生；可按任务 id 或 `-WorkflowId` 过滤。见 [事件流](#事件流)。 |
+| `cancel <task_id>` | POST | `/tasks/<id>/cancel` | 取消仍在 `queued` 的任务；已经开始的任务返回 `409`，因为桥无法在 agent 执行中途叫停它。 |
+| `workflow <workflow_id>` | GET | `/workflows/<id>` | 列出带该 `workflow_id` 的全部任务，附各状态计数 `counts` 和整体 `state`（`in_progress`、`done`、`failed`；全部任务都是被主动取消时为 `cancelled`）。 |
+| `tasks` | GET | `/tasks` | 列出最近 20 个任务。`status`（`queued`、`running`、`done`、`error`、`orphaned`、`quota_exhausted`、`cancelled`）和 `limit`（1–200）可以缩小或放宽范围——`tasks -Status queued` 就是找出正在等待的任务的办法。 |
 | `ask <task>` | POST | `/ask` | 同步执行并返回 agent 结果；目标 agent 忙时返回 `409`。 |
 | `prompt <task>` | POST | `/prompt` | 同步发送任务，但不提取结果。文本会被包进委派信封，所以它是一个任务而不是一次按键：用它发 `/compact` 并不是斜杠命令。带 `-Agent` 时只会发给那个 agent，绝不会被转给备用 agent。 |
 
-通用客户端参数为 `-Agent <name>`、`-TimeoutMs <milliseconds>`（用于 `ask`、`prompt` 和 `delegate`）以及 `-Lines <count>` 和 `-Source recent-unwrapped|visible`（用于 `read`）。agent 名称会去除首尾空白，不能为空，最长 200 个字符。请求超时必须在 1 秒至 6 小时之间。
+通用客户端参数为 `-Agent <name>`、`-TimeoutMs <milliseconds>`（用于 `ask`、`prompt` 和 `delegate`）以及 `-Lines <count>` 和 `-Source recent-unwrapped|visible`（用于 `read`），还有 `-WorkflowId`、`-DependsOn` 和 `-Reroute`（用于 `delegate`）。agent 名称会去除首尾空白，不能为空，最长 200 个字符。请求超时必须在 1 秒至 6 小时之间。
 
 ### 退出码与通道故障
 
@@ -191,6 +198,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `3` | 任务以 `quota_exhausted` 结束 |
 | `4` | **根本没有到达 bridge** —— 通道不通，bridge 本身的状态无从得知 |
 | `5` | **bridge 能回应 `/health`，但这一个请求没在时限内得到回复** —— 通道本身没问题，不要去重连任何东西 |
+| `6` | 任务以 `cancelled` 结束 —— 在开始之前就被叫停，什么都没有运行 |
 
 `4` 被刻意单列。SSH 转发不在时，远端的 bridge 通常好好地跑着、只是联系不上；把这种情况报成"bridge 故障"会把人引向错误的机器。消息里会指明是两种通道状态中的哪一种——没有东西在监听，还是连上了却不回应——因为二者的处理方式不同；并且明确说明 bridge 的状态是**未知**而非损坏。
 
@@ -210,9 +218,78 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 
 ```
 queued → running → done
-              ↓        ↑（一次结果文件提醒）
-    error / orphaned / quota_exhausted
+  ↓        ↓   ↑（一次结果文件提醒）
+  ↓   error / orphaned / quota_exhausted
+  ↓
+cancelled   （只能从 queued 进入：从未发给任何 agent）
 ```
+
+### 状态机
+
+所有状态变更都经过同一个函数 `transition()`，它对照一张迁移表检查，并且是 compare-and-set：只有任务仍处在调用方预期的状态时才生效。两条路径同时抢着结束同一个任务——比如关停把它标成 orphaned 的同时，worker 还在等 agent——不可能都成功，输的一方什么也不改。表里没有的迁移会抛异常，因为那是调用方的 bug，而不是输掉了竞争。
+
+| 从 | 可以迁移到 |
+|---|---|
+| `queued` | `running`、`error`（未发送即放弃）、`cancelled` |
+| `running` | `queued`（所有备用都忙）、`done`、`error`、`orphaned`、`quota_exhausted` |
+| `error`、`orphaned` | `done` —— 仅当结果文件迟到时 |
+| `done`、`quota_exhausted`、`cancelled` | —— 终态 |
+
+答案到达时任务已不是 `running`，worker 不会去完成它，并把结果文件留在原处，由迟到采纳的路径去取。
+
+### 结构化结果
+
+agent 可以把结果文件写成 JSON 对象，而不是一段文字：
+
+```json
+{
+  "status": "success | partial | failed | blocked",
+  "summary": "做了什么、结论是什么、有没有卡住",
+  "job_ids": ["12345678"],
+  "artifacts": ["/scratch/run1/log.txt"],
+  "metrics": {"val_loss": 0.42},
+  "warnings": [],
+  "changed_files": []
+}
+```
+
+只有 `summary` 必填。用 ` ```json ` 围栏包起来也能识别。桥从收到的文本里读出这些字段，以 `result_data` 和 `result_format: "json"` 提供；`result_text` 永远是原文，所以任何读它的东西都不会坏。纯文本则是 `result_format: "text"`、`result_data: null`。
+
+看起来像 JSON 却不可用的结果——被截断、缺 `summary`、字段类型不对——按文本保留，并在 `error_text` 里加一条说明原因。它**不会**让任务失败：工作已经交付，出问题的只是格式。
+
+`result_data.status` 是 **agent** 对这项工作的说法；任务自己的 `status` 只说明桥有没有把结果送到。一个任务可以是 `done` 而 `result_data.status` 为 `failed`，二者不能混为一谈。
+
+### Workflow 与依赖
+
+```powershell
+$build = (.\sentinel.ps1 delegate -WorkflowId run-7 "build the environment" | ConvertFrom-Json).task_id
+$train = (.\sentinel.ps1 delegate -WorkflowId run-7 -DependsOn $build "train the model" | ConvertFrom-Json).task_id
+.\sentinel.ps1 workflow run-7
+```
+
+- 带 `depends_on` 的任务保持 `queued`，直到它列出的**每一个**任务都是 `done`。worker 会跳过它，去跑其他能跑的，所以等待中的任务不会拖住无关任务。`queued_reason` 会说明它在等谁。
+- 任务只能依赖已存在的任务，因此依赖图不可能出现环。未知的 id 以 `422` 拒绝（`reason: unknown_dependency`），已经失败的同样（`reason: dependency_failed`）。最多 20 个依赖，重复的只算一次。
+- 如果它所等待的任务以 `error`、`orphaned`、`quota_exhausted` 或 `cancelled` 结束，该任务就被 `cancelled`，其下游的全部任务也一样。它们都没有发给任何 agent，所以重新提交是安全的。`orphaned` 也会触发取消，尽管迟到的结果仍可能把它变成 `done`：要避免的是在结果未知的前提下继续跑后续工作，而被取消的任务只需重新提交。
+- `cancel` 可停止仍在 `queued` 的任务。已经开始的任务桥无法叫停（`409`），由 agent 自己决定怎么做。
+- 等待中的任务同样计入队列上限。
+
+### 事件流
+
+`/tasks/<id>` 只说明任务**现在**在哪儿，不说明它**动过**，移开视线的调用方会错过那些来了又走的变化。每一次状态变更——包括任务被创建——还会写进 `task_events`，并且**与变更在同一个事务里**：不会出现有变更没事件、或有事件没变更；输掉竞争或被拒绝的迁移，什么也不写。
+
+```powershell
+.\sentinel.ps1 events                       # 到目前为止的全部
+.\sentinel.ps1 events -After 41 -WaitSec 20 # seq 41 之后发生的；请求最多挂起 20 秒
+.\sentinel.ps1 events -WorkflowId run-7     # 某个 workflow 的变更
+```
+
+每个事件是 `{seq, task_id, workflow_id, at, from_status, to_status}`，创建事件的 `from_status` 为 `null`。回复里的 `next` 是本次返回的最后一个 `seq`（没有新事件时，就是你传入的 `after`）。保存它，下次从它之后继续：因为 `seq` 只增不减，断线重连既不漏也不重。`limit` 为 1–500（默认 100）；`wait` 为 0–30 秒，有事发生的瞬间就会返回，bridge 正在关停时也会立即返回。
+
+事件记录的是状态变更，不是 agent 的输出；它从表被创建的那一刻开始，此前已完成的任务没有事件。该表不做清理。
+
+### 排队任务的 agent 不存在时的改派
+
+默认情况下，为一个已不存在的 agent 排队的任务，在 `SENTINEL_STALE_TARGET_SEC` 之后会原样失败、不发送，绝不改派：把任务发给错的 agent，比不发更糟。如果调用方并不在意由哪个 agent 来跑，可以用 `reroute: "any"`（`-Reroute any`）表明。等同样长的时间之后，并且 herdr 确实应答、也确实没有这个 agent，桥会把任务指向最合适的存活 agent——提供商未被阻断，并优先选现在就能接活的。任务尚未开始，所以不可能执行两次；`agent` 显示它去了哪里，`rerouted_from` 显示它原本要去哪里。没有合适的 agent 时照旧失败。
 
 - `orphaned` 表示 bridge 没有等到任务完成信号，**不等于**远程任务一定失败。不要直接重试；应先检查该任务是否已经产生实际影响。
 - `error` 表示 bridge 已确认执行或结果收集失败。
@@ -364,10 +441,16 @@ cd sentinel-bridge
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install pytest  # Windows
 .venv/bin/python -m pip install pytest          # Linux/macOS
-.venv/Scripts/python.exe -m pytest test_bridge.py -v
+.venv/Scripts/python.exe -m pytest -v
 ```
 
-Python 测试套件含 111 个 mock 测试，不需要真实的 Herdr 安装或网络。Windows 客户端还有一个 16 用例的 Pester 套件，通过本地 HTTP stub 执行：
+Python 测试套件含 500 多个测试，不需要真实的 Herdr 安装或网络，分三层：
+
+- `test_bridge.py` 在测试进程内运行 bridge、替换掉 herdr 调用，逐个情形覆盖逻辑。
+- `test_remote_scripts.py` 在 bash 下运行部署脚本，`screen`、`pkill`、`curl` 均为桩。
+- `test_e2e.py` 把 `bridge.py` 作为真实进程启动在 [`fake_herdr.py`](sentinel-bridge/fake_herdr.py) 前面，通过 HTTP 驱动，所以被检验的是代码**周围**发生的事：进程被无预警杀死并在同一数据库上重启（任务变为 `orphaned`、agent 绝不会被第二次下发 prompt、迟到的答案被找回）、12 个相同的重试同时到达（只产生一个任务）、20 个提交对着上限为 5 的队列（恰好接受 5 个）、模型提供商额度耗尽（任务转到另一家）、以及某一步失败会在下游任何内容到达 agent 之前将其全部取消。
+
+有两个测试在 Windows 上跳过，因为 Windows 无法投递 POSIX 信号。Windows 客户端还有一个约 60 用例的 Pester 套件，通过本地 HTTP stub 执行：
 
 ```powershell
 Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser  # 首次需要

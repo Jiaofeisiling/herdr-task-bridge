@@ -11,7 +11,7 @@ English | [简体中文](README.zh-CN.md)
 
 `herdr-task-bridge` is an execution gateway for remote research computing. It lets you work entirely in ChatGPT, Claude, Cursor, or another AI development tool on Windows while the commands, verification, and Slurm work that need a Linux/NeSI environment are carried out by a persistent Herdr agent — without logging into the server for routine operations yourself.
 
-v4 provides the Windows CLI, the HTTP bridge behind an SSH tunnel, the SQLite asynchronous task queue, multi-agent routing, mutual exclusion, and conservative recovery. The "Target architecture" below also covers the Windows Gateway, event stream, active notification, and dedicated monitoring worker that are **not yet implemented**; this document distinguishes what exists from what is planned.
+v4 provides the Windows CLI, the HTTP bridge behind an SSH tunnel, the SQLite asynchronous task queue with task dependencies, multi-agent routing, mutual exclusion, and conservative recovery. The "Target architecture" below also covers the Windows Gateway, active notification, and dedicated monitoring worker that are **not yet implemented** (the bridge's half of the event stream, which they would consume, is); this document distinguishes what exists from what is planned.
 
 ## What this project is
 
@@ -79,7 +79,7 @@ These layers must be reported separately. A single `done` must never stand in fo
 
 Therefore: **a bridge task reaching `done` does not mean the Slurm job finished, and Slurm reporting `COMPLETED` does not mean the research result is valid.** `orphaned` only means the bridge lost reliable tracking; the remote action may still be running. Inspect the real effects before doing anything else, and never blindly retry.
 
-Active reporting should use a durable event stream rather than having the Windows side poll a wall of terminal text. The intended design has the remote side write `task_events` transactionally while a Windows gateway uses a cursor-based long poll or subscription: silent while nothing changes, and notifying on `needs_input`, `error`, `orphaned`, completion, or a new artifact. The correlation identifiers are:
+Active reporting should use a durable event stream rather than having the Windows side poll a wall of terminal text. The remote side now writes `task_events` transactionally (see [Event stream](#event-stream)); the intended design has a Windows gateway consume them with a cursor-based long poll or subscription: silent while nothing changes, and notifying on `needs_input`, `error`, `orphaned`, completion, or a new artifact. The correlation identifiers are:
 
 ```text
 workflow_id → task_id → command_run_id → slurm_job_id → artifact_id
@@ -99,16 +99,20 @@ Not yet. Below is the acceptance checklist from v4 to that point. Only once ever
 - [x] Bridge supervisor, deployment aliases, and a pytest/Pester/CI baseline.
 - [x] Documentation of roles, code ownership, target architecture, workflow, and evidence boundaries.
 - [x] **Reliable result extraction** — agents deliver results through a per-task file rather than scraped terminal text, so a backend's terminal rendering (Claude Code vs OpenCode) no longer determines whether a result can be read at all.
+- [x] **Structured results** — an agent may write its result as a JSON object (`status`, `summary`, `job_ids`, `artifacts`, `metrics`, `warnings`, `changed_files`) and callers read the fields from `result_data`; plain text is still accepted unchanged. See [Structured results](#structured-results).
+- [x] **A single task state machine** — one transition table and one code path that writes a status, so two paths racing to finish a task cannot both win. See [State machine](#state-machine).
+- [x] **Workflows** — `workflow_id`, `depends_on`, cancellation of queued tasks, and cancellation of everything downstream of a failure. See [Workflows and dependencies](#workflows-and-dependencies).
+- [x] **Opt-in re-pointing** of a queued task whose agent no longer exists (`reroute: any`); the default still fails it unsent.
 
 ### Blocking items for main development
 
-- [ ] **Workflow and execution contracts** — add `workflow_id`, an execution-contract schema, originating client, permission/coding policy, idempotency keys, and correlation IDs.
-- [ ] **Durable event stream** — transactional `task_events`, a monotonic `event_seq`, a cursor/long-poll API, and no missed or duplicated reports across reconnects.
+- [ ] **Workflow and execution contracts** — `workflow_id`, task dependencies and idempotency keys exist; still missing are an execution-contract schema, originating client, permission/coding policy, and correlation IDs.
+- [x] **Durable event stream** — every status change is written as a `task_events` row in the transaction that makes it, with a monotonic `seq`, read through `GET /events` with a cursor and a long poll. See [Event stream](#event-stream). What consumes it and notifies — the Gateway and active-notification items below — is not built.
 - [ ] **Windows Gateway** — lift the shared client, SSH tunnel lifecycle, reconnection, subscriptions, and ChatGPT/Claude/Cursor adapters out of a single-shot CLI.
 - [ ] **Active notification** — notify only on completion, failure, an authorisation request, `orphaned`, or important new evidence; deduplicate, stay quiet while nothing changes, and stop automatically at a terminal state.
 - [ ] **Independent monitoring worker** — track bridge tasks, Herdr agents, Slurm jobs, and artifacts separately without occupying an execution agent.
 - [x] **Slurm safety gate** — a per-task policy (`submit` / `test_only` / `dry_run_only`) stated in the prompt and recorded against the task, job IDs requested in every result, and no automatic resubmission from an unknown state. Declared rather than enforced: the bridge is not in the execution path and cannot block an `sbatch`.
-- [ ] **Structured remote reporting** — support progress, `needs_input`, artifact, metric, warning, and final report rather than relying on terminal text extraction.
+- [ ] **Structured remote reporting** — the final report is structured (artifacts, metrics, warnings, job IDs) and progress travels a file channel; still missing are a `needs_input` state and live progress events.
 - [ ] **Controlled concurrency and write isolation** — execute asynchronous tasks concurrently per agent, with single-writer or branch/worktree isolation and explicit handover for writes to the same project.
 - [ ] **Secure defaults** — token authentication on by default for production deployments, plus secret management, command/directory allowlists, per-task permissions, and audit records.
 - [ ] **Reproducible evidence bundle** — a final report that always carries the commit, workdir, commands, environment, job/task IDs, log and artifact paths, metric configuration, sample counts, and what may and may not be claimed.
@@ -172,14 +176,17 @@ If the host has more than one Herdr agent, inspect them and select one explicitl
 | `read` | GET | `/read` | Reads recent agent-terminal lines for diagnosis. `source` is `recent-unwrapped` (the default, honours `lines`) or `visible` (the screen). For an agent that is working, an unnamed source falls back to `visible` and the response says so in `note`. |
 | `quota` | GET | `/quota` | Lists agents temporarily blocked after a provider quota or balance failure. |
 | `quota-reset` | POST | `/quota/reset` | Clears one agent's quota circuit with `-Agent`, or all circuits when deliberately called without it. |
-| `delegate <task>` | POST | `/delegate` | Queues a task and returns a `task_id`; default server timeout is six hours. |
-| `task <task_id>` | GET | `/tasks/<id>` | Task state, in-flight `progress`, and — while `queued` — a `queued_reason` explaining what it is waiting on. |
+| `delegate <task>` | POST | `/delegate` | Queues a task and returns a `task_id`; default server timeout is six hours. Optional `-WorkflowId`, `-DependsOn <id,id>` and `-Reroute none\|any` (see [Workflows and dependencies](#workflows-and-dependencies)). |
+| `task <task_id>` | GET | `/tasks/<id>` | Task state, in-flight `progress`, `depends_on`, the structured `result_data` when there is one, and — while `queued` — a `queued_reason` explaining what it is waiting on. |
 | `wait <task_id>` | GET | `/tasks/<id>` | Polls every three seconds until a terminal state, then prints the result or error. |
-| `tasks` | GET | `/tasks` | Lists the 20 most recent tasks. `status` (`queued`, `running`, `done`, `error`, `orphaned`, `quota_exhausted`) and `limit` (1–200) narrow or widen that — `tasks -Status queued` is how to find work that is waiting. |
+| `events [task_id]` | GET | `/events` | Status changes after a cursor (`-After <seq>`), optionally held open for up to 30 s (`-WaitSec`) until one happens; filter with a task id or `-WorkflowId`. See [Event stream](#event-stream). |
+| `cancel <task_id>` | POST | `/tasks/<id>/cancel` | Cancels a task that is still `queued`; `409` for one that has started, since the bridge cannot stop an agent mid-task. |
+| `workflow <workflow_id>` | GET | `/workflows/<id>` | Every task carrying that `workflow_id`, with per-status `counts` and an overall `state` (`in_progress`, `done`, `failed`, or `cancelled` when every task was cancelled on purpose). |
+| `tasks` | GET | `/tasks` | Lists the 20 most recent tasks. `status` (`queued`, `running`, `done`, `error`, `orphaned`, `quota_exhausted`, `cancelled`) and `limit` (1–200) narrow or widen that — `tasks -Status queued` is how to find work that is waiting. |
 | `ask <task>` | POST | `/ask` | Runs synchronously and returns the agent result; returns `409` if that agent is busy. |
 | `prompt <task>` | POST | `/prompt` | Runs synchronously but does not extract a result. The text is wrapped in the delegation envelope, so it is a task, not a keystroke: `/compact` sent this way is not a slash command. With `-Agent` it goes to exactly that agent -- never to a fallback. |
 
-Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask`, `prompt`, and `delegate`), `-Lines <count>` and `-Source recent-unwrapped|visible` (for `read`). Agent names are trimmed, must be non-empty, and are limited to 200 characters. Request timeouts must be between 1 second and 6 hours.
+Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask`, `prompt`, and `delegate`), `-Lines <count>` and `-Source recent-unwrapped|visible` (for `read`), and `-WorkflowId`, `-DependsOn` and `-Reroute` (for `delegate`). Agent names are trimmed, must be non-empty, and are limited to 200 characters. Request timeouts must be between 1 second and 6 hours.
 
 ### Exit codes and channel failures
 
@@ -191,6 +198,7 @@ Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask
 | `3` | A task ended `quota_exhausted` |
 | `4` | **The bridge was never reached** — the channel is down, and nothing is known about the bridge itself |
 | `5` | **The bridge answers `/health`, but this one request got no reply in time** — the channel is fine, do not reconnect anything |
+| `6` | A task ended `cancelled` — stopped before it started, so nothing ran |
 
 Code `4` is deliberately distinct. When the SSH forward is not in place, the bridge is usually running perfectly well on the remote side and simply cannot be talked to; reporting that as a bridge failure sends the reader to the wrong machine. The message names which of the two channel states applies — nothing listening, or connected but never replying — because they need different fixes, and says plainly that the bridge's state is unknown rather than bad.
 
@@ -210,9 +218,78 @@ Note that `pwsh -Command "& sentinel.ps1 ..."` collapses any non-zero code to `1
 
 ```
 queued → running → done
-              ↓        ↑ (one result-file reminder)
-    error / orphaned / quota_exhausted
+  ↓        ↓   ↑ (one result-file reminder)
+  ↓   error / orphaned / quota_exhausted
+  ↓
+cancelled   (only from queued: never sent to an agent)
 ```
+
+### State machine
+
+Every status change goes through one function, `transition()`, which checks the move against a single table and is a compare-and-set: it only applies if the task is still in the state the caller expected. Two paths racing to finish the same task — a shutdown orphaning it while the worker is still waiting on the agent, say — cannot both win, and the loser changes nothing. A move the table does not allow raises, since that is a bug in the caller rather than a lost race.
+
+| From | May move to |
+|---|---|
+| `queued` | `running`, `error` (abandoned unsent), `cancelled` |
+| `running` | `queued` (every fallback busy), `done`, `error`, `orphaned`, `quota_exhausted` |
+| `error`, `orphaned` | `done` — only when a result file turns up late |
+| `done`, `quota_exhausted`, `cancelled` | — final |
+
+A worker whose task is no longer `running` when its answer arrives does not complete it, and leaves the result file where the late-adoption path will find it.
+
+### Structured results
+
+An agent may write its result file as a JSON object instead of prose:
+
+```json
+{
+  "status": "success | partial | failed | blocked",
+  "summary": "what was done, what it concluded, whether anything stuck",
+  "job_ids": ["12345678"],
+  "artifacts": ["/scratch/run1/log.txt"],
+  "metrics": {"val_loss": 0.42},
+  "warnings": [],
+  "changed_files": []
+}
+```
+
+Only `summary` is required. A fenced ` ```json ` block is accepted. The bridge reads the fields out of the text it was given and serves them as `result_data` with `result_format: "json"`; `result_text` is always the original, so nothing that read it breaks. Prose gives `result_format: "text"` and `result_data: null`.
+
+A result that looks like JSON but is not usable — cut off, a missing `summary`, a field of the wrong type — is kept as text with a note in `error_text` saying why. It does not fail the task: the work was delivered and only the format slipped.
+
+`result_data.status` is what the **agent** says about the work; the task's own `status` says only whether the bridge delivered the result. A task can be `done` with `result_data.status: "failed"`, and one must never be read as the other.
+
+### Workflows and dependencies
+
+```powershell
+$build = (.\sentinel.ps1 delegate -WorkflowId run-7 "build the environment" | ConvertFrom-Json).task_id
+$train = (.\sentinel.ps1 delegate -WorkflowId run-7 -DependsOn $build "train the model" | ConvertFrom-Json).task_id
+.\sentinel.ps1 workflow run-7
+```
+
+- A task with `depends_on` stays `queued` until **every** task it names is `done`. The worker passes over it and runs whatever else can run, so a waiting task never holds up an unrelated one. `queued_reason` names what it is waiting for.
+- A task can only name tasks that already exist, so the graph cannot contain a cycle. An unknown id is refused with `422` (`reason: unknown_dependency`), as is one that has already failed (`reason: dependency_failed`). Up to 20 dependencies, repeats counted once.
+- If something a task waits on ends `error`, `orphaned`, `quota_exhausted` or `cancelled`, the task is `cancelled` — and so is everything downstream of it. None of them was sent to an agent, so resubmitting is safe. `orphaned` cancels too, although a late result could still turn it `done`: running work on an unknown outcome is the thing to avoid, and a cancelled task costs only a resubmit.
+- `cancel` stops a task that is still `queued`. A task that has started cannot be stopped by the bridge (`409`); the agent decides what it does.
+- Waiting tasks count towards the queue limit.
+
+### Event stream
+
+`/tasks/<id>` says where a task is now, not that it moved, and a caller that looks away misses anything that came and went. Every status change — including a task being created — is also written to `task_events`, **in the same transaction as the change**: there is never a change without its event or an event without its change, and a move that loses a race or is refused writes nothing.
+
+```powershell
+.\sentinel.ps1 events                       # everything so far
+.\sentinel.ps1 events -After 41 -WaitSec 20 # what came after seq 41; hold the request open up to 20 s
+.\sentinel.ps1 events -WorkflowId run-7     # one workflow's changes
+```
+
+Each event is `{seq, task_id, workflow_id, at, from_status, to_status}`; `from_status` is `null` for creation. The reply carries `next`, the last `seq` it returned (or the `after` it was given when there was nothing). Keep it and ask for what follows: because `seq` only grows, resuming after a dropped connection neither misses nor repeats an event. `limit` is 1–500 (default 100); `wait` is 0–30 s and returns the moment something happens, and immediately if the bridge is shutting down.
+
+Events are a record of status changes, not of agent output, and they start from when the table was created: tasks that finished before that have none. The table is not pruned.
+
+### Re-pointing a task whose agent is gone
+
+By default a task queued for an agent that no longer exists is failed unsent after `SENTINEL_STALE_TARGET_SEC`, never redirected: sending work to the wrong agent is worse than not sending it. A caller that does not care which agent runs it can say so with `reroute: "any"` (`-Reroute any`). After the same wait, and only when herdr answered and listed no such agent, the bridge points the task at the best live agent whose provider is not blocked, preferring one that can take work now. The task has not started, so nothing can run twice; `agent` shows where it went and `rerouted_from` where it was meant to go. With no eligible agent it is failed as before.
 
 - `orphaned` means the bridge lost the completion signal, not that the remote task necessarily failed. Do **not** blindly retry it; inspect the task's real effects first.
 - `error` means the bridge confirmed an execution or result-collection failure.
@@ -221,7 +298,7 @@ queued → running → done
 - **Reading a working agent.** herdr will not read the history of a working agent once more lines are asked for than the screen holds — measured: fine at the screen's height, `agent_not_idle` one line past it, while `visible` is never refused and is clamped to the screen. The default request is past any screen, so every read of a working agent failed: 33 times in one night, each followed by a retry with `--source visible`, which the client silently dropped. `/read` now takes `source`. When none is named and herdr refuses the history, the bridge falls back to the visible screen and says so (`source`, `note`); when one is named, the caller gets what it asked for plus a `hint`. Failure diagnostics use the same fallback, so a task that fails while its agent is busy, or stuck on a prompt, still carries evidence instead of "terminal read failed".
 - **The client no longer swallows options it does not know.** `sentinel.ps1` collects every undeclared argument into its free-text parameter, so a mistyped or unsupported option on a command that takes no text was dropped while the caller believed it had been sent. Those commands now refuse unrecognised arguments (exit 1). `-Source` is a real option, and PowerShell reads `--source` as `-Source`, so herdr's own spelling — the one its error message recommends — works.
 - **A task too large to deliver is refused up front.** herdr takes the prompt as one command-line argument, and Linux caps a single argument at 131072 bytes: measured on the host, 131000 is delivered and 131072 fails with `Errno 7`. The bridge checked nothing, so an oversized task was accepted and queued — the caller was told `queued` — and then failed in the worker with that bare errno; it had happened once for real. `/delegate`, `/ask` and `/prompt` now measure what is actually sent (envelope, result path and policy line included, in UTF-8 bytes — a Chinese character is three) against `SENTINEL_MAX_PROMPT_BYTES`, and answer 400 with `reason: task_too_large` and what to do instead: put the material in a file on the host and refer to it by path.
-- **A task queued for an agent that no longer exists no longer waits forever.** herdr drops an agent's name when its process restarts. Two tasks queued for `sentinel-claude` and `sentinel-opencode` stayed `queued` for three weeks: the bridge knew nothing would pick them up (`queued_reason` said so) but never acted on it, so a caller would `wait` indefinitely, and the tasks held queue slots; `/tasks` shows only the newest twenty, so nobody saw them. After `SENTINEL_STALE_TARGET_SEC` (10 minutes), a queued task whose agent herdr no longer lists is failed with an error that says it was never sent and is safe to resubmit. It is not re-pointed at some other agent: sending work to the wrong agent is worse than not sending it. It waits the full period first, because an agent that is restarting is briefly absent from the list; and it does nothing when herdr cannot be asked, or when the agent exists but is busy.
+- **A task queued for an agent that no longer exists no longer waits forever.** herdr drops an agent's name when its process restarts. Two tasks queued for `sentinel-claude` and `sentinel-opencode` stayed `queued` for three weeks: the bridge knew nothing would pick them up (`queued_reason` said so) but never acted on it, so a caller would `wait` indefinitely, and the tasks held queue slots; `/tasks` shows only the newest twenty, so nobody saw them. After `SENTINEL_STALE_TARGET_SEC` (10 minutes), a queued task whose agent herdr no longer lists is failed with an error that says it was never sent and is safe to resubmit. It is not re-pointed at some other agent unless the caller opted in with `reroute: any` (see [above](#re-pointing-a-task-whose-agent-is-gone)): sending work to the wrong agent is worse than not sending it. It waits the full period first, because an agent that is restarting is briefly absent from the list; and it does nothing when herdr cannot be asked, or when the agent exists but is busy.
 - **A killed `herdr agent prompt` is not a failed prompt.** `bridge-restart` hangs up the whole process group, including the call the worker is waiting on. That call ended with no output and was reported as "Herdr prompt command failed:" followed by nothing, marking the task `error` — which tells a caller that retrying is safe. Whether the prompt had landed was never known. A call that ends with no output at all is now a lost track (the task is `orphaned`: "may still be executing"), and `error` can no longer overwrite `orphaned`, whichever of the shutdown and the worker gets there second.
 - **`/prompt` gets the same wait-abort handling as a task** (v23 fixed only tasks): a transient `blocked` no longer produces a 500 saying the agent "requires interactive input".
 - **A synchronous `ask` that times out (504) or finds no result after the reminder (502) now leaves a task row behind**, and says so in a `hint`. Before, the `task_id` in that response returned 404, so a result that arrived a minute later had nowhere to go — the 111 above. Successful asks and refused ones (busy, unavailable, quota) write nothing: the first needs no record and in the second nothing ran, so the success path is unchanged.
@@ -364,10 +441,16 @@ cd sentinel-bridge
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install pytest  # Windows
 .venv/bin/python -m pip install pytest          # Linux/macOS
-.venv/Scripts/python.exe -m pytest test_bridge.py -v
+.venv/Scripts/python.exe -m pytest -v
 ```
 
-The Python suite has 111 mocked tests and does not require a real Herdr installation or network. The Windows client has a 16-test Pester suite that runs against a local HTTP stub:
+The Python suite has over 500 tests and needs neither a real Herdr installation nor a network, in three layers:
+
+- `test_bridge.py` runs the bridge inside the test process with the herdr call replaced, covering the logic case by case.
+- `test_remote_scripts.py` runs the deployment scripts under bash with `screen`, `pkill` and `curl` stubbed.
+- `test_e2e.py` starts `bridge.py` as a real process in front of [`fake_herdr.py`](sentinel-bridge/fake_herdr.py) and drives it over HTTP, so what is exercised is what happens *around* the code: the process killed without warning and restarted onto the same database (the task becomes `orphaned`, the agent is never prompted twice, and a late answer is recovered), twelve identical retries arriving at once (one task), twenty submissions against a queue limit of five (exactly five accepted), a provider running out of quota (the task moves to another provider), and a failed step cancelling everything downstream before any of it reaches an agent.
+
+Two tests are skipped on Windows, which cannot deliver POSIX signals. The Windows client has a Pester suite of about sixty tests that runs against a local HTTP stub:
 
 ```powershell
 Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser  # first time only
