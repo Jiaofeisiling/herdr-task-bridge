@@ -314,6 +314,24 @@ STALE_TARGET_SEC = int(os.environ.get("SENTINEL_STALE_TARGET_SEC", "600"))
 TASK_STATUSES = (
     "queued", "running", "done", "error", "orphaned", "quota_exhausted",
 )
+
+# The whole life of a task, in one place. Every status change goes through
+# transition(), which refuses anything not listed here.
+TASK_TRANSITIONS = {
+    "queued": ("running", "error"),   # claimed by the worker; abandoned unsent
+    "running": ("queued", "done", "error", "orphaned", "quota_exhausted"),
+    # Not final: a result that turns up late adopts them (adopt_late_result).
+    "error": ("done",),
+    "orphaned": ("done",),
+    "done": (),
+    "quota_exhausted": (),
+}
+
+# What a transition may write alongside the status. A whitelist because the
+# names are spliced into the SQL.
+_TRANSITION_COLUMNS = frozenset({
+    "started_at", "finished_at", "result_text", "error_text", "recovered_at",
+})
 TASKS_LIMIT_DEFAULT = 20
 TASKS_LIMIT_MAX = 200
 
@@ -554,6 +572,7 @@ def init_db():
         if "recovered_at" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN recovered_at TEXT")
 
+
         if "idempotency_key" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
             conn.execute("ALTER TABLE tasks ADD COLUMN request_fingerprint TEXT")
@@ -581,17 +600,13 @@ def init_db():
 
         # 如果 bridge 在一个任务执行期间崩溃，
         # 千万不要自动重新运行它，否则可能重复执行危险操作。
-        conn.execute("""
-            UPDATE tasks
-            SET
-                status = 'orphaned',
-                finished_at = ?,
-                error_text = COALESCE(
-                    error_text,
-                    'Bridge restarted while this task was running. Sentinel may have partially or fully executed it.'
-                )
-            WHERE status = 'running'
-        """, (now_iso(),))
+        _transition_where(conn, "orphaned", "running", {
+            "finished_at": now_iso(),
+            "error_text": (
+                "Bridge restarted while this task was running. Sentinel may "
+                "have partially or fully executed it."
+            ),
+        })
 
 
 class QueueFullError(RuntimeError):
@@ -654,19 +669,14 @@ def adopt_late_result(task_id):
         f"waiting, and was recovered at {now_iso()}."
     )
 
-    with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'done',
-                result_text = ?,
-                recovered_at = ?,
-                error_text = CASE
-                    WHEN error_text IS NULL OR error_text = '' THEN ?
-                    ELSE error_text || char(10) || ?
-                END
-            WHERE task_id = ? AND status IN ('error', 'orphaned')
-        """, (content, now_iso(), note, note, task_id))
-        adopted = cursor.rowcount == 1
+    adopted = transition(
+        task_id, "done", LATE_RESULT_STATUSES,
+        result_text=content,
+        recovered_at=now_iso(),
+        error_text=(
+            f"{task['error_text']}\n{note}" if task["error_text"] else note
+        ),
+    )
 
     if not adopted:
         return None   # another caller got there first
@@ -869,16 +879,51 @@ def validate_tasks_query(query):
     return limit, status
 
 
+def _transition_where(conn, to, expect, columns, task_id=None):
+    """Move every task in the `expect` state(s) to `to`; return how many moved.
+
+    The one place that writes a status. `expect` makes it a compare-and-set:
+    a task that is no longer in that state is left alone, which is how two
+    paths racing to finish the same task cannot both win. A move the table
+    does not allow is a bug in the caller rather than a lost race, and raises.
+    """
+    sources = (expect,) if isinstance(expect, str) else tuple(expect)
+
+    for source in sources:
+        if to not in TASK_TRANSITIONS.get(source, ()):
+            raise ValueError(f"illegal task transition: {source} -> {to}")
+
+    unknown = set(columns) - _TRANSITION_COLUMNS
+    if unknown:
+        raise ValueError(
+            f"a transition cannot set: {', '.join(sorted(unknown))}"
+        )
+
+    assignments = ", ".join(f"{name} = ?" for name in ("status", *columns))
+    where = f"status IN ({', '.join('?' for _ in sources)})"
+    params = [to, *columns.values(), *sources]
+
+    if task_id is not None:
+        where += " AND task_id = ?"
+        params.append(task_id)
+
+    return conn.execute(
+        f"UPDATE tasks SET {assignments} WHERE {where}", params
+    ).rowcount
+
+
+def transition(task_id, to, expect, **columns):
+    """Atomically move one task from `expect` to `to`. True if it moved."""
+    with db_session() as conn:
+        return _transition_where(conn, to, expect, columns, task_id) == 1
+
+
 def abandon_task(task_id, error_text):
     """Fail a task that is still queued. Never touches one that has started."""
-    with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'error', error_text = ?, finished_at = ?
-            WHERE task_id = ? AND status = 'queued'
-        """, (error_text, now_iso(), task_id))
-
-        return cursor.rowcount == 1
+    return transition(
+        task_id, "error", "queued",
+        error_text=error_text, finished_at=now_iso(),
+    )
 
 
 def _age_seconds(iso_stamp):
@@ -923,42 +968,38 @@ def peek_next_task(exclude_agents=()):
 
 
 def claim_task(task_id):
-    with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'running', started_at = ?
-            WHERE task_id = ? AND status = 'queued'
-        """, (now_iso(), task_id))
-
-        return cursor.rowcount == 1
+    return transition(task_id, "running", "queued", started_at=now_iso())
 
 
 def requeue_task(task_id):
     """Return a claimed task to the queue when every fallback is busy."""
-    with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'queued', started_at = NULL, finished_at = NULL
-            WHERE task_id = ? AND status = 'running'
-        """, (task_id,))
-
-        return cursor.rowcount == 1
+    return transition(
+        task_id, "queued", "running", started_at=None, finished_at=None
+    )
 
 
 def complete_task(task_id, result_text, note=None):
+    """Finish a running task. False if it was no longer running.
+
+    A task that is not running has already been settled some other way -- a
+    shutdown orphaned it, say, while the worker was still waiting on the agent.
+    Completing it anyway would overwrite that, and deleting the result file
+    would lose the only copy: it stays where adopt_late_result will find it.
+    """
+    columns = {"result_text": result_text, "finished_at": now_iso()}
+
     # `note` rides in error_text, as a late delivery's does: a finished task
     # that still has something the reader should know.
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'done', result_text = ?,
-                error_text = COALESCE(?, error_text), finished_at = ?
-            WHERE task_id = ?
-        """, (result_text, note, now_iso(), task_id))
+    if note is not None:
+        columns["error_text"] = note
+
+    if not transition(task_id, "done", "running", **columns):
+        return False
 
     # The file is the recovery copy until the transaction commits.
     discard_result_file(task_id)
     discard_progress_file(task_id)
+    return True
 
 
 def routing_note(requested, used):
@@ -988,32 +1029,26 @@ def fail_task(task_id, error_text):
     # orphaned -- "may have run; do not retry" -- must not be overwritten by
     # the worker's own report of the same event: `error` says retrying is
     # safe, and which of the two arrived last was a race.
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'error', error_text = ?, finished_at = ?
-            WHERE task_id = ? AND status = 'running'
-        """, (error_text, now_iso(), task_id))
+    return transition(
+        task_id, "error", "running",
+        error_text=error_text, finished_at=now_iso(),
+    )
 
 
 def orphan_task(task_id, error_text):
     discard_progress_file(task_id)
 
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'orphaned', error_text = ?, finished_at = ?
-            WHERE task_id = ?
-        """, (error_text, now_iso(), task_id))
+    return transition(
+        task_id, "orphaned", "running",
+        error_text=error_text, finished_at=now_iso(),
+    )
 
 
 def quota_exhausted_task(task_id, error_text):
-    with db_session() as conn:
-        conn.execute("""
-            UPDATE tasks
-            SET status = 'quota_exhausted', error_text = ?, finished_at = ?
-            WHERE task_id = ?
-        """, (error_text, now_iso(), task_id))
+    return transition(
+        task_id, "quota_exhausted", "running",
+        error_text=error_text, finished_at=now_iso(),
+    )
 
 
 def mark_agent_quota_blocked(agent_name, detail):
@@ -2508,10 +2543,16 @@ def task_worker(stop_event=None):
                             agent_name, operation, primary_locked=True
                         )
 
-                complete_task(
+                if complete_task(
                     task_id, result, note=routing_note(agent_name, used_agent)
-                )
-                print(f"[task {task_id}] done (agent={used_agent})")
+                ):
+                    print(f"[task {task_id}] done (agent={used_agent})")
+                else:
+                    print(
+                        f"[task {task_id}] finished on {used_agent} but is no "
+                        "longer running; its result file is left for late "
+                        "adoption"
+                    )
 
             except TimeoutError as e:
                 # The agent may still be executing, so it cannot safely be
@@ -2664,14 +2705,10 @@ def wait_for_inflight(grace_sec):
 
 def orphan_running_tasks(reason):
     with db_session() as conn:
-        cursor = conn.execute("""
-            UPDATE tasks
-            SET status = 'orphaned', finished_at = ?,
-                error_text = COALESCE(error_text, ?)
-            WHERE status = 'running'
-        """, (now_iso(), reason))
-
-    return cursor.rowcount
+        return _transition_where(
+            conn, "orphaned", "running",
+            {"finished_at": now_iso(), "error_text": reason},
+        )
 
 
 def graceful_shutdown(server, grace_sec=None, signame="signal"):

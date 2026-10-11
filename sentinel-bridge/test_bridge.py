@@ -973,6 +973,7 @@ def test_delegate_succeeds_again_once_queue_has_room(live_server, monkeypatch):
     blocked = _post(live_server, "/delegate", {"task": "task 2"})
     assert blocked[0] == 429
 
+    assert bridge.claim_task(first[1]["task_id"])
     bridge.complete_task(first[1]["task_id"], "done")
 
     status, body = _post(live_server, "/delegate", {"task": "task 3"})
@@ -2889,6 +2890,7 @@ def test_progress_file_is_removed_once_the_task_finishes(tmp_path, monkeypatch):
     with open(path, "w", encoding="utf-8") as f:
         f.write("working\n")
 
+    assert bridge.claim_task(task_id)
     bridge.complete_task(task_id, "done")
 
     # Otherwise every finished task leaves one behind, which is the leak
@@ -4387,6 +4389,7 @@ def test_a_task_whose_herdr_call_is_killed_ends_orphaned_not_error(tmp_path, mon
 def test_an_error_never_overwrites_an_orphaned_task(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
     task_id = bridge.create_task("audit", 60000, "w1:p3")
+    assert bridge.claim_task(task_id)
     bridge.orphan_task(task_id, "stopped while running")
 
     # `orphaned` says "may have run; do not retry". Whichever of the shutdown
@@ -4655,3 +4658,192 @@ def test_an_agent_that_is_listed_but_cannot_be_queried_keeps_its_tasks(tmp_path,
     _run_worker_until(lambda: bridge.get_task(task_id)["status"] != "queued", seconds=2)
 
     assert bridge.get_task(task_id)["status"] == "queued"
+
+
+# --- the task state machine: one table, one door -------------------------
+#
+# A task's status used to be rewritten by seven separate UPDATE statements,
+# of which only some checked what the status was. complete_task, orphan_task
+# and quota_exhausted_task would overwrite anything -- including a task that
+# had already finished -- so whether a result survived depended on which of two
+# racing paths got there last.
+
+import itertools
+
+
+def _task_in_state(status):
+    task_id = bridge.create_task("t", 60000, "w1:p3")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (status, task_id))
+    return task_id
+
+
+def test_every_status_has_a_row_in_the_transition_table():
+    assert set(bridge.TASK_TRANSITIONS) == set(bridge.TASK_STATUSES)
+
+    for targets in bridge.TASK_TRANSITIONS.values():
+        assert set(targets) <= set(bridge.TASK_STATUSES)
+
+
+def test_only_done_and_quota_exhausted_are_final():
+    final = {s for s, targets in bridge.TASK_TRANSITIONS.items() if not targets}
+
+    # error and orphaned are deliberately not final: a result file that turns
+    # up late turns them into done (adopt_late_result).
+    assert final == {"done", "quota_exhausted"}
+
+
+@pytest.mark.parametrize(
+    "source,target", list(itertools.product(bridge.TASK_STATUSES, repeat=2))
+)
+def test_transition_follows_the_table(tmp_path, monkeypatch, source, target):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state(source)
+
+    if target in bridge.TASK_TRANSITIONS[source]:
+        assert bridge.transition(task_id, target, expect=source) is True
+        assert bridge.get_task(task_id)["status"] == target
+    else:
+        # A transition the table does not allow is a bug in the caller, not a
+        # lost race, and is loud about it.
+        with pytest.raises(ValueError):
+            bridge.transition(task_id, target, expect=source)
+        assert bridge.get_task(task_id)["status"] == source
+
+
+def test_transition_is_a_no_op_when_the_task_is_not_in_the_expected_state(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("queued")
+
+    # running -> done is legal, but this task is not running: a lost race.
+    assert bridge.transition(task_id, "done", expect="running") is False
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+def test_transition_writes_its_columns_in_the_same_statement(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+
+    assert bridge.transition(task_id, "error", expect="running",
+                             error_text="boom", finished_at="2026-01-01T00:00:00+00:00")
+
+    row = bridge.get_task(task_id)
+    assert row["error_text"] == "boom"
+    assert row["finished_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_transition_rejects_a_column_it_does_not_know(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+
+    with pytest.raises(ValueError):
+        bridge.transition(task_id, "error", expect="running", bogus="x")
+
+
+_FINISHERS = {
+    "complete": lambda t: bridge.complete_task(t, "r"),
+    "fail": lambda t: bridge.fail_task(t, "e"),
+    "orphan": lambda t: bridge.orphan_task(t, "e"),
+    "quota": lambda t: bridge.quota_exhausted_task(t, "e"),
+}
+_FINISHER_RESULT = {
+    "complete": "done", "fail": "error", "orphan": "orphaned", "quota": "quota_exhausted",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FINISHERS))
+def test_a_finisher_moves_a_running_task_and_says_so(tmp_path, monkeypatch, name):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+
+    assert _FINISHERS[name](task_id) is True
+    assert bridge.get_task(task_id)["status"] == _FINISHER_RESULT[name]
+
+
+@pytest.mark.parametrize("name", sorted(_FINISHERS))
+@pytest.mark.parametrize("state", ["queued", "done", "error", "orphaned", "quota_exhausted"])
+def test_a_finisher_never_touches_a_task_that_is_not_running(tmp_path, monkeypatch, name, state):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state(state)
+    before = bridge.get_task(task_id)
+
+    assert _FINISHERS[name](task_id) is False
+    assert bridge.get_task(task_id) == before
+
+
+def test_a_refused_completion_keeps_the_result_for_late_adoption(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    assert bridge.claim_task(task_id)
+
+    # A shutdown marks the running task orphaned while the worker is still
+    # waiting on the agent ...
+    assert bridge.orphan_task(task_id, "bridge is stopping")
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write("the answer")
+
+    # ... and then the worker gets its answer. The task is no longer running,
+    # so it must not be completed behind the orphaning's back, and -- the point
+    # -- the file is the only copy, so it must not be deleted either.
+    assert bridge.complete_task(task_id, "the answer") is False
+    assert os.path.exists(bridge.result_file_path(task_id))
+
+    adopted = bridge.adopt_late_result(task_id)
+    assert adopted["status"] == "done"
+    assert adopted["result_text"] == "the answer"
+    assert adopted["recovered_at"] is not None
+
+
+def test_only_one_of_several_racing_finishers_wins(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("running")
+    barrier = threading_module.Barrier(len(_FINISHERS))
+    outcomes = {}
+
+    def race(name):
+        barrier.wait()
+        outcomes[name] = _FINISHERS[name](task_id)
+
+    threads = [threading_module.Thread(target=race, args=(n,)) for n in _FINISHERS]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    winners = [name for name, won in outcomes.items() if won]
+    assert len(winners) == 1
+    assert bridge.get_task(task_id)["status"] == _FINISHER_RESULT[winners[0]]
+
+
+def test_status_is_only_rewritten_through_the_transition_door():
+    # Keeps the next UPDATE from quietly bypassing the table.
+    with open(bridge.__file__, encoding="utf-8") as f:
+        source = f.read()
+
+    assert re.findall(r"SET\s+status\s*=", source) == []
+
+
+def test_the_worker_does_not_log_done_for_a_task_it_could_not_complete(tmp_path, monkeypatch, capsys):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+
+    def shutdown_lands_mid_task(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        # The shutdown orphans the running task while the worker still waits.
+        assert bridge.orphan_task(task_id, "bridge is stopping")
+        return "an answer that arrives too late"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", shutdown_lands_mid_task)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+
+    _run_worker_until(lambda: bridge.get_task(task_id)["status"] not in ("queued", "running"))
+
+    assert bridge.get_task(task_id)["status"] == "orphaned"
+    out = capsys.readouterr().out
+    assert f"[task {task_id}] done" not in out
+    assert f"[task {task_id}]" in out   # but it does say what happened
+
+
+# --- found in review ------------------------------------------------------
+
+
