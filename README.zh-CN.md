@@ -422,6 +422,15 @@ python scripts/smoke.py
 
 三种通道状态会被区别报告，因为它们需要不同的处理：连接被拒表示没有任何东西在监听；能连上却始终不回应表示本地端口转发还在、但它通往主机的链路已断——这种"半死"状态最容易被误判成 bridge 故障，因为端口看上去完好；能收到回应则表示 bridge 在正常应答，此时下面的任何失败才真正属于它自己。
 
+`smoke.py` 不会向任何 agent 发任务。要在你自己的主机和 agent 上验证较新的行为——结构化结果、依赖、取消、事件流、幂等重试——运行验收脚本：
+
+```bash
+python scripts/acceptance.py                         # 只打印它打算做什么，不发送任何东西
+python scripts/acceptance.py --yes --report run.md   # 真正运行，并写出可分享的报告
+```
+
+它会创建四个小探针任务：其中两个真的在存活的 agent 上运行，另两个在开始之前就被取消（这本身也被检查：它们绝不能被发出去）。探针禁止执行命令、改文件、使用集群，并带有 `slurm_policy: dry_run_only`。报告只写 agent 的运行时（`opencode`、`claude`），不含任何关于主机的信息。见 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)。
+
 supervisor 会保留 `screen` 会话，并将重启日志写到 `sentinel-bridge/bridge.log`；不要在 `screen` 中直接运行 `bridge.py`。迁移到其他 HPC 或 Linux 服务器时，只需要按本站情况调整部署细节：clone 位置、服务守护方式、私有连接、环境文件和 agent 权限。bridge 的 API 与安全约定不变。
 
 Windows 端可选地在 PowerShell profile 中加载 [`sentinel.profile.ps1`](sentinel.profile.ps1)，以便在任何目录直接使用 `sentinel`：
