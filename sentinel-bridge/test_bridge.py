@@ -4844,6 +4844,292 @@ def test_the_worker_does_not_log_done_for_a_task_it_could_not_complete(tmp_path,
     assert f"[task {task_id}]" in out   # but it does say what happened
 
 
+# --- structured results ---------------------------------------------------
+#
+# A result used to be whatever prose the agent wrote. A caller wanting the job
+# ID, or wanting to know whether the work actually succeeded, had to read it
+# out of that prose. An agent may now write a JSON object instead; plain text
+# is still accepted, unchanged, so no agent and no stored row stops working.
+
+STRUCTURED = {
+    "status": "partial",
+    "summary": "built the env; training job queued",
+    "job_ids": ["12345678"],
+    "artifacts": ["/scratch/run1/log.txt"],
+    "metrics": {"val_loss": 0.42, "epochs": 3, "split": "dev"},
+    "warnings": ["cuda module deprecated"],
+    "changed_files": ["env/setup.sh"],
+}
+
+
+def test_plain_text_is_not_structured_and_not_a_problem():
+    assert bridge.parse_structured_result("all done, nothing to report") == (None, None)
+    # Prose that merely mentions braces is still prose.
+    assert bridge.parse_structured_result("set {a,b} to 1") == (None, None)
+    # So is JSON that is not an object: there is nothing to read fields from.
+    assert bridge.parse_structured_result('["a", "b"]') == (None, None)
+
+
+def test_a_minimal_object_needs_only_a_summary():
+    data, problem = bridge.parse_structured_result('{"summary": "done"}')
+
+    assert problem is None
+    assert data == {
+        "summary": "done", "status": None, "job_ids": [], "artifacts": [],
+        "metrics": {}, "warnings": [], "changed_files": [],
+    }
+
+
+def test_a_full_object_is_read_field_for_field():
+    data, problem = bridge.parse_structured_result(json_module.dumps(STRUCTURED))
+
+    assert problem is None
+    assert data == STRUCTURED
+
+
+def test_a_fenced_block_is_accepted():
+    # Agents wrap JSON in a markdown fence far more often than not.
+    text = "```json\n" + json_module.dumps(STRUCTURED) + "\n```"
+
+    data, problem = bridge.parse_structured_result("  \n" + text + "\n  ")
+
+    assert problem is None
+    assert data["job_ids"] == ["12345678"]
+
+
+def test_unknown_keys_are_ignored_not_rejected():
+    data, problem = bridge.parse_structured_result(
+        '{"summary": "done", "mood": "cheerful"}'
+    )
+
+    assert problem is None
+    assert "mood" not in data
+
+
+@pytest.mark.parametrize("text,fragment", [
+    ('{"summary": "done"', "parse"),                          # truncated
+    ('{"status": "success"}', "summary"),                     # required field missing
+    ('{"summary": ""}', "summary"),
+    ('{"summary": 5}', "summary"),
+    ('{"summary": "x", "status": "great"}', "status"),        # not one of the four
+    ('{"summary": "x", "job_ids": "123"}', "job_ids"),        # not a list
+    ('{"summary": "x", "job_ids": [123]}', "job_ids"),        # not strings
+    ('{"summary": "x", "metrics": {"a": [1]}}', "metrics"),   # nested value
+    ('{"summary": "x", "metrics": []}', "metrics"),
+])
+def test_a_malformed_object_is_refused_with_the_reason(text, fragment):
+    data, problem = bridge.parse_structured_result(text)
+
+    assert data is None
+    assert fragment in problem
+
+
+def _running_task(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+    assert bridge.claim_task(task_id)
+    return task_id
+
+
+def test_a_structured_result_is_stored_and_served_as_data(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    raw = json_module.dumps(STRUCTURED)
+
+    assert bridge.complete_task(task_id, raw)
+
+    view = bridge.task_view(bridge.get_task(task_id))
+    assert view["status"] == "done"
+    assert view["result_format"] == "json"
+    assert view["result_data"] == STRUCTURED
+    # The original text is never replaced, so nothing that read it breaks ...
+    assert view["result_text"] == raw
+    # ... and the storage column is an implementation detail.
+    assert "result_json" not in view
+
+
+def test_a_text_result_is_served_as_text(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    bridge.complete_task(task_id, "just prose")
+
+    view = bridge.task_view(bridge.get_task(task_id))
+
+    assert view["result_format"] == "text"
+    assert view["result_data"] is None
+    assert view["error_text"] is None   # plain text is not a problem to report
+
+
+def test_a_task_without_a_result_has_no_format(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p3")
+
+    view = bridge.task_view(bridge.get_task(task_id))
+
+    assert view["result_format"] is None
+    assert view["result_data"] is None
+
+
+def test_broken_json_degrades_to_text_and_says_why(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    raw = '{"summary": "did the thing", "job_ids": ["1"'    # cut off mid-write
+
+    assert bridge.complete_task(task_id, raw)
+
+    view = bridge.task_view(bridge.get_task(task_id))
+    # The work was delivered; a format slip must not fail it.
+    assert view["status"] == "done"
+    assert view["result_text"] == raw
+    assert view["result_format"] == "text"
+    # But an agent that keeps getting it wrong should be able to find out.
+    assert "structured" in view["error_text"].lower()
+    assert "parse" in view["error_text"]
+
+
+def test_the_note_about_the_format_does_not_displace_the_routing_note(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+
+    bridge.complete_task(task_id, '{"status": "success"}', note="Ran on w1:p1, not w1:p3")
+
+    error_text = bridge.get_task(task_id)["error_text"]
+    assert "Ran on w1:p1" in error_text
+    assert "summary" in error_text
+
+
+def test_an_agent_that_reports_failure_does_not_fail_the_bridge_task(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+
+    bridge.complete_task(task_id, '{"status": "failed", "summary": "sbatch rejected the script"}')
+
+    view = bridge.task_view(bridge.get_task(task_id))
+    # Two different facts, reported separately: the bridge delivered the
+    # result (done); the work behind it did not succeed (failed). One `done`
+    # must never stand in for both.
+    assert view["status"] == "done"
+    assert view["result_data"]["status"] == "failed"
+
+
+def test_a_late_structured_result_is_parsed_too(tmp_path, monkeypatch):
+    task_id = _running_task(tmp_path, monkeypatch)
+    assert bridge.orphan_task(task_id, "bridge is stopping")
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write(json_module.dumps(STRUCTURED))
+
+    adopted = bridge.task_view(bridge.adopt_late_result(task_id))
+
+    assert adopted["status"] == "done"
+    assert adopted["result_data"] == STRUCTURED
+
+
+def test_a_database_from_before_structured_results_gains_the_column(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
+            finished_at TEXT, timeout_ms INTEGER NOT NULL, result_text TEXT,
+            error_text TEXT, slurm_policy TEXT, idempotency_key TEXT,
+            request_fingerprint TEXT, recovered_at TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks VALUES ('old', 't', 'a', 'done', 'x', NULL, NULL, 1, "
+        "'{\"summary\": \"looks structured\"}', NULL, NULL, NULL, NULL, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    # A row stored before the feature stays what it was: text. It is not
+    # re-read as something its agent never claimed to write.
+    view = bridge.task_view(bridge.get_task("old"))
+    assert view["result_format"] == "text"
+    assert view["result_data"] is None
+
+
+def test_the_task_endpoints_serve_structured_results(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    assert bridge.claim_task(task_id)
+    bridge.complete_task(task_id, json_module.dumps(STRUCTURED))
+
+    _, one = _get(live_server, f"/tasks/{task_id}")
+    _, many = _get(live_server, "/tasks")
+
+    for task in (one["task"], many["tasks"][0]):
+        assert task["result_format"] == "json"
+        assert task["result_data"] == STRUCTURED
+        assert "result_json" not in task
+
+
+def test_ask_returns_the_structured_form_beside_the_text(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    raw = json_module.dumps(STRUCTURED)
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent(raw))
+
+    status, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert status == 200
+    assert body["result"]["text"] == raw           # the shape clients already read
+    assert body["result"]["format"] == "json"
+    assert body["result"]["data"] == STRUCTURED
+
+
+def test_ask_marks_prose_as_text(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("总结完成"))
+
+    _, body = _post(live_server, "/ask", {"task": "do something"})
+
+    assert body["result"]["format"] == "text"
+    assert body["result"]["data"] is None
+
+
+def test_the_delegation_prompt_offers_the_structured_form():
+    prompt = bridge.build_delegation_prompt("检查磁盘", "11111111-2222-3333-4444-555555555555")
+
+    for field in ("summary", "status", "job_ids", "artifacts", "metrics",
+                  "warnings", "changed_files"):
+        assert field in prompt
+    # Still an offer, not a demand: prose must remain a valid answer.
+    assert "纯文本" in prompt
+
+
 # --- found in review ------------------------------------------------------
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_a_non_finite_metric_is_not_accepted_as_structured(token):
+    # json.loads reads these, and the API would then write them back out as bare
+    # tokens that are not JSON: a strict parser (Windows PowerShell 5.1's
+    # ConvertFrom-Json among them) rejects the whole reply, status included.
+    data, problem = bridge.parse_structured_result(
+        '{"summary": "diverged", "metrics": {"loss": ' + token + "}}"
+    )
+
+    assert data is None
+    assert "finite" in problem
+
+
+def test_a_task_with_a_non_finite_metric_is_still_served_as_valid_json(live_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("train", 60000, "w1:p1")
+    assert bridge.claim_task(task_id)
+    bridge.complete_task(task_id, '{"summary": "diverged", "metrics": {"loss": NaN}}')
+
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("GET", f"/tasks/{task_id}")
+    raw = conn.getresponse().read().decode("utf-8")
+    conn.close()
+
+    def strict(token):
+        raise ValueError(f"not JSON: {token}")
+
+    # Parsed the way a strict client would: no NaN or Infinity allowed.
+    assert json_module.loads(raw, parse_constant=strict)["task"]["result_format"] == "text"
 
 

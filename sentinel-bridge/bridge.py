@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import signal
@@ -330,7 +331,8 @@ TASK_TRANSITIONS = {
 # What a transition may write alongside the status. A whitelist because the
 # names are spliced into the SQL.
 _TRANSITION_COLUMNS = frozenset({
-    "started_at", "finished_at", "result_text", "error_text", "recovered_at",
+    "started_at", "finished_at", "result_text", "result_json", "error_text",
+    "recovered_at",
 })
 TASKS_LIMIT_DEFAULT = 20
 TASKS_LIMIT_MAX = 200
@@ -543,6 +545,7 @@ def init_db():
                 timeout_ms INTEGER NOT NULL,
 
                 result_text TEXT,
+                result_json TEXT,
                 error_text TEXT,
 
                 slurm_policy TEXT,
@@ -572,6 +575,10 @@ def init_db():
         if "recovered_at" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN recovered_at TEXT")
 
+        # Rows from before structured results stay NULL here: they were
+        # never claimed to be structured, so they read back as plain text.
+        if "result_json" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN result_json TEXT")
 
         if "idempotency_key" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
@@ -633,6 +640,115 @@ def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None,
     ))
 
 
+# What the agent itself says about the work, as opposed to `status`, which says
+# whether the bridge delivered the result. A task can be `done` here and
+# `failed` there: one `done` must never stand in for both.
+RESULT_OUTCOMES = ("success", "partial", "failed", "blocked")
+_RESULT_LIST_FIELDS = ("job_ids", "artifacts", "warnings", "changed_files")
+
+# Agents wrap JSON in a markdown fence far more often than not.
+_FENCED_BLOCK = re.compile(r"^```[A-Za-z]*[ \t]*\n(.*?)\n?```$", re.DOTALL)
+
+
+def parse_structured_result(text):
+    """Read an agent's result as a JSON object, if that is what it wrote.
+
+    Returns (data, problem). Prose is not a problem: (None, None). Something
+    that tried to be an object and was not -- cut off, a field of the wrong
+    type -- is (None, why), so the caller can say so; it is never an error,
+    because the work was delivered and only the format slipped.
+    """
+    body = (text or "").strip()
+
+    fenced = _FENCED_BLOCK.match(body)
+    if fenced:
+        body = fenced.group(1).strip()
+
+    if not body.startswith("{"):
+        return None, None
+
+    try:
+        raw = json.loads(body)
+    except ValueError as e:
+        return None, f"could not parse as JSON ({e})"
+
+    summary = raw.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None, "'summary' is required and must be a non-empty string"
+
+    status = raw.get("status")
+    if status is not None and status not in RESULT_OUTCOMES:
+        return None, (
+            f"'status' must be one of {', '.join(RESULT_OUTCOMES)}, "
+            f"got {status!r}"
+        )
+
+    data = {"summary": summary, "status": status}
+
+    for field in _RESULT_LIST_FIELDS:
+        value = raw.get(field, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return None, f"'{field}' must be a list of strings"
+        data[field] = value
+
+    metrics = raw.get("metrics", {})
+    if not isinstance(metrics, dict) or not all(
+        isinstance(v, (str, int, float)) for v in metrics.values()
+    ):
+        return None, "'metrics' must be an object of numbers and strings"
+
+    # json.loads reads NaN and Infinity, and the API would write them back out
+    # as bare tokens that are not JSON, which a strict client rejects along
+    # with everything else in the reply.
+    if any(isinstance(v, float) and not math.isfinite(v) for v in metrics.values()):
+        return None, "'metrics' values must be finite numbers"
+    data["metrics"] = metrics
+
+    return data, None
+
+
+def _result_columns(result_text):
+    """The columns that record a result, plus a note if it fell short.
+
+    The text is always kept as delivered; the structured form is read out of
+    it, never put in its place.
+    """
+    data, problem = parse_structured_result(result_text)
+
+    columns = {
+        "result_text": result_text,
+        "result_json": json.dumps(data, ensure_ascii=False) if data else None,
+    }
+    note = (
+        f"Result kept as plain text, not read as structured JSON: {problem}."
+        if problem else None
+    )
+
+    return columns, note
+
+
+def task_view(row):
+    """A task row as the API serves it.
+
+    `result_json` is storage; callers get `result_data` and `result_format`
+    instead. A row without it is text, whatever its text looks like: it was
+    never claimed to be anything else.
+    """
+    view = dict(row)
+    raw = view.pop("result_json", None)
+
+    view["result_data"] = json.loads(raw) if raw else None
+
+    if raw:
+        view["result_format"] = "json"
+    elif view.get("result_text") is not None:
+        view["result_format"] = "text"
+    else:
+        view["result_format"] = None
+
+    return view
+
+
 # Task states in which a delivered result can still turn up. A queued or
 # running task is on the normal path -- the worker is about to read its file --
 # and quota_exhausted never reached an agent that could have written one.
@@ -669,13 +785,15 @@ def adopt_late_result(task_id):
         f"waiting, and was recovered at {now_iso()}."
     )
 
+    columns, format_note = _result_columns(content)
+
     adopted = transition(
         task_id, "done", LATE_RESULT_STATUSES,
-        result_text=content,
         recovered_at=now_iso(),
-        error_text=(
-            f"{task['error_text']}\n{note}" if task["error_text"] else note
+        error_text="\n".join(
+            n for n in (task["error_text"], note, format_note) if n
         ),
+        **columns,
     )
 
     if not adopted:
@@ -986,12 +1104,14 @@ def complete_task(task_id, result_text, note=None):
     Completing it anyway would overwrite that, and deleting the result file
     would lose the only copy: it stays where adopt_late_result will find it.
     """
-    columns = {"result_text": result_text, "finished_at": now_iso()}
+    columns, format_note = _result_columns(result_text)
+    columns["finished_at"] = now_iso()
 
-    # `note` rides in error_text, as a late delivery's does: a finished task
+    # Notes ride in error_text, as a late delivery's does: a finished task
     # that still has something the reader should know.
-    if note is not None:
-        columns["error_text"] = note
+    notes = "\n".join(n for n in (note, format_note) if n)
+    if notes:
+        columns["error_text"] = notes
 
     if not transition(task_id, "done", "running", **columns):
         return False
@@ -2661,7 +2781,9 @@ def build_delegation_prompt(task, task_id, slurm_policy=None):
 做完后把结果写入：
 {path}
 
-写清楚做了什么、结论是什么、有没有卡住或改动了什么。文件会被整份取走，别写凭据。
+推荐写成一个 JSON 对象，调用方能直接读到状态和 job ID（写纯文本也行，同样会被收下）：
+{{"status": "success|partial|failed|blocked", "summary": "做了什么、结论是什么、有没有卡住", "job_ids": [], "artifacts": [], "metrics": {{}}, "warnings": [], "changed_files": []}}
+只有 summary 必填；改动了什么写进 changed_files。文件会被整份取走，别写凭据。
 """.strip()
 
 _inflight = 0
@@ -3106,8 +3228,10 @@ class Handler(BaseHTTPRequestHandler):
 
             # A late result may have arrived since anyone last looked.
             tasks = [
-                (adopt_late_result(t["task_id"]) or t)
-                if t["status"] in LATE_RESULT_STATUSES else t
+                task_view(
+                    (adopt_late_result(t["task_id"]) or t)
+                    if t["status"] in LATE_RESULT_STATUSES else t
+                )
                 for t in list_tasks(limit, status_filter)
             ]
 
@@ -3130,6 +3254,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if task["status"] in LATE_RESULT_STATUSES:
                 task = adopt_late_result(task_id) or task
+
+            task = task_view(task)
 
             # Read here rather than in get_task(): the worker calls that
             # on every poll and has no use for progress, so it should not
@@ -3404,11 +3530,17 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
 
+            result_data, _ = parse_structured_result(result_text)
+
             self.send_json({
                 "ok": True,
                 "task_id": task_id,
                 "agent": used_agent,
-                "result": {"text": result_text},
+                "result": {
+                    "text": result_text,
+                    "format": "json" if result_data else "text",
+                    "data": result_data,
+                },
             })
             # Synchronous asks have no completion transaction. Keep their
             # recovery copy until the response has been written successfully.
