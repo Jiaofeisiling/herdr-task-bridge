@@ -1283,3 +1283,124 @@ Describe "workflows" {
     }
 }
 
+
+Describe "events" {
+    # The bridge writes every status change as an event with a growing `seq`.
+    # `events` reads them, resuming from the last `seq` seen.
+
+    It "reads /events with no query when nothing was asked for" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("events")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; events = @(); next = 0
+            }
+            $result = Wait-SentinelExit -Process $proc
+
+            $req.Method | Should -Be "GET"
+            $req.Path | Should -Be "/events"
+            $req.Context.Request.Url.Query | Should -BeNullOrEmpty
+            $result.ExitCode | Should -Be 0
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "sends the cursor, the wait and the filters as query parameters" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("events", "-After", "5", "-WaitSec", "2", "-WorkflowId", "run-7")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; events = @(); next = 5
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $query = $req.Context.Request.QueryString
+            $query["after"] | Should -Be "5"
+            $query["wait"] | Should -Be "2"
+            $query["workflow_id"] | Should -Be "run-7"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "treats a bare argument as the task whose events to read" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("events", "t1")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; events = @(); next = 0
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.QueryString["task_id"] | Should -Be "t1"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "does not give up on a long poll before the bridge's own wait is over" {
+        # A quick call is bounded at SENTINEL_CLIENT_TIMEOUT_SEC; a long poll
+        # is meant to be silent for longer than that, so cutting it at the
+        # quick bound would report a healthy bridge as unreachable.
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("events", "-WaitSec", "4") `
+                -Env @{ SENTINEL_CLIENT_TIMEOUT_SEC = "1" }
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Start-Sleep -Seconds 3
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; events = @(); next = 0
+            }
+            $result = Wait-SentinelExit -Process $proc -TimeoutMs 20000
+
+            $result.ExitCode | Should -Be 0
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "can ask for as many events as the bridge will give in one reply" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("events", "-Limit", "500")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{
+                ok = $true; events = @(); next = 0
+            }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.QueryString["limit"] | Should -Be "500"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "rejects a wait longer than the bridge allows, without contacting it" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl `
+                -ScriptArgs @("events", "-WaitSec", "999")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 2500
+            $result = Wait-SentinelExit -Process $proc
+
+            $req | Should -BeNullOrEmpty
+            $result.ExitCode | Should -Not -Be 0
+            # Refused for the wait itself, not merely for being an unknown command.
+            $result.StdErr | Should -Match "WaitSec"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}

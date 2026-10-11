@@ -20,7 +20,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 26
+BRIDGE_VERSION = 27
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -640,6 +640,24 @@ def init_db():
             )
         """)
 
+        # Every status change, written in the transaction that makes it. `seq`
+        # only ever grows, so a reader that remembers the last one it saw can
+        # ask for exactly what came after.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                workflow_id TEXT,
+                at TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_events_task "
+            "ON task_events(task_id)"
+        )
+
         # Which tasks a task waits on. A separate table because the scheduler
         # has to ask "is everything this waits on done?" in SQL.
         conn.execute("""
@@ -863,6 +881,8 @@ def _insert_task(conn, task_id, task, timeout_ms, agent_name, slurm_policy=None,
         idempotency_key, fingerprint, validate_reroute(reroute), workflow_id,
     ))
 
+    _record_event(conn, task_id, workflow_id, None, "queued")
+
 
 # What the agent itself says about the work, as opposed to `status`, which says
 # whether the bridge delivered the result. A task can be `done` here and
@@ -1075,6 +1095,7 @@ def record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
                 task_id, task, agent_name, status, now, now, now, timeout_ms,
                 error_text, validate_slurm_policy(slurm_policy),
             ))
+            _record_event(conn, task_id, None, None, status)
         return True
     except Exception as e:
         print(f"[ask {task_id}] could not record the failure: {e}")
@@ -1255,15 +1276,106 @@ def _transition_where(conn, to, expect, columns, task_id=None):
 
     assignments = ", ".join(f"{name} = ?" for name in ("status", *columns))
     where = f"status IN ({', '.join('?' for _ in sources)})"
-    params = [to, *columns.values(), *sources]
+    match = list(sources)
 
     if task_id is not None:
         where += " AND task_id = ?"
+        match.append(task_id)
+
+    # Take the write lock before looking, so the rows seen are the rows moved
+    # and each event can name the status it really replaced.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+    moving = conn.execute(
+        f"SELECT task_id, workflow_id, status FROM tasks WHERE {where}", match
+    ).fetchall()
+
+    if not moving:
+        return 0
+
+    conn.execute(
+        f"UPDATE tasks SET {assignments} WHERE {where}",
+        [to, *columns.values(), *match],
+    )
+
+    for row in moving:
+        _record_event(conn, row["task_id"], row["workflow_id"], row["status"], to)
+
+    return len(moving)
+
+
+def _record_event(conn, task_id, workflow_id, from_status, to_status):
+    conn.execute(
+        "INSERT INTO task_events "
+        "(task_id, workflow_id, at, from_status, to_status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, workflow_id, now_iso(), from_status, to_status),
+    )
+
+
+EVENTS_LIMIT_DEFAULT = 100
+EVENTS_LIMIT_MAX = 500
+EVENTS_WAIT_MAX_SEC = 30
+EVENTS_POLL_SEC = 0.25
+EVENTS_CURSOR_MAX = 2**63 - 1
+
+
+def list_events(after=0, limit=EVENTS_LIMIT_DEFAULT, task_id=None,
+                workflow_id=None):
+    """Events with a `seq` greater than `after`, oldest first."""
+    clauses, params = ["seq > ?"], [after]
+
+    if task_id is not None:
+        clauses.append("task_id = ?")
         params.append(task_id)
 
-    return conn.execute(
-        f"UPDATE tasks SET {assignments} WHERE {where}", params
-    ).rowcount
+    if workflow_id is not None:
+        clauses.append("workflow_id = ?")
+        params.append(workflow_id)
+
+    with db_session() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM task_events WHERE {' AND '.join(clauses)} "
+            "ORDER BY seq ASC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def validate_events_query(query):
+    """(after, limit, wait, task_id, workflow_id) from a parsed query string."""
+    def first(name):
+        values = query.get(name)
+        return values[0] if values else None
+
+    after = int(first("after") or 0)
+    # The upper bound is SQLite's largest integer; beyond it the query raises
+    # rather than finds nothing.
+    if not (0 <= after <= EVENTS_CURSOR_MAX):
+        raise ValueError(
+            f"after must be between 0 and {EVENTS_CURSOR_MAX}, got {after}"
+        )
+
+    limit = EVENTS_LIMIT_DEFAULT
+    if first("limit") is not None:
+        limit = int(first("limit"))
+        if not (1 <= limit <= EVENTS_LIMIT_MAX):
+            raise ValueError(
+                f"limit must be between 1 and {EVENTS_LIMIT_MAX}, got {limit}"
+            )
+
+    wait = 0.0
+    if first("wait") is not None:
+        wait = float(first("wait"))
+        if not (0 <= wait <= EVENTS_WAIT_MAX_SEC):
+            raise ValueError(
+                f"wait must be between 0 and {EVENTS_WAIT_MAX_SEC} seconds, "
+                f"got {wait:g}"
+            )
+
+    return after, limit, wait, first("task_id"), first("workflow_id")
 
 
 def transition(task_id, to, expect, **columns):
@@ -3597,6 +3709,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "ok": True,
                 "tasks": tasks,
+            })
+            return
+
+        if path == "/events":
+            try:
+                after, limit, wait, task_id, workflow_id = validate_events_query(
+                    parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                )
+            except (TypeError, ValueError) as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"}, 400
+                )
+                return
+
+            # A long poll: hold the request until something happens or the
+            # wait runs out, so a watcher is told at once without asking in a
+            # tight loop.
+            deadline = time.monotonic() + wait
+            while True:
+                events = list_events(after, limit, task_id, workflow_id)
+
+                if events or _shutting_down or time.monotonic() >= deadline:
+                    break
+
+                time.sleep(EVENTS_POLL_SEC)
+
+            self.send_json({
+                "ok": True,
+                "events": events,
+                "next": events[-1]["seq"] if events else after,
             })
             return
 

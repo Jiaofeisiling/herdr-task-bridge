@@ -5765,6 +5765,331 @@ def test_a_database_from_before_workflows_gains_what_it_needs(tmp_path, monkeypa
     assert "task_deps" in tables
 
 
+# --- the event stream -----------------------------------------------------
+#
+# Polling /tasks/<id> shows where a task is now, not that it moved, and a
+# caller that looks away misses anything that came and went. Every status
+# change is also written as an event, in the same transaction as the change, so
+# there is never a change without its event or an event without its change. A
+# caller keeps the last `seq` it saw and asks for what came after; reconnecting
+# neither misses nor repeats anything.
+
+
+def _events(after=0, **filters):
+    return bridge.list_events(after=after, **filters)
+
+
+def _moves(events):
+    return [(e["from_status"], e["to_status"]) for e in events]
+
+
+def test_creating_a_task_is_an_event(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    [event] = _events()
+
+    assert event["task_id"] == task_id
+    assert event["from_status"] is None
+    assert event["to_status"] == "queued"
+    assert event["at"]
+
+
+def test_every_status_change_is_an_event_in_order(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    bridge.claim_task(task_id)
+    bridge.complete_task(task_id, "done")
+
+    events = _events()
+
+    assert _moves(events) == [(None, "queued"), ("queued", "running"), ("running", "done")]
+    assert [e["seq"] for e in events] == sorted(e["seq"] for e in events)
+    assert len({e["seq"] for e in events}) == 3
+
+
+def test_a_lost_race_leaves_no_event(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    before = len(_events())
+
+    # Not running, so there is nothing to complete -- and nothing to announce.
+    assert bridge.complete_task(task_id, "x") is False
+
+    assert len(_events()) == before
+
+
+def test_an_illegal_transition_leaves_no_event(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = _task_in_state("done")
+    before = len(_events())
+
+    with pytest.raises(ValueError):
+        bridge.transition(task_id, "queued", expect="done")
+
+    assert len(_events()) == before
+
+
+def test_the_event_and_the_change_stand_or_fall_together(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("could not write the event")
+
+    monkeypatch.setattr(bridge, "_record_event", boom)
+
+    with pytest.raises(RuntimeError):
+        bridge.claim_task(task_id)
+
+    # The status change rolled back with the event that failed.
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+def test_an_event_names_the_workflow_it_belongs_to(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.enqueue_task("audit", 60000, "w1:p1", workflow_id="run-7")[0]
+    bridge.claim_task(task_id)
+
+    assert {e["workflow_id"] for e in _events()} == {"run-7"}
+
+
+def test_shutting_down_announces_every_task_it_orphans(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    ids = [bridge.create_task(f"t{i}", 60000, "w1:p1") for i in range(3)]
+    for task_id in ids[:2]:
+        assert bridge.claim_task(task_id)
+    mark = max(e["seq"] for e in _events())
+
+    assert bridge.orphan_running_tasks("bridge is stopping") == 2
+
+    after = _events(after=mark)
+    assert sorted(e["task_id"] for e in after) == sorted(ids[:2])
+    assert set(_moves(after)) == {("running", "orphaned")}
+
+
+def test_a_restart_announces_the_tasks_it_found_running(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    bridge.claim_task(task_id)
+    mark = max(e["seq"] for e in _events())
+
+    bridge.init_db()      # what a restart does
+
+    [event] = _events(after=mark)
+    assert (event["task_id"], event["from_status"], event["to_status"]) == (task_id, "running", "orphaned")
+
+
+def test_a_late_result_is_announced_with_what_it_replaced(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    task_id = bridge.create_task("audit", 60000, "w1:p1")
+    bridge.claim_task(task_id)
+    bridge.orphan_task(task_id, "stopped")
+    mark = max(e["seq"] for e in _events())
+    with open(bridge.result_file_path(task_id), "w", encoding="utf-8") as f:
+        f.write("the answer")
+
+    bridge.adopt_late_result(task_id)
+
+    assert _moves(_events(after=mark)) == [("orphaned", "done")]
+
+
+def test_a_cascade_cancellation_is_announced(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("a", 60000, "w1:p1")
+    second = bridge.enqueue_task("b", 60000, "w1:p1", depends_on=[first])[0]
+    bridge.claim_task(first)
+    bridge.fail_task(first, "broke")
+    mark = max(e["seq"] for e in _events())
+
+    bridge.cancel_blocked_tasks()
+
+    [event] = _events(after=mark)
+    assert (event["task_id"], event["from_status"], event["to_status"]) == (second, "queued", "cancelled")
+
+
+def test_a_synchronous_ask_that_leaves_a_row_announces_it(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    bridge.record_sync_failure("t-sync", "audit", 1000, "w1:p1", None, "orphaned", "timed out")
+
+    [event] = _events()
+    assert (event["task_id"], event["from_status"], event["to_status"]) == ("t-sync", None, "orphaned")
+
+
+def test_events_can_be_filtered_by_task_and_workflow(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    a = bridge.enqueue_task("a", 60000, "w1:p1", workflow_id="run-7")[0]
+    b = bridge.enqueue_task("b", 60000, "w1:p1", workflow_id="run-8")[0]
+
+    assert {e["task_id"] for e in _events(workflow_id="run-7")} == {a}
+    assert {e["task_id"] for e in _events(task_id=b)} == {b}
+
+
+def test_a_database_from_before_events_gains_the_table(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, task TEXT NOT NULL, "
+        "agent TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "started_at TEXT, finished_at TEXT, timeout_ms INTEGER NOT NULL, "
+        "result_text TEXT, error_text TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    assert _events() == []
+    bridge.create_task("audit", 60000, "w1:p1")
+    assert len(_events()) == 1
+
+
+# -- over HTTP -------------------------------------------------------------
+
+
+def test_the_events_endpoint_returns_events_and_a_cursor(live_server):
+    task_id = _submit(live_server, "audit")
+
+    status, body = _get(live_server, "/events")
+
+    assert status == 200
+    assert [e["task_id"] for e in body["events"]] == [task_id]
+    assert body["next"] == body["events"][-1]["seq"]
+
+
+def test_resuming_from_the_cursor_neither_misses_nor_repeats(live_server):
+    ids = [_submit(live_server, f"t{i}") for i in range(5)]
+    for task_id in ids:
+        bridge.claim_task(task_id)
+
+    everything = _get(live_server, "/events?limit=500")[1]["events"]
+    assert len(everything) == 10
+
+    seen, cursor = [], 0
+    while True:
+        _, page = _get(live_server, f"/events?after={cursor}&limit=3")
+        if not page["events"]:
+            break
+        seen += page["events"]
+        cursor = page["next"]
+
+    assert [e["seq"] for e in seen] == [e["seq"] for e in everything]
+
+
+def test_an_empty_poll_hands_back_the_cursor_it_was_given(live_server):
+    _submit(live_server, "audit")
+    cursor = _get(live_server, "/events")[1]["next"]
+
+    status, body = _get(live_server, f"/events?after={cursor}")
+
+    assert status == 200
+    assert body["events"] == []
+    assert body["next"] == cursor
+
+
+def test_the_events_endpoint_filters(live_server):
+    a = _submit(live_server, "a", workflow_id="run-7")
+    _submit(live_server, "b", workflow_id="run-8")
+
+    by_workflow = _get(live_server, "/events?workflow_id=run-7")[1]["events"]
+    by_task = _get(live_server, f"/events?task_id={a}")[1]["events"]
+
+    assert {e["task_id"] for e in by_workflow} == {a}
+    assert {e["task_id"] for e in by_task} == {a}
+
+
+@pytest.mark.parametrize("query", [
+    "after=-1", "after=abc", "limit=0", "limit=100000", "limit=x", "wait=-1", "wait=1000", "wait=x",
+])
+def test_the_events_endpoint_refuses_a_bad_query(live_server, query):
+    status, body = _get(live_server, f"/events?{query}")
+
+    assert status == 400
+    assert not body["ok"]
+
+
+def test_a_long_poll_returns_as_soon_as_something_happens(live_server):
+    task_id = _submit(live_server, "audit")
+    cursor = _get(live_server, "/events")[1]["next"]
+    answer = {}
+
+    def poll():
+        started = time.monotonic()
+        answer["body"] = _get(live_server, f"/events?after={cursor}&wait=8")[1]
+        answer["took"] = time.monotonic() - started
+
+    poller = threading_module.Thread(target=poll)
+    poller.start()
+    time.sleep(0.4)
+    bridge.claim_task(task_id)
+    poller.join(timeout=10)
+
+    assert [(e["from_status"], e["to_status"]) for e in answer["body"]["events"]] == [("queued", "running")]
+    assert answer["took"] < 5     # it did not sit out the whole wait
+
+
+def test_a_long_poll_with_nothing_to_report_gives_up_when_the_wait_is_over(live_server):
+    cursor = _get(live_server, "/events")[1]["next"]
+
+    started = time.monotonic()
+    status, body = _get(live_server, f"/events?after={cursor}&wait=1")
+    took = time.monotonic() - started
+
+    assert status == 200
+    assert body["events"] == [] and body["next"] == cursor
+    assert 0.8 <= took < 4
+
+
+def test_a_long_poll_does_not_hold_up_a_shutdown(live_server, monkeypatch):
+    cursor = _get(live_server, "/events")[1]["next"]
+    # A watcher parked for half a minute would otherwise outlast the grace
+    # period, and the bridge would be stopped with a request still open.
+    monkeypatch.setattr(bridge, "_shutting_down", True)
+
+    started = time.monotonic()
+    status, body = _get(live_server, f"/events?after={cursor}&wait=8")
+    took = time.monotonic() - started
+
+    assert status == 200
+    assert body["events"] == []
+    assert took < 2
+
+
+# --- the newer endpoints are behind the token like the rest ----------------
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/events"),
+    ("GET", "/workflows/run-7"),
+    ("POST", "/tasks/some-task/cancel"),
+])
+def test_the_workflow_and_event_endpoints_refuse_a_caller_without_the_token(live_server, monkeypatch, method, path):
+    # A route added later is the easiest place to forget the check, and these
+    # expose task text, results and the means to cancel work.
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request(method, path, body=b"{}" if method == "POST" else None)
+    response = conn.getresponse()
+    response.read()
+    conn.close()
+
+    assert response.status == 401
+
+
+def test_the_workflow_and_event_endpoints_accept_the_token(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret")
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("GET", "/events", headers={"X-Sentinel-Token": "s3cret"})
+    response = conn.getresponse()
+    response.read()
+    conn.close()
+
+    assert response.status == 200
+
+
 # --- found in review ------------------------------------------------------
 
 
@@ -5797,6 +6122,13 @@ def test_a_task_with_a_non_finite_metric_is_still_served_as_valid_json(live_serv
 
     # Parsed the way a strict client would: no NaN or Infinity allowed.
     assert json_module.loads(raw, parse_constant=strict)["task"]["result_format"] == "text"
+
+
+def test_an_event_cursor_beyond_what_the_database_can_hold_is_a_bad_request(live_server):
+    status, body = _get(live_server, "/events?after=99999999999999999999")
+
+    assert status == 400
+    assert "after" in body["error"]
 
 
 def test_a_workflow_whose_tasks_were_all_cancelled_is_cancelled_not_failed():

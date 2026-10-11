@@ -15,7 +15,8 @@ param(
         "quota",
         "quota-reset",
         "cancel",
-        "workflow"
+        "workflow",
+        "events"
     )]
     [string]$Command,
 
@@ -38,8 +39,18 @@ param(
     [ValidateSet("queued", "running", "done", "error", "orphaned", "quota_exhausted", "cancelled")]
     [string]$Status,
 
-    [ValidateRange(1, 200)]
+    # `tasks` takes up to 200 and `events` up to 500; the bridge enforces each.
+    [ValidateRange(1, 500)]
     [int]$Limit,
+
+    # For `events`: resume after this `seq` (the `next` of the previous
+    # reply), and how long the bridge may hold the request open waiting for
+    # something to happen. Omit -WaitSec for a plain read.
+    [ValidateRange(0, [long]::MaxValue)]
+    [long]$After,
+
+    [ValidateRange(0, 30)]
+    [int]$WaitSec,
 
     [int]$TimeoutMs = 120000,
 
@@ -641,6 +652,31 @@ switch ($Command) {
         $result = Invoke-SentinelApi -Uri "$BaseUrl/tasks/$encodedTaskId"
         $result | ConvertTo-Json -Depth 20
 
+
+        if (-not $result.ok) {
+            exit 1
+        }
+    }
+
+    "events" {
+        $eventsQuery = @()
+        if ($PSBoundParameters.ContainsKey("After")) { $eventsQuery += "after=$After" }
+        if ($PSBoundParameters.ContainsKey("WaitSec")) { $eventsQuery += "wait=$WaitSec" }
+        if ($PSBoundParameters.ContainsKey("WorkflowId")) { $eventsQuery += "workflow_id=$([uri]::EscapeDataString($WorkflowId))" }
+        if ($PSBoundParameters.ContainsKey("Limit")) { $eventsQuery += "limit=$Limit" }
+
+        $forTask = Join-TaskText
+        if ($forTask) { $eventsQuery += "task_id=$([uri]::EscapeDataString($forTask))" }
+
+        $eventsSuffix = if ($eventsQuery.Count -gt 0) { "?" + ($eventsQuery -join "&") } else { "" }
+
+        # A long poll is silent for as long as the bridge was told to wait, so
+        # it gets that long plus the usual slack. Bounded at the quick limit it
+        # would report a healthy bridge as unreachable.
+        $eventsTimeout = if ($PSBoundParameters.ContainsKey("WaitSec")) { $WaitSec + $AskGraceSec } else { $QuickTimeoutSec }
+
+        $result = Invoke-SentinelApi -Uri "$BaseUrl/events$eventsSuffix" -TimeoutSec $eventsTimeout
+        $result | ConvertTo-Json -Depth 20
 
         if (-not $result.ok) {
             exit 1
