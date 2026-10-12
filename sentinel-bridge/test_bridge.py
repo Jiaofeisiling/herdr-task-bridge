@@ -6400,3 +6400,148 @@ def test_the_real_database_ends_up_private(tmp_path, monkeypatch):
         assert os.stat(db).st_mode & 0o077 == 0
     finally:
         os.umask(old_umask)
+
+
+# --- an audit trail --------------------------------------------------------
+#
+# With one shared token there is no telling who did something, but there should
+# be a record that it was done: what was asked, how it ended, and every time the
+# token was refused. Reads that merely poll are left out, or they would drown
+# the rest; the token, the query string and the request body are never stored.
+
+
+def _audit_rows():
+    with bridge.db_session() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM audit_log ORDER BY seq")]
+
+
+def test_a_request_that_changes_something_is_recorded(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "audit the disk"})
+
+    [row] = _audit_rows()
+    assert (row["method"], row["path"], row["status"]) == ("POST", "/delegate", 202)
+    assert row["task_id"] == body["task_id"]
+    assert row["at"]
+
+
+def test_cancelling_names_the_task(live_server):
+    task_id = _post(live_server, "/delegate", {"task": "x"})[1]["task_id"]
+
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert _audit_rows()[-1]["task_id"] == task_id
+    assert _audit_rows()[-1]["path"] == f"/tasks/{task_id}/cancel"
+
+
+def test_a_refused_request_is_recorded_too(live_server):
+    _post(live_server, "/delegate", {"task": ""})            # a 400
+
+    assert _audit_rows()[-1]["status"] == 400
+
+
+def test_a_plain_read_is_not_recorded(live_server):
+    _get(live_server, "/health")
+    _get(live_server, "/tasks")
+    _get(live_server, "/events")
+
+    assert _audit_rows() == []
+
+
+def test_every_refusal_of_the_token_is_recorded_and_the_token_is_not(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "the-real-token-0123456789")
+
+    for guess in ("guess-one-0123456789", "guess-two-0123456789"):
+        conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+        conn.request("GET", "/tasks", headers={"X-Sentinel-Token": guess})
+        conn.getresponse().read()
+        conn.close()
+
+    rows = _audit_rows()
+    assert [(r["method"], r["path"], r["status"]) for r in rows] == [("GET", "/tasks", 401)] * 2
+    stored = json_module.dumps(rows)
+    for secret in ("the-real-token", "guess-one", "guess-two"):
+        assert secret not in stored
+
+
+def test_the_query_string_is_not_kept(live_server):
+    _post(live_server, "/quota/reset?agent=secret-looking-name", {})
+
+    assert _audit_rows()[-1]["path"] == "/quota/reset"
+    assert "secret-looking-name" not in json_module.dumps(_audit_rows())
+
+
+def test_a_client_can_say_who_it_is_and_it_is_kept_tidy(live_server):
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("POST", "/delegate", body=b'{"task": "x"}',
+                 headers={"Content-Type": "application/json",
+                          "X-Sentinel-Client": "sentinel.ps1 " + "x" * 100 + "\u00e9"})
+    conn.getresponse().read()
+    conn.close()
+
+    client = _audit_rows()[-1]["client"]
+    assert client.startswith("sentinel.ps1 ")
+    assert len(client) <= 64
+    assert client.isascii() and client.isprintable()
+
+
+def test_a_request_without_a_client_name_has_none(live_server):
+    _post(live_server, "/delegate", {"task": "x"})
+
+    assert _audit_rows()[-1]["client"] is None
+
+
+def test_the_trail_is_trimmed_to_the_newest_rows(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUDIT_RETAIN_ROWS", 5)
+
+    for i in range(12):
+        _post(live_server, "/delegate", {"task": f"t{i}"})
+
+    rows = _audit_rows()
+    assert len(rows) == 5
+    assert [r["seq"] for r in rows] == sorted(r["seq"] for r in rows)
+    assert rows[-1]["status"] == 202
+
+
+def test_a_failure_to_write_the_record_does_not_fail_the_request(live_server, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(bridge, "record_audit", boom)
+
+    status, body = _post(live_server, "/delegate", {"task": "x"})
+
+    assert status == 202 and body["ok"]
+
+
+def test_the_audit_endpoint_pages_through_the_trail(live_server):
+    for i in range(5):
+        _post(live_server, "/delegate", {"task": f"t{i}"})
+
+    _, first = _get(live_server, "/audit?limit=2")
+    _, rest = _get(live_server, f"/audit?after={first['next']}&limit=10")
+
+    assert len(first["entries"]) == 2
+    assert [e["seq"] for e in first["entries"] + rest["entries"]] == sorted(
+        e["seq"] for e in first["entries"] + rest["entries"]
+    )
+    assert len(first["entries"]) + len(rest["entries"]) == 5
+    # Looking at the trail does not add to it.
+    assert len(_audit_rows()) == 5
+
+
+def test_the_audit_endpoint_needs_the_token(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "the-real-token-0123456789")
+
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("GET", "/audit")
+    response = conn.getresponse()
+    response.read()
+    conn.close()
+
+    assert response.status == 401
+
+
+def test_the_audit_endpoint_refuses_a_bad_query(live_server):
+    assert _get(live_server, "/audit?limit=0")[0] == 400
+    assert _get(live_server, "/audit?after=-1")[0] == 400
+    assert _get(live_server, "/audit?limit=100000")[0] == 400

@@ -723,6 +723,20 @@ def init_db():
             "ON task_events(task_id)"
         )
 
+        # Who asked for what, and every refusal of the token. No token, query
+        # string or request body is ever stored here.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                status INTEGER NOT NULL,
+                client TEXT,
+                task_id TEXT
+            )
+        """)
+
         # Which tasks a task waits on. A separate table because the scheduler
         # has to ask "is everything this waits on done?" in SQL.
         conn.execute("""
@@ -1404,6 +1418,46 @@ def list_events(after=0, limit=EVENTS_LIMIT_DEFAULT, task_id=None,
             f"SELECT * FROM task_events WHERE {' AND '.join(clauses)} "
             "ORDER BY seq ASC LIMIT ?",
             [*params, limit],
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+AUDIT_RETAIN_ROWS = int(os.environ.get("SENTINEL_AUDIT_RETAIN_ROWS", "50000"))
+
+
+def clean_client_label(value):
+    """A client's self-declared name, made safe to store, or None.
+
+    It is only a label the caller chose: with one shared token nothing proves it.
+    """
+    if not value:
+        return None
+
+    cleaned = "".join(c for c in value if c.isascii() and c.isprintable())[:64].strip()
+    return cleaned or None
+
+
+def record_audit(method, path, status, client=None, task_id=None):
+    """Append one row, and drop the oldest beyond AUDIT_RETAIN_ROWS."""
+    with db_session() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (at, method, path, status, client, task_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (now_iso(), method, path, status, client, task_id),
+        )
+        conn.execute(
+            "DELETE FROM audit_log WHERE seq <= "
+            "(SELECT MAX(seq) FROM audit_log) - ?",
+            (AUDIT_RETAIN_ROWS,),
+        )
+
+
+def list_audit(after=0, limit=EVENTS_LIMIT_DEFAULT):
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+            (after, limit),
         ).fetchall()
 
     return [dict(row) for row in rows]
@@ -3437,6 +3491,12 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def send_json(self, obj, status=200):
+        # Recorded before the reply goes out, so that a caller who has been told
+        # something happened can rely on the trail saying so, and a bridge killed
+        # between the two cannot have done it unrecorded.
+        task_id = obj.get("task_id") if isinstance(obj, dict) else None
+        self._audit(status, task_id if isinstance(task_id, str) else None)
+
         data = json.dumps(
             obj,
             ensure_ascii=False,
@@ -3505,6 +3565,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         with track_inflight():
             self._do_GET_guarded()
+
+    def _audit(self, status, task_id):
+        """Record this request if it is the kind worth a record.
+
+        Anything that is not a read, and every refusal of the token. Polling
+        reads are left out; they would bury the rest.
+        """
+        if getattr(self, "_audited", False):
+            return
+
+        self._audited = True
+
+        if self.command == "GET" and status != 401:
+            return
+
+        try:
+            record_audit(
+                self.command,
+                urlparse(self.path).path[:200],
+                status,
+                clean_client_label(self.headers.get("X-Sentinel-Client")),
+                task_id,
+            )
+        except Exception as e:
+            # A trail that cannot be written must not take the request with it.
+            print(f"[audit] could not record a {self.command} request: {e}")
 
     def _do_GET_guarded(self):
         try:
@@ -3784,6 +3870,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "ok": True,
                 "tasks": tasks,
+            })
+            return
+
+        if path == "/audit":
+            try:
+                after, limit, _, _, _ = validate_events_query({
+                    k: v for k, v in parse_qs(
+                        urlparse(self.path).query, keep_blank_values=True
+                    ).items() if k in ("after", "limit")
+                })
+            except (TypeError, ValueError) as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"}, 400
+                )
+                return
+
+            entries = list_audit(after, limit)
+            self.send_json({
+                "ok": True,
+                "entries": entries,
+                "next": entries[-1]["seq"] if entries else after,
             })
             return
 

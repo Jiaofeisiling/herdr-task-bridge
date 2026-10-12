@@ -343,7 +343,11 @@ function Invoke-SentinelApi {
 
     $Script:ChannelFailed = $false
 
-    $headers = @{}
+    # A label for the bridge's audit trail, not a proof: one shared token cannot
+    # say who is asking.
+    $headers = @{
+        "X-Sentinel-Client" = $(if ($env:SENTINEL_CLIENT_NAME) { $env:SENTINEL_CLIENT_NAME } else { "sentinel.ps1" })
+    }
 
     if ($env:SENTINEL_BRIDGE_TOKEN) {
         $headers["X-Sentinel-Token"] = $env:SENTINEL_BRIDGE_TOKEN

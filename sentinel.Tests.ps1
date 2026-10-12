@@ -1404,3 +1404,40 @@ Describe "events" {
         finally { $stub.Listener.Stop() }
     }
 }
+
+
+Describe "who the client says it is" {
+    # The bridge keeps an audit trail. One shared token cannot say who made a
+    # request, so a client names itself, as a label rather than a proof.
+
+    It "names itself on every request" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("health")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.Headers["X-Sentinel-Client"] | Should -Be "sentinel.ps1"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "uses the name the operator gave it" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("health") `
+                -Env @{ SENTINEL_CLIENT_NAME = "claude-code on laptop" }
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.Headers["X-Sentinel-Client"] | Should -Be "claude-code on laptop"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}
