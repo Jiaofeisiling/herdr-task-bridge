@@ -215,6 +215,89 @@ def test_the_log_and_the_env_file_are_private_to_the_user(tmp_path):
     assert os.stat(root / "remote" / "bridge.env").st_mode & 0o077 == 0
 
 
+# -- a refusal to start must not cost the running bridge -------------------------
+
+
+def _check_stub(tmp_path):
+    """python3 as the supervisor and the restart script will call it.
+
+    `bridge.py --check` exits with $STUB_CHECK_EXIT; anything else is a normal
+    run, which writes down what it was given and exits with $STUB_RUN_EXIT.
+    """
+    stubs = tmp_path / "stubs"
+    seen = tmp_path / "seen.txt"
+    checked = tmp_path / "checked.txt"
+    _stub(
+        stubs / "python3",
+        'if [ "${2:-}" = "--check" ]; then\n'
+        f'  echo "check token=${{SENTINEL_BRIDGE_TOKEN-UNSET}}" >> "{checked.as_posix()}"\n'
+        '  exit "${STUB_CHECK_EXIT:-0}"\n'
+        "fi\n"
+        f'echo "token=${{SENTINEL_BRIDGE_TOKEN-UNSET}} failover=${{SENTINEL_QUOTA_FAILOVER_AGENTS-UNSET}}" >> "{seen.as_posix()}"\n'
+        'exit "${STUB_RUN_EXIT:-0}"\n',
+    )
+    return seen, checked
+
+
+def test_the_supervisor_can_check_its_settings_without_starting_anything(tmp_path):
+    root, env, _ = _supervisor_world(tmp_path, ['SENTINEL_BRIDGE_TOKEN="0123456789abcdef0123456789abcdef"'])
+    seen, checked = _check_stub(tmp_path)
+
+    result = _run([str(root / "remote" / "bridge-supervisor.sh"), "--check"], env)
+
+    assert result.returncode == 0
+    # It looked at the settings bridge.env gives, exported, as a real start would.
+    assert checked.read_text().strip() == "check token=0123456789abcdef0123456789abcdef"
+    assert not seen.exists()                     # and started nothing
+
+
+def test_a_failed_check_is_reported_with_its_status(tmp_path):
+    root, env, _ = _supervisor_world(tmp_path, [])
+    _check_stub(tmp_path)
+    env["STUB_CHECK_EXIT"] = "2"
+
+    assert _run([str(root / "remote" / "bridge-supervisor.sh"), "--check"], env).returncode == 2
+
+
+def test_the_supervisor_stops_instead_of_retrying_a_refusal(tmp_path):
+    # Exit 2 means the settings were refused. Restarting every five seconds
+    # cannot change that, only fill the log.
+    root, env, seen = _supervisor_world(tmp_path, [])
+    _check_stub(tmp_path)
+    env["STUB_RUN_EXIT"] = "2"
+
+    result = _run([str(root / "remote" / "bridge-supervisor.sh")], env)
+
+    # `sleep` is the stub that kills the supervisor: reaching it means it looped.
+    assert result.returncode == 2
+    log = (root / "sentinel-bridge" / "bridge.log").read_text()
+    assert "not restarting" in log
+
+
+def test_a_restart_whose_settings_would_be_refused_stops_nothing(tmp_path):
+    root, calls, env = _host(tmp_path)
+    shutil.copy(os.path.join(REMOTE, "bridge-supervisor.sh"), root / "remote" / "bridge-supervisor.sh")
+    _check_stub(tmp_path)
+    env["STUB_CHECK_EXIT"] = "2"
+
+    result = _run([str(root / "remote" / "bridge-restart.sh")], env)
+
+    assert result.returncode != 0
+    assert "nothing was stopped" in result.stderr
+    assert not any(c.startswith(("screen", "pkill")) for c in _calls(calls))
+
+
+def test_a_restart_whose_settings_are_fine_goes_ahead(tmp_path):
+    root, calls, env = _host(tmp_path)
+    shutil.copy(os.path.join(REMOTE, "bridge-supervisor.sh"), root / "remote" / "bridge-supervisor.sh")
+    _check_stub(tmp_path)
+
+    result = _run([str(root / "remote" / "bridge-restart.sh")], env)
+
+    assert result.returncode == 0, result.stderr
+    assert any("-dmS" in c for c in _calls(calls))
+
+
 # -- making an access token --------------------------------------------------------
 #
 # The token is the only thing standing between every user of a shared login node

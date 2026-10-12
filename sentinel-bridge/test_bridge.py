@@ -3648,6 +3648,8 @@ def test_a_real_signal_stops_the_bridge_in_an_orderly_way(tmp_path, sig_name):
         SENTINEL_RESULT_DIR=str(tmp_path / "results"),
         SENTINEL_SHUTDOWN_GRACE_SEC="1",
         HERDR_BIN="/bin/false",
+        # Not what is being tested; the bridge refuses to start open otherwise.
+        SENTINEL_ALLOW_NO_AUTH="1",
     )
     proc = subprocess_module.Popen(
         [sys.executable, "-u", "bridge.py"],
@@ -6400,6 +6402,96 @@ def test_the_real_database_ends_up_private(tmp_path, monkeypatch):
         assert os.stat(db).st_mode & 0o077 == 0
     finally:
         os.umask(old_umask)
+
+
+# --- the bridge does not start open by accident ------------------------------
+#
+# With no SENTINEL_BRIDGE_TOKEN the bridge used to start anyway and print a
+# warning into a log nobody reads. On a shared login node that is everyone on
+# the machine able to run commands through the agents. Running without a token
+# is now something to ask for, by name.
+
+
+def test_no_token_is_a_reason_not_to_start(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "")
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", False)
+
+    [problem] = bridge.startup_security_problems()
+
+    # It says what to do about it, both ways.
+    assert "SENTINEL_BRIDGE_TOKEN" in problem
+    assert "SENTINEL_ALLOW_NO_AUTH" in problem
+
+
+def test_running_open_can_be_asked_for(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "")
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", True)
+
+    assert bridge.startup_security_problems() == []
+
+
+def test_a_token_too_short_to_resist_guessing_is_refused(monkeypatch):
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", False)
+
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "a" * (bridge.MIN_TOKEN_LENGTH - 1))
+    [problem] = bridge.startup_security_problems()
+    assert str(bridge.MIN_TOKEN_LENGTH) in problem
+
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "a" * bridge.MIN_TOKEN_LENGTH)
+    assert bridge.startup_security_problems() == []
+
+
+def test_allowing_no_auth_does_not_excuse_a_weak_token(monkeypatch):
+    # Saying "open is fine" is not saying "a guessable secret is fine".
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", True)
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "short")
+
+    assert len(bridge.startup_security_problems()) == 1
+
+
+def _start_bridge_process(tmp_path, *args, **env):
+    environment = {
+        **os.environ,
+        "SENTINEL_DB": str(tmp_path / "state" / "tasks.db"),
+        "SENTINEL_RESULT_DIR": str(tmp_path / "results"),
+        "SENTINEL_BRIDGE_PORT": "0",
+        "HERDR_BIN": "this-program-does-not-exist",
+    }
+    for inherited in ("SENTINEL_BRIDGE_TOKEN", "SENTINEL_ALLOW_NO_AUTH"):
+        environment.pop(inherited, None)
+    environment.update({k: str(v) for k, v in env.items()})
+    return subprocess_module.run(
+        [sys.executable, bridge.__file__, *args],
+        env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30,
+    )
+
+
+def test_check_mode_reports_a_missing_token_and_changes_nothing(tmp_path):
+    done = _start_bridge_process(tmp_path, "--check")
+
+    assert done.returncode == 2
+    assert "SENTINEL_BRIDGE_TOKEN" in done.stdout + done.stderr
+    # A check only looks: no database, no results directory, nothing listening.
+    assert not (tmp_path / "state").exists()
+    assert not (tmp_path / "results").exists()
+
+
+def test_check_mode_passes_a_good_configuration_without_printing_the_token(tmp_path):
+    token = "t" * 32
+
+    done = _start_bridge_process(tmp_path, "--check", SENTINEL_BRIDGE_TOKEN=token)
+
+    assert done.returncode == 0
+    assert "ok" in done.stdout
+    assert token not in done.stdout + done.stderr
+
+
+def test_the_bridge_itself_refuses_to_start_without_a_token(tmp_path):
+    done = _start_bridge_process(tmp_path)
+
+    assert done.returncode == 2
+    assert "REFUSING TO START" in done.stdout + done.stderr
+    assert not (tmp_path / "state").exists()
 
 
 # --- an audit trail --------------------------------------------------------

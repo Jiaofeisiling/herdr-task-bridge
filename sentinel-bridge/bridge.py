@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,7 +22,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 27
+BRIDGE_VERSION = 28
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -65,6 +66,12 @@ HERDR_DEFAULT_TIMEOUT_SEC = int(os.environ.get("SENTINEL_HERDR_TIMEOUT_SEC", "30
 DEFAULT_AGENT = os.environ.get("SENTINEL_AGENT") or None
 
 AUTH_TOKEN = os.environ.get("SENTINEL_BRIDGE_TOKEN", "")
+
+# Without a token anyone who can reach the port can have the agents run commands,
+# and on a shared login node that is every user on the machine. So the bridge
+# does not start that way unless asked to, by name.
+ALLOW_NO_AUTH = os.environ.get("SENTINEL_ALLOW_NO_AUTH") == "1"
+MIN_TOKEN_LENGTH = 16
 
 DB_PATH = os.environ.get(
     "SENTINEL_DB",
@@ -588,6 +595,31 @@ def auth_token_warning():
         )
 
     return None
+
+
+def startup_security_problems():
+    """Reasons the bridge should not start with these settings.
+
+    Kept apart from auth_token_warning(), which only warns: these stop it.
+    """
+    problems = []
+
+    if not AUTH_TOKEN:
+        if not ALLOW_NO_AUTH:
+            problems.append(
+                "SENTINEL_BRIDGE_TOKEN is not set, so anyone who can reach "
+                f"http://{HOST}:{PORT} could have the agents run commands. Set it "
+                "to a random secret (remote/bridge-set-token.sh makes one), or "
+                "set SENTINEL_ALLOW_NO_AUTH=1 to run open knowingly."
+            )
+    elif len(AUTH_TOKEN) < MIN_TOKEN_LENGTH:
+        # Saying open is fine is not saying a guessable secret is fine.
+        problems.append(
+            f"SENTINEL_BRIDGE_TOKEN is too short to resist guessing: use at "
+            f"least {MIN_TOKEN_LENGTH} characters."
+        )
+
+    return problems
 
 
 def now_iso():
@@ -4471,6 +4503,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    problems = startup_security_problems()
+
+    # `--check` only looks. The restart script runs it before stopping the
+    # running bridge, so a settings change that would be refused costs nothing.
+    if "--check" in sys.argv[1:]:
+        for problem in problems:
+            print(f"bridge --check: REFUSED -- {problem}")
+        if not problems:
+            print("bridge --check: ok "
+                  f"(authentication: {'on' if AUTH_TOKEN else 'OFF, by request'})")
+        sys.exit(2 if problems else 0)
+
+    if problems:
+        for problem in problems:
+            print(f"REFUSING TO START: {problem}")
+        sys.exit(2)
+
     # Before anything is created, so the database is born private.
     for permission_warning in harden_permissions():
         print(f"WARNING: {permission_warning}")
