@@ -16,6 +16,12 @@ BeforeAll {
     $Script:ScriptPath = Join-Path $PSScriptRoot "sentinel.ps1"
     $Script:HostExe = (Get-Process -Id $PID).Path
 
+    # Where the client under test looks for a stored token. An empty directory
+    # of its own, so that a token the developer keeps for real use cannot leak
+    # into a test that expects there to be none.
+    $Script:EmptyConfigDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sentinel-test-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $Script:EmptyConfigDir | Out-Null
+
     function New-LoopbackPort {
         $tcp = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
         $tcp.Start()
@@ -42,7 +48,8 @@ BeforeAll {
             [Parameter(Mandatory = $true)][string[]]$ScriptArgs,
             [Parameter(Mandatory = $true)][string]$BaseUrl,
             [string]$Token,
-            [hashtable]$Env = @{}
+            [hashtable]$Env = @{},
+            [string]$StdIn
         )
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -53,6 +60,7 @@ BeforeAll {
         $psi.Arguments = "-NoProfile -NonInteractive -File `"$Script:ScriptPath`" " + ($quotedArgs -join " ")
 
         $psi.EnvironmentVariables["SENTINEL_BRIDGE_URL"] = $BaseUrl
+        $psi.EnvironmentVariables["SENTINEL_CONFIG_DIR"] = $Script:EmptyConfigDir
         foreach ($name in $Env.Keys) {
             $psi.EnvironmentVariables[$name] = [string]$Env[$name]
         }
@@ -66,7 +74,23 @@ BeforeAll {
         $psi.RedirectStandardError = $true
         $psi.UseShellExecute = $false
 
-        return [System.Diagnostics.Process]::Start($psi)
+        if ($PSBoundParameters.ContainsKey("StdIn")) {
+            $psi.RedirectStandardInput = $true
+        }
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+
+        if ($PSBoundParameters.ContainsKey("StdIn")) {
+            # Raw bytes. Through the writer, PowerShell 7 puts a UTF-8 byte order
+            # mark in front, which a Windows PowerShell 5.1 child reads as junk
+            # characters at the start of the first line.
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($StdIn + "`n")
+            $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+            $proc.StandardInput.BaseStream.Flush()
+            $proc.StandardInput.Close()
+        }
+
+        return $proc
     }
 
     function Receive-StubRequest {
@@ -1443,5 +1467,269 @@ Describe "who the client says it is" {
             $req.Context.Request.Headers["X-Sentinel-Client"] | Should -Be "claude-code on laptop"
         }
         finally { $stub.Listener.Stop() }
+    }
+}
+
+
+Describe "the access token" {
+    # From bridge v28 every request but /health needs a token. A client that has
+    # none used to print {"error":"unauthorized"} and exit 1, which is the same as
+    # any failed request: an AI caller could neither tell it apart nor know what to
+    # do, and might retry, or go looking for the token itself.
+
+    BeforeEach {
+        $Script:Dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sentinel-token-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path $Script:Dir | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -Recurse -Force -LiteralPath $Script:Dir -ErrorAction SilentlyContinue
+    }
+
+    It "sends the token stored in the configuration directory" {
+        [System.IO.File]::WriteAllText((Join-Path $Script:Dir "token"), "stored-token-0123456789abcdef`r`n")
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("agents") `
+                -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir }
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true; agents = @() }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            # Trimmed: a trailing newline in the file is not part of the token.
+            $req.Token | Should -Be "stored-token-0123456789abcdef"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "prefers the environment variable to the stored file" {
+        [System.IO.File]::WriteAllText((Join-Path $Script:Dir "token"), "stored-token-0123456789abcdef")
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("agents") `
+                -Token "from-the-environment-0123456789" -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir }
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true; agents = @() }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Token | Should -Be "from-the-environment-0123456789"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "sends no token when there is none anywhere" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("agents")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true; agents = @() }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Token | Should -BeNullOrEmpty
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "says a token is needed, exits 7 and does not retry, when it has none" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("agents")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 401 -Payload @{ ok = $false; error = "unauthorized" }
+            $result = Wait-SentinelExit -Process $proc
+            $again = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 2500
+
+            $result.ExitCode | Should -Be 7
+            $result.StdErr | Should -Match "AUTHENTICATION REQUIRED"
+            $result.StdErr | Should -Match "sentinel.ps1 login"
+            # An AI caller is told to stop and ask, not to hunt for the secret.
+            $result.StdErr | Should -Match "do not look for the token"
+            $result.StdOut.Trim() | Should -BeNullOrEmpty
+            $again | Should -BeNullOrEmpty
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "says the token was refused, and where it came from, without printing it" {
+        $secret = "rejected-by-the-bridge-0123456789"
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("agents") -Token $secret
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 401 -Payload @{ ok = $false; error = "unauthorized" }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 7
+            $result.StdErr | Should -Match "AUTHENTICATION FAILED"
+            $result.StdErr | Should -Match "SENTINEL_BRIDGE_TOKEN environment variable"
+            ($result.StdOut + $result.StdErr) | Should -Not -Match $secret
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "names the file when it is the stored token that was refused" {
+        $path = Join-Path $Script:Dir "token"
+        [System.IO.File]::WriteAllText($path, "stale-token-0123456789abcdef")
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("agents") `
+                -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir }
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 401 -Payload @{ ok = $false; error = "unauthorized" }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 7
+            $result.StdErr | Should -Match "AUTHENTICATION FAILED"
+            $result.StdErr | Should -Match ([regex]::Escape($path))
+            ($result.StdOut + $result.StdErr) | Should -Not -Match "stale-token"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "gives up at once when a wait is refused, instead of riding it out" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("wait", "t1")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 401 -Payload @{ ok = $false; error = "unauthorized" }
+            $result = Wait-SentinelExit -Process $proc
+
+            # A lost channel heals by itself and is waited out; a refused token
+            # does not.
+            $result.ExitCode | Should -Be 7
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "still treats any other error status as an ordinary failure" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("task", "nope")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            Send-StubResponse -Context $req.Context -Status 404 -Payload @{ ok = $false; error = "task not found" }
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 1
+            $result.StdErr | Should -Not -Match "AUTHENTICATION"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}
+
+Describe "login" {
+    BeforeEach {
+        $Script:Dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sentinel-login-" + [guid]::NewGuid())
+    }
+
+    AfterEach {
+        Remove-Item -Recurse -Force -LiteralPath $Script:Dir -ErrorAction SilentlyContinue
+    }
+
+    It "stores the token it is given, and shows the place but never the token" {
+        $token = "typed-by-the-owner-0123456789ab"
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn $token
+        $result = Wait-SentinelExit -Process $proc
+
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        (Get-Content -LiteralPath (Join-Path $Script:Dir "token") -Raw).Trim() | Should -Be $token
+        $result.StdOut | Should -Match ([regex]::Escape((Join-Path $Script:Dir "token")))
+        ($result.StdOut + $result.StdErr) | Should -Not -Match $token
+    }
+
+    It "accepts a token that arrives behind a byte order mark" {
+        # What Windows PowerShell sends in front of piped text; found when this
+        # command failed under 5.1 for no visible reason.
+        $token = "typed-by-the-owner-0123456789ab"
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn ([string][char]0xFEFF + $token)
+        $result = Wait-SentinelExit -Process $proc
+
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        (Get-Content -LiteralPath (Join-Path $Script:Dir "token") -Raw).Trim() | Should -Be $token
+    }
+
+    It "makes the file readable by its owner alone" -Skip:($env:OS -ne "Windows_NT") {
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn "typed-by-the-owner-0123456789ab"
+        Wait-SentinelExit -Process $proc | Out-Null
+
+        $acl = Get-Acl -LiteralPath (Join-Path $Script:Dir "token")
+        # Inheritance cut, so a parent directory's permissions do not apply ...
+        $acl.AreAccessRulesProtected | Should -BeTrue
+        # ... and nothing is granted to everyone.
+        ($acl.Access | Where-Object { $_.IdentityReference.Value -match "Everyone|BUILTIN\\Users" }) | Should -BeNullOrEmpty
+    }
+
+    It "leaves the owner able to delete the file again" -Skip:($env:OS -ne "Windows_NT") {
+        # To log out or to start over. A first version granted read and write only,
+        # which PowerShell's Remove-Item got round (the owner can delete files in
+        # their own directory), but a tool such as MSYS's rm, which asks for the
+        # file's own DELETE right, was refused.
+        $path = Join-Path $Script:Dir "token"
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn "typed-by-the-owner-0123456789ab"
+        Wait-SentinelExit -Process $proc | Out-Null
+
+        { Remove-Item -LiteralPath $path -ErrorAction Stop } | Should -Not -Throw
+        Test-Path -LiteralPath $path | Should -BeFalse
+    }
+
+    It "replaces a token that was stored before" {
+        New-Item -ItemType Directory -Force -Path $Script:Dir | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $Script:Dir "token"), "the-old-token-0123456789abcd")
+
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn "the-new-token-0123456789abcd"
+        Wait-SentinelExit -Process $proc | Out-Null
+
+        (Get-Content -LiteralPath (Join-Path $Script:Dir "token") -Raw).Trim() | Should -Be "the-new-token-0123456789abcd"
+    }
+
+    It "refuses an empty answer and stores nothing" {
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn ""
+        $result = Wait-SentinelExit -Process $proc
+
+        $result.ExitCode | Should -Be 1
+        # Refused by login itself, not merely by the parameter binder.
+        $result.StdErr | Should -Match "sentinel.ps1 login: no token was given"
+        Test-Path -LiteralPath (Join-Path $Script:Dir "token") | Should -BeFalse
+    }
+
+    It "refuses something that cannot be a token made by the bridge" {
+        # Too short, or containing a space: pasted by mistake, or a sentence.
+        foreach ($notAToken in @("short", "this has spaces in it and is long enough")) {
+            $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+                -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn $notAToken
+            $result = Wait-SentinelExit -Process $proc
+
+            $result.ExitCode | Should -Be 1
+            $result.StdErr | Should -Match "sentinel.ps1 login: .* does not look like an access token"
+            ($result.StdOut + $result.StdErr) | Should -Not -Match "this has spaces"
+            Test-Path -LiteralPath (Join-Path $Script:Dir "token") | Should -BeFalse
+        }
+    }
+
+    It "refuses arguments it does not use" {
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login", "some-token-0123456789abcdef") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn "typed-by-the-owner-0123456789ab"
+        $result = Wait-SentinelExit -Process $proc
+
+        # A token typed as an argument would be on the command line; refuse it.
+        $result.ExitCode | Should -Be 1
+        $result.StdErr | Should -Match "unrecognised"
+        Test-Path -LiteralPath (Join-Path $Script:Dir "token") | Should -BeFalse
     }
 }

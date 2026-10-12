@@ -405,12 +405,27 @@ def test_the_event_stream_records_a_tasks_whole_life_over_http(world):
 ACCEPTANCE = os.path.join(HERE, "..", "scripts", "acceptance.py")
 
 
+def _isolated_env(world, **extra):
+    """The developer's own environment, minus any token they keep for real use.
+
+    The scripts under test look in $SENTINEL_BRIDGE_TOKEN and then in a stored
+    file; a test that expects none must not find the one on this machine.
+    """
+    empty = world.root / "no-config"
+    empty.mkdir(exist_ok=True)
+    environment = {k: v for k, v in os.environ.items() if k != "SENTINEL_BRIDGE_TOKEN"}
+    environment["SENTINEL_CONFIG_DIR"] = str(empty)
+    environment.update(extra)
+    return environment
+
+
 def _run_acceptance(world, bridge, *extra):
     report = world.root / "report.md"
     done = subprocess.run(
         [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{bridge.port}",
          "--yes", "--report", str(report), *extra],
         capture_output=True, text=True, encoding="utf-8", timeout=240,
+        env=_isolated_env(world),
     )
     return done, report
 
@@ -506,8 +521,7 @@ def test_the_acceptance_script_checks_authentication_when_given_a_token(world):
 
 def _run_with_env(world, bridge, extra_env, *args):
     report = world.root / "report.md"
-    environment = {k: v for k, v in os.environ.items() if k != "SENTINEL_BRIDGE_TOKEN"}
-    environment.update(extra_env)
+    environment = _isolated_env(world, **extra_env)
     done = subprocess.run(
         [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{bridge.port}",
          "--yes", "--report", str(report), *args],
@@ -557,7 +571,7 @@ def test_the_smoke_test_reads_the_token_from_the_environment(world):
     token = "s" * 32
     bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN=token)
     smoke = os.path.join(HERE, "..", "scripts", "smoke.py")
-    environment = {**os.environ, "SENTINEL_BRIDGE_TOKEN": token}
+    environment = _isolated_env(world, SENTINEL_BRIDGE_TOKEN=token)
 
     with_token = subprocess.run(
         [sys.executable, smoke, "--url", f"http://127.0.0.1:{bridge.port}"],
@@ -570,3 +584,35 @@ def test_the_smoke_test_reads_the_token_from_the_environment(world):
     assert with_token.returncode == 0, with_token.stdout + with_token.stderr
     # And it is the token that made the difference.
     assert without.returncode != 0
+
+
+def test_the_acceptance_script_finds_a_token_stored_by_login(world, tmp_path):
+    # `sentinel.ps1 login` keeps the token in a file; the scripts read the same
+    # one, so it is stored once and not typed again for each tool.
+    world.configure([ALPHA], {"alpha": {"text": json.dumps({"summary": "OK"})}})
+    token = "l" * 32
+    bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN=token)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "token").write_text(token + "\r\n")
+
+    done, report = _run_with_env(world, bridge, {"SENTINEL_CONFIG_DIR": str(config)})
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "auth: the event stream refuses a caller without the token" in report.read_text(encoding="utf-8")
+    assert token not in done.stdout + done.stderr
+
+
+def test_the_environment_variable_beats_the_stored_file_for_the_scripts_too(world, tmp_path):
+    world.configure([ALPHA], {"alpha": {"text": json.dumps({"summary": "OK"})}})
+    token = "m" * 32
+    bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN=token)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "token").write_text("a-stale-token-" + "x" * 20)
+
+    done, _ = _run_with_env(
+        world, bridge, {"SENTINEL_CONFIG_DIR": str(config), "SENTINEL_BRIDGE_TOKEN": token}
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr

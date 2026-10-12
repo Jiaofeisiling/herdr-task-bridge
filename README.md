@@ -180,6 +180,7 @@ If the host has more than one Herdr agent, inspect them and select one explicitl
 | `task <task_id>` | GET | `/tasks/<id>` | Task state, in-flight `progress`, `depends_on`, the structured `result_data` when there is one, and — while `queued` — a `queued_reason` explaining what it is waiting on. |
 | `wait <task_id>` | GET | `/tasks/<id>` | Polls every three seconds until a terminal state, then prints the result or error. |
 | `events [task_id]` | GET | `/events` | Status changes after a cursor (`-After <seq>`), optionally held open for up to 30 s (`-WaitSec`) until one happens; filter with a task id or `-WorkflowId`. See [Event stream](#event-stream). |
+| `login` | — | — | Stores the access token for this machine (see [Configuration and security](#configuration-and-security)). Asks for it with the input hidden; never takes it as an argument. |
 | `cancel <task_id>` | POST | `/tasks/<id>/cancel` | Cancels a task that is still `queued`; `409` for one that has started, since the bridge cannot stop an agent mid-task. |
 | `workflow <workflow_id>` | GET | `/workflows/<id>` | Every task carrying that `workflow_id`, with per-status `counts` and an overall `state` (`in_progress`, `done`, `failed`, or `cancelled` when every task was cancelled on purpose). |
 | `tasks` | GET | `/tasks` | Lists the 20 most recent tasks. `status` (`queued`, `running`, `done`, `error`, `orphaned`, `quota_exhausted`, `cancelled`) and `limit` (1–200) narrow or widen that — `tasks -Status queued` is how to find work that is waiting. |
@@ -199,6 +200,7 @@ Common client options are `-Agent <name>`, `-TimeoutMs <milliseconds>` (for `ask
 | `4` | **The bridge was never reached** — the channel is down, and nothing is known about the bridge itself |
 | `5` | **The bridge answers `/health`, but this one request got no reply in time** — the channel is fine, do not reconnect anything |
 | `6` | A task ended `cancelled` — stopped before it started, so nothing ran |
+| `7` | **The bridge refused the access token**, or none was sent. Not a failure to retry: store the token with `login`, or tell the user. |
 
 Code `4` is deliberately distinct. When the SSH forward is not in place, the bridge is usually running perfectly well on the remote side and simply cannot be talked to; reporting that as a bridge failure sends the reader to the wrong machine. The message names which of the two channel states applies — nothing listening, or connected but never replying — because they need different fixes, and says plainly that the bridge's state is unknown rather than bad.
 
@@ -384,6 +386,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_AUDIT_RETAIN_ROWS` | `50000` | Audit rows kept; the oldest are dropped. |
 | `SENTINEL_TASK_RETENTION_DAYS` | `0` | `0` keeps every task, as before. Otherwise a finished task older than this many days is deleted once a day, with its events. Never a task still queued or running, nor one a waiting task depends on; the audit trail is separate. The file stops growing but does not shrink, and an idempotency key is forgotten with its task, so keep this above any window in which a client might retry. |
 | `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | Client-side: the label sent as `X-Sentinel-Client` for the audit trail. |
+| `SENTINEL_CONFIG_DIR` | `~/.sentinel` | Client-side: the directory holding the token file `login` writes. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |
 | `SENTINEL_SLURM_POLICY` | `submit` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
@@ -410,7 +413,9 @@ bash remote/bridge-set-token.sh           # writes remote/bridge.env (mode 600),
 bash remote/bridge-restart.sh
 ```
 
-`bridge-restart` first asks the new bridge whether it would accept its settings (`bridge.py --check`) and stops nothing if not, so adding this protection cannot take down the bridge that is running. `--rotate` replaces a token in use; every client must then be updated. `/health` answers without the token so a probe can tell the process is alive; everything else, including `/events`, `/workflows` and `/audit`, needs it.
+`bridge-restart` first asks the new bridge whether it would accept its settings (`bridge.py --check`) and stops nothing if not, so adding this protection cannot take down the bridge that is running. `--rotate` replaces a token in use; every client must then be updated. On the client side (Windows), store the token once in your own terminal: `.\sentinel.ps1 login`. It asks with the input hidden and writes it to `~/.sentinel/token`, readable by you alone. A file as well as the `SENTINEL_BRIDGE_TOKEN` environment variable, because an environment variable only reaches processes started after it was set and not every tool you run inherits it (a sandboxed assistant, a window that was already open); a file in your own profile is read by all of them. The environment variable wins when both exist. `smoke.py` and `acceptance.py` read the same file. A command refused for want of a token exits **7** with a message that says what to do and tells an AI assistant to stop and ask, not to hunt for the secret.
+
+`/health` answers without the token so a probe can tell the process is alive; everything else, including `/events`, `/workflows` and `/audit`, needs it.
 
 What else is done, and why it is not left to the token alone:
 

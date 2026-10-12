@@ -16,7 +16,8 @@ python scripts/acceptance.py --yes --report run.md    # runs it, writes a report
 ```
 
 If the bridge has a token (it must, from v28), the script reads it from the
-`SENTINEL_BRIDGE_TOKEN` environment variable, and then also checks that the
+`SENTINEL_BRIDGE_TOKEN` environment variable or the file `sentinel.ps1 login`
+writes, and then also checks that the
 event stream refuses a caller without it. Do not type the token on the command
 line: on a shared login node that line is visible to every other user in the
 process list while it runs, and it stays in your shell history. (`--token` still

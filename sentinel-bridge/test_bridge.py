@@ -1323,7 +1323,16 @@ def test_task_worker_skips_busy_agent_to_run_a_different_idle_agents_task(
 
     monkeypatch.setattr(bridge, "get_agent_status", fake_get_agent_status)
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "results"))
-    monkeypatch.setattr(bridge, "run_herdr", compliant_agent("done"))
+    # An agent that takes a moment, so the task is observably `running` before it
+    # is `done`: the test used to look once it left `queued` and expect `done`.
+    fast = compliant_agent("done")
+
+    def slow(*args, **kwargs):
+        if args[1] == "prompt":
+            time_module.sleep(0.4)
+        return fast(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "run_herdr", slow)
 
     # The busy agent's task is queued first (oldest), the idle agent's
     # task second -- a naive "always take the oldest queued task" worker
@@ -1338,10 +1347,12 @@ def test_task_worker_skips_busy_agent_to_run_a_different_idle_agents_task(
     worker_thread.start()
 
     try:
-        deadline = time_module.time() + 5
+        # Until it has finished, not merely until it has started: leaving `queued`
+        # only means the worker picked it up.
+        deadline = time_module.time() + 20
         idle_task = bridge.get_task(idle_task_id)
 
-        while idle_task["status"] == "queued" and time_module.time() < deadline:
+        while idle_task["status"] in ("queued", "running") and time_module.time() < deadline:
             time_module.sleep(0.05)
             idle_task = bridge.get_task(idle_task_id)
 
