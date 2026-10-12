@@ -377,6 +377,13 @@ TASKS_LIMIT_MAX = 200
 # counts three.
 MAX_PROMPT_BYTES = int(os.environ.get("SENTINEL_MAX_PROMPT_BYTES", "120000"))
 
+# The bridge listens on loopback, which on a shared login node every user can
+# reach. A request body is capped well above the largest legitimate one (a
+# prompt of MAX_PROMPT_BYTES plus its JSON), and a connection that does not
+# finish its request is dropped, since each one holds a thread.
+MAX_BODY_BYTES = int(os.environ.get("SENTINEL_MAX_BODY_BYTES", str(1024 * 1024)))
+REQUEST_TIMEOUT_SEC = int(os.environ.get("SENTINEL_REQUEST_TIMEOUT_SEC", "30"))
+
 
 class TaskTooLargeError(ValueError):
     reason = "task_too_large"
@@ -3359,6 +3366,10 @@ def graceful_shutdown(server, grace_sec=None, signame="signal"):
 
 class Handler(BaseHTTPRequestHandler):
 
+    # Applies to reading the request and writing the reply, not to the time the
+    # bridge spends working in between, so a slow /ask is unaffected.
+    timeout = REQUEST_TIMEOUT_SEC
+
     def log_message(self, format, *args):
         # 保留最基本日志即可。
         print(
@@ -3873,6 +3884,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if not (self.command == "GET" and path == "/health") and not self.check_auth():
             self.send_json({"ok": False, "error": "unauthorized"}, 401)
+            return
+
+        # After authentication, so a caller without the token learns nothing
+        # about the limits. Refused on the header alone: the body is never read.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+
+        if length < 0:
+            self.send_json({"ok": False, "error": "invalid Content-Length"}, 400)
+            self.close_connection = True
+            return
+
+        if length > MAX_BODY_BYTES:
+            self.send_json({
+                "ok": False,
+                "error": f"request body too large: the limit is {MAX_BODY_BYTES} bytes",
+            }, 413)
+            self.close_connection = True
             return
 
         if path.startswith("/tasks/") and path.endswith("/cancel"):

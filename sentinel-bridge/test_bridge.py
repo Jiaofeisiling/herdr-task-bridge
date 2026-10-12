@@ -6213,3 +6213,90 @@ def test_the_dependency_sweep_still_works_once_a_task_has_waited(tmp_path, monke
 
     assert bridge.cancel_blocked_tasks() == 1
     assert bridge.get_task(second)["status"] == "cancelled"
+
+
+# --- a local caller must not be able to exhaust the bridge ------------------
+#
+# The bridge listens on loopback, but on a shared login node every user can
+# reach loopback. Before authentication there was no limit on how much a request
+# could claim to send or how long a connection could sit half-finished, and each
+# occupies a thread.
+
+import socket as socket_module
+
+
+def _raw(port, request, wait=5):
+    """Send raw bytes and return whatever the server answers before closing."""
+    with socket_module.create_connection(("127.0.0.1", port), timeout=wait) as s:
+        s.sendall(request)
+        chunks = []
+        try:
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        except socket_module.timeout:
+            chunks.append(b"<<timed out waiting for the server>>")
+    return b"".join(chunks)
+
+
+def test_a_request_claiming_a_huge_body_is_refused_without_reading_it(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_BODY_BYTES", 1000)
+
+    # Headers only: the body is claimed, never sent. A server that tried to read
+    # it would sit waiting, and one that allocated for it would be exhausted.
+    answer = _raw(live_server, (
+        b"POST /delegate HTTP/1.0\r\nContent-Type: application/json\r\n"
+        b"Content-Length: 99999999999\r\n\r\n"
+    ))
+
+    assert b" 413 " in answer.split(b"\r\n", 1)[0]
+    assert b"1000" in answer          # it says what the limit is
+
+
+@pytest.mark.parametrize("length", [b"abc", b"-5", b"1.5"])
+def test_a_nonsense_content_length_is_a_bad_request(live_server, length):
+    answer = _raw(live_server, (
+        b"POST /delegate HTTP/1.0\r\nContent-Length: " + length + b"\r\n\r\n"
+    ))
+
+    assert b" 400 " in answer.split(b"\r\n", 1)[0]
+
+
+def test_a_body_inside_the_limit_is_still_served(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_BODY_BYTES", 5000)
+
+    status, body = _post(live_server, "/delegate", {"task": "x" * 1000})
+
+    assert status == 202
+
+
+def test_the_size_limit_is_checked_after_authentication(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_BODY_BYTES", 1000)
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret-s3cret-s3cret")
+
+    answer = _raw(live_server, (
+        b"POST /delegate HTTP/1.0\r\nContent-Length: 99999999\r\n\r\n"
+    ))
+
+    # An unauthenticated caller learns nothing about limits: it is just refused.
+    assert b" 401 " in answer.split(b"\r\n", 1)[0]
+
+
+def test_a_connection_that_never_finishes_its_request_is_dropped(live_server, monkeypatch):
+    monkeypatch.setattr(bridge.Handler, "timeout", 1)
+
+    started = time.monotonic()
+    answer = _raw(live_server, b"POST /delegate HTTP/1.0\r\nContent-Length: 50\r\n\r\n{", wait=6)
+
+    # Closed by the server (with or without an error reply), not by our patience.
+    assert b"timed out waiting" not in answer
+    assert time.monotonic() - started < 5
+
+
+def test_a_connection_has_a_timeout_unless_someone_removed_it():
+    # socketserver's default is None: wait forever. The test above sets a short
+    # one itself; this is the one a real deployment gets.
+    assert bridge.Handler.timeout is not None
+    assert 0 < bridge.Handler.timeout <= 120
