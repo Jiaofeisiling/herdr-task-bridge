@@ -35,6 +35,17 @@ are listed against it. Earlier history is in `git log`.
 - The supervisor stops instead of restarting every five seconds when
   `bridge.py` refuses its own settings.
 
+### Performance
+
+- Indexes on `tasks(status, created_at)`, `tasks(created_at)` and
+  `task_events(workflow_id, seq)`. On a 20,000-task database the worker's poll
+  went from 65 ms to 2.3 ms, the queue-cap count in `/delegate` (which ran under
+  the write lock) from 65 ms to 2.2 ms, and `GET /tasks` from 361 ms to 2.4 ms.
+  `tasks` is never pruned, so these cost more the longer a deployment runs.
+- An idle worker starts a task when it is queued instead of at its next poll,
+  which took about a second on average. Submit-to-done through a real bridge
+  with an instant fake agent: 3.04 s to 1.09 s.
+
 ## Bridge v27
 
 ### Added
