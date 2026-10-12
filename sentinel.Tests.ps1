@@ -120,7 +120,11 @@ BeforeAll {
     }
 
     function Wait-SentinelExit {
-        param([Parameter(Mandatory = $true)]$Process, [int]$TimeoutMs = 10000)
+        # Not a bound on the client, whose own timeouts are tested separately: only
+        # how long a test waits for a process it started. A cold PowerShell on a
+        # busy machine can take longer than ten seconds merely to start, which
+        # failed an unrelated test about once in four runs.
+        param([Parameter(Mandatory = $true)]$Process, [int]$TimeoutMs = 30000)
 
         if (-not $Process.WaitForExit($TimeoutMs)) {
             $Process.Kill()
