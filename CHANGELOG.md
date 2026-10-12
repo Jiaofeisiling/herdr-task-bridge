@@ -46,6 +46,16 @@ are listed against it. Earlier history is in `git log`.
   which took about a second on average. Submit-to-done through a real bridge
   with an instant fake agent: 3.04 s to 1.09 s.
 
+### Added (v28)
+
+- `SENTINEL_TASK_RETENTION_DAYS`: delete finished tasks older than this, once a
+  day, with their events. Off by default. It keeps anything queued or running
+  and anything a waiting task depends on, reads ages as times (the database holds
+  stamps with different UTC offsets), and pauses between batches so that a
+  `/delegate` arriving meanwhile is not starved of the write lock: 20,000 tasks
+  take about 5 s and the worst concurrent wait was under 200 ms (1.7 s without
+  the pause).
+
 ## Bridge v27
 
 ### Added

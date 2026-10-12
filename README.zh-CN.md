@@ -382,6 +382,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_MAX_BODY_BYTES` | `1048576` | 请求体上限；超过则不读取、直接返回 413。 |
 | `SENTINEL_REQUEST_TIMEOUT_SEC` | `30` | 一个连接到时仍未发完请求就会被断开。 |
 | `SENTINEL_AUDIT_RETAIN_ROWS` | `50000` | 审计保留的行数，最旧的被丢弃。 |
+| `SENTINEL_TASK_RETENTION_DAYS` | `0` | `0` 表示保留所有任务，与以前相同。否则，已结束且早于该天数的任务每天被删除一次，连同它的事件。仍在排队或运行的任务、以及被等待中的任务所依赖的任务绝不会被删；审计记录另有上限。文件不再增长但不会变小，幂等键会随任务一起被遗忘，所以该值要大于客户端可能重试的最长窗口。 |
 | `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | 客户端：作为 `X-Sentinel-Client` 发送、用于审计的标签。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |

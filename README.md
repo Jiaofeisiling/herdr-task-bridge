@@ -382,6 +382,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_MAX_BODY_BYTES` | `1048576` | Largest request body; larger is refused with 413 unread. |
 | `SENTINEL_REQUEST_TIMEOUT_SEC` | `30` | A connection that has not finished its request by then is dropped. |
 | `SENTINEL_AUDIT_RETAIN_ROWS` | `50000` | Audit rows kept; the oldest are dropped. |
+| `SENTINEL_TASK_RETENTION_DAYS` | `0` | `0` keeps every task, as before. Otherwise a finished task older than this many days is deleted once a day, with its events. Never a task still queued or running, nor one a waiting task depends on; the audit trail is separate. The file stops growing but does not shrink, and an idempotency key is forgotten with its task, so keep this above any window in which a client might retry. |
 | `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | Client-side: the label sent as `X-Sentinel-Client` for the audit trail. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |

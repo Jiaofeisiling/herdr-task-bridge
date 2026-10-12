@@ -6828,3 +6828,221 @@ def test_a_wakeup_that_arrives_while_the_worker_is_busy_is_not_lost(tmp_path, mo
         stop.set()
         bridge._work_available.set()
         worker.join(timeout=5)
+
+
+# --- old tasks can be pruned, if the operator asks ---------------------------
+#
+# tasks is never pruned and each row carries its prompt and result, so the file
+# only grows. Deleting history is the operator's decision, so it is off unless
+# SENTINEL_TASK_RETENTION_DAYS is set, and then it removes only what is finished,
+# old, and not wanted by anything still waiting.
+
+
+def _stamp(days_ago, tz_hours=0):
+    moment = (
+        datetime_module.now(datetime_module_tz.utc)
+        - datetime_module_delta(days=days_ago)
+    ).astimezone(datetime_module_tz(datetime_module_delta(hours=tz_hours)))
+    return moment.isoformat()
+
+
+def _task_row(task_id, status, finished_days_ago, tz_hours=0, created_days_ago=None):
+    finished = _stamp(finished_days_ago, tz_hours) if finished_days_ago is not None else None
+    if created_days_ago is None:
+        created_days_ago = (finished_days_ago or 0) + 0.01
+    created = _stamp(created_days_ago, tz_hours)
+    with bridge.db_session() as conn:
+        conn.execute(
+            "INSERT INTO tasks (task_id, task, agent, status, created_at, finished_at, timeout_ms)"
+            " VALUES (?, 't', 'w1:p1', ?, ?, ?, 1)",
+            (task_id, status, created, finished),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, at, from_status, to_status) VALUES (?, ?, NULL, ?)",
+            (task_id, created, status),
+        )
+
+
+def _remaining():
+    with bridge.db_session() as conn:
+        return {r["task_id"] for r in conn.execute("SELECT task_id FROM tasks")}
+
+
+def test_nothing_is_pruned_unless_asked_for(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 0)
+    _task_row("ancient", "done", 4000)
+
+    assert bridge.prune_old_tasks() == 0
+    assert _remaining() == {"ancient"}
+
+
+@pytest.mark.parametrize("status", ["done", "error", "orphaned", "quota_exhausted", "cancelled"])
+def test_a_finished_task_older_than_the_retention_is_pruned(tmp_path, monkeypatch, status):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    _task_row("old", status, 45)
+    _task_row("young", status, 5)
+
+    assert bridge.prune_old_tasks() == 1
+    assert _remaining() == {"young"}
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_a_task_that_has_not_finished_is_never_pruned_however_old(tmp_path, monkeypatch, status):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    _task_row("stuck", status, None, created_days_ago=400)
+
+    assert bridge.prune_old_tasks() == 0
+    assert _remaining() == {"stuck"}
+
+
+def test_a_task_that_something_still_waiting_depends_on_is_kept(tmp_path, monkeypatch):
+    # Gone, it would read as "no longer failing" to a dependent that has not
+    # run: the join that decides whether a task may start finds no row.
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    _task_row("upstream", "done", 60)
+    _task_row("waiting", "queued", None, created_days_ago=1)
+    with bridge.db_session() as conn:
+        conn.execute("INSERT INTO task_deps (task_id, depends_on) VALUES ('waiting', 'upstream')")
+
+    assert bridge.prune_old_tasks() == 0
+    assert "upstream" in _remaining()
+
+    # Once the dependent is itself finished and old, nothing needs it any more.
+    with bridge.db_session() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'done', finished_at = ?, created_at = ? WHERE task_id = 'waiting'",
+            (_stamp(40), _stamp(41)),
+        )
+    assert bridge.prune_old_tasks() == 2
+    assert _remaining() == set()
+
+
+def test_what_belongs_to_a_pruned_task_goes_with_it_and_nothing_else_does(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    _task_row("old", "done", 60)
+    _task_row("old-too", "done", 59)
+    _task_row("young", "done", 1)
+    with bridge.db_session() as conn:
+        conn.execute("INSERT INTO task_deps (task_id, depends_on) VALUES ('old-too', 'old')")
+        conn.execute("INSERT INTO task_deps (task_id, depends_on) VALUES ('young', 'old-too')")
+
+    bridge.prune_old_tasks()
+
+    with bridge.db_session() as conn:
+        events = {r["task_id"] for r in conn.execute("SELECT task_id FROM task_events")}
+        deps = [(r["task_id"], r["depends_on"]) for r in conn.execute("SELECT * FROM task_deps")]
+    assert events == {"young"}
+    # `young` waited on a task that is gone, so that row would be a dangling
+    # pointer. The dependency was satisfied long ago.
+    assert deps == []
+
+
+def test_the_age_is_read_as_a_time_not_compared_as_text(tmp_path, monkeypatch):
+    # The live database holds stamps written with a +13:00 offset beside +00:00
+    # ones. As text, 11:00+13:00 sorts after 01:00+00:00 although it is the same
+    # instant minus an hour, and a text comparison would delete the wrong tasks.
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    _task_row("just-too-old", "done", 30 + 1 / 24, tz_hours=13)
+    _task_row("just-young-enough", "done", 30 - 1 / 24, tz_hours=13)
+    _task_row("utc-too-old", "done", 30 + 1 / 24, tz_hours=0)
+    _task_row("utc-young-enough", "done", 30 - 1 / 24, tz_hours=0)
+
+    bridge.prune_old_tasks()
+
+    assert _remaining() == {"just-young-enough", "utc-young-enough"}
+
+
+def test_a_stamp_that_cannot_be_read_is_left_alone(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    _task_row("odd", "done", 60)
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE tasks SET finished_at = 'not a time' WHERE task_id = 'odd'")
+
+    assert bridge.prune_old_tasks() == 0
+    assert _remaining() == {"odd"}
+
+
+def test_a_large_backlog_is_pruned_in_batches(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    monkeypatch.setattr(bridge, "PRUNE_BATCH", 7)
+    for i in range(25):
+        _task_row(f"old-{i}", "done", 60 + i / 100)
+    _task_row("young", "done", 1)
+
+    assert bridge.prune_old_tasks() == 25
+    assert _remaining() == {"young"}
+
+
+def test_pruning_does_not_touch_the_audit_trail(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    _task_row("old", "done", 60)
+    bridge.record_audit("POST", "/delegate", 202, None, "old")
+
+    bridge.prune_old_tasks()
+
+    assert len(bridge.list_audit()) == 1
+
+
+def test_an_idle_worker_prunes_now_and_then(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    monkeypatch.setattr(bridge, "PRUNE_INTERVAL_SEC", 0.2)
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.05)
+    _task_row("old", "done", 60)
+
+    _run_worker_until(lambda: "old" not in _remaining(), seconds=5)
+
+    assert "old" not in _remaining()
+
+
+def test_a_worker_with_pruning_off_leaves_history_alone(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 0)
+    monkeypatch.setattr(bridge, "PRUNE_INTERVAL_SEC", 0.1)
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.05)
+    _task_row("old", "done", 4000)
+
+    _run_worker_until(lambda: False, seconds=1)
+
+    assert _remaining() == {"old"}
+
+
+def test_pruning_lets_go_of_the_lock_between_batches(tmp_path, monkeypatch):
+    # Measured: pruning 20,000 tasks took 2 s, and a /delegate arriving meanwhile
+    # waited up to 1.7 s for the write lock. A writer that fails to get the lock
+    # backs off; the pruner, starting its next batch the instant it committed,
+    # kept taking it again. Pausing between batches is what lets that writer in.
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    monkeypatch.setattr(bridge, "PRUNE_BATCH", 7)
+    monkeypatch.setattr(bridge, "PRUNE_PAUSE_SEC", 0.123)
+    for i in range(25):
+        _task_row(f"old-{i}", "done", 60 + i / 100)
+    pauses = []
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: pauses.append(s))
+
+    assert bridge.prune_old_tasks() == 25
+
+    # 25 rows in batches of 7 is four batches: three gaps, and none after the last.
+    assert pauses == [0.123] * 3
+
+
+def test_a_prune_that_finds_nothing_does_not_pause(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "TASK_RETENTION_DAYS", 30)
+    pauses = []
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: pauses.append(s))
+
+    assert bridge.prune_old_tasks() == 0
+    assert pauses == []

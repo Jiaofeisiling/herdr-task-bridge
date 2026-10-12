@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -1504,6 +1504,83 @@ def record_audit(method, path, status, client=None, task_id=None):
             "(SELECT MAX(seq) FROM audit_log) - ?",
             (AUDIT_RETAIN_ROWS,),
         )
+
+
+# tasks is never pruned unless the operator asks: each row carries its prompt and
+# result, so the file only grows, but deleting history is theirs to decide.
+# 0 keeps everything, as before.
+TASK_RETENTION_DAYS = max(0, int(os.environ.get("SENTINEL_TASK_RETENTION_DAYS", "0")))
+PRUNE_INTERVAL_SEC = 24 * 3600
+PRUNE_BATCH = 500
+# Between batches, outside any transaction. Without it the next batch takes the
+# write lock again the instant the last released it, and a writer that backed off
+# to wait (a /delegate) can be kept out for the whole prune: measured at 1.7 s.
+PRUNE_PAUSE_SEC = 0.05
+_FINAL_STATUSES = ("done", "error", "orphaned", "quota_exhausted", "cancelled")
+
+
+def prune_old_tasks():
+    """Delete finished tasks older than SENTINEL_TASK_RETENTION_DAYS. Returns how many.
+
+    Only a task that is in a final state and finished long enough ago, and that
+    no task still waiting depends on: gone, it would read as satisfied to the
+    join that decides whether a dependent may start. Its events and dependency
+    rows go with it. The audit trail has its own limit and is not touched.
+
+    A stamp that cannot be read is left alone. The age is read as a time, not
+    compared as text, because stamps carry different UTC offsets.
+    """
+    if TASK_RETENTION_DAYS <= 0:
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=TASK_RETENTION_DAYS)
+    # A text comparison picks the candidates, with a day's margin for the offsets
+    # stamps are written with; the parsed time below is what decides.
+    margin = (cutoff + timedelta(days=1)).isoformat()
+    final = ", ".join("?" for _ in _FINAL_STATUSES)
+
+    pruned, last_rowid = 0, 0
+
+    while True:
+        with db_session() as conn:
+            # Serialised with enqueue_task, so a task cannot be queued against
+            # one of these between the check and the delete.
+            conn.execute("BEGIN IMMEDIATE")
+
+            rows = conn.execute(f"""
+                SELECT rowid AS rid, task_id, finished_at FROM tasks
+                WHERE rowid > ? AND status IN ({final}) AND created_at < ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM task_deps d
+                    JOIN tasks waiting ON waiting.task_id = d.task_id
+                    WHERE d.depends_on = tasks.task_id
+                    AND waiting.status NOT IN ({final})
+                )
+                ORDER BY rowid LIMIT ?
+            """, [last_rowid, *_FINAL_STATUSES, margin, *_FINAL_STATUSES, PRUNE_BATCH]).fetchall()
+
+            if not rows:
+                return pruned
+
+            last_rowid = rows[-1]["rid"]
+            old = []
+            for row in rows:
+                age = _age_seconds(row["finished_at"])
+                if age is not None and age > TASK_RETENTION_DAYS * 86400:
+                    old.append(row["task_id"])
+
+            if old:
+                marks = ", ".join("?" for _ in old)
+                conn.execute(f"DELETE FROM task_events WHERE task_id IN ({marks})", old)
+                conn.execute(f"DELETE FROM task_deps WHERE task_id IN ({marks})", old)
+                conn.execute(f"DELETE FROM task_deps WHERE depends_on IN ({marks})", old)
+                conn.execute(f"DELETE FROM tasks WHERE task_id IN ({marks})", old)
+                pruned += len(old)
+
+        if len(rows) < PRUNE_BATCH:
+            return pruned
+
+        time.sleep(PRUNE_PAUSE_SEC)
 
 
 def list_audit(after=0, limit=EVENTS_LIMIT_DEFAULT):
@@ -3267,6 +3344,7 @@ def task_worker(stop_event=None):
     # is what stops one busy agent's oldest task from starving a
     # different, already-idle agent's tasks sitting behind it.
     busy_this_pass = set()
+    last_prune = float("-inf")
 
     while stop_event is None or not stop_event.is_set():
         try:
@@ -3275,6 +3353,13 @@ def task_worker(stop_event=None):
 
             if task_row is None:
                 busy_this_pass.clear()
+
+                if TASK_RETENTION_DAYS and time.monotonic() - last_prune >= PRUNE_INTERVAL_SEC:
+                    last_prune = time.monotonic()
+                    pruned = prune_old_tasks()
+                    if pruned:
+                        print(f"[prune] removed {pruned} finished task(s) older than "
+                              f"{TASK_RETENTION_DAYS} day(s)")
 
                 # Cleared before the next look, never after it: a task queued
                 # in between sets it again, so it is found rather than slept
