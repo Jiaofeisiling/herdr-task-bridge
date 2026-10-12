@@ -284,10 +284,9 @@ def write_report(path, health, families, run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--url", default=smoke.DEFAULT_URL)
-    # Read from the environment by default: a command line is visible to every
-    # user in the process list and stays in the shell history.
-    parser.add_argument("--token", default=os.environ.get("SENTINEL_BRIDGE_TOKEN"),
-                        help="access token (default: $SENTINEL_BRIDGE_TOKEN)")
+    parser.add_argument("--token", default=smoke.default_token(),
+                        help="access token (default: $SENTINEL_BRIDGE_TOKEN, "
+                             "else the file `sentinel.ps1 login` writes)")
     parser.add_argument("--yes", action="store_true",
                         help="actually send the probe tasks")
     parser.add_argument("--patience", type=int, default=600,

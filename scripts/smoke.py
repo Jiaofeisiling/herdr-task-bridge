@@ -29,6 +29,27 @@ DEFAULT_URL = "http://127.0.0.1:8765"
 PROBE_TIMEOUT = 8
 
 
+def default_token():
+    """The access token, if there is one to find: $SENTINEL_BRIDGE_TOKEN, else
+    the file that `sentinel.ps1 login` writes (token, in $SENTINEL_CONFIG_DIR or
+    ~/.sentinel). Neither is a command line, which every other user of a shared
+    machine can read in the process list and which stays in the shell history.
+    """
+    value = os.environ.get("SENTINEL_BRIDGE_TOKEN")
+    if value:
+        return value
+
+    directory = os.environ.get("SENTINEL_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".sentinel"
+    )
+
+    try:
+        with open(os.path.join(directory, "token"), encoding="utf-8-sig") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 class ChannelDown(RuntimeError):
     pass
 
@@ -109,10 +130,9 @@ def check_channel(base, token):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=DEFAULT_URL)
-    # Read from the environment by default: a command line is visible to every
-    # user in the process list and stays in the shell history.
-    parser.add_argument("--token", default=os.environ.get("SENTINEL_BRIDGE_TOKEN"),
-                        help="access token (default: $SENTINEL_BRIDGE_TOKEN)")
+    parser.add_argument("--token", default=default_token(),
+                        help="access token (default: $SENTINEL_BRIDGE_TOKEN, "
+                             "else the file `sentinel.ps1 login` writes)")
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
