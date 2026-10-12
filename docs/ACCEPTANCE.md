@@ -15,9 +15,14 @@ python scripts/acceptance.py                          # prints the plan, sends n
 python scripts/acceptance.py --yes --report run.md    # runs it, writes a report
 ```
 
-Add `--token <value>` if the bridge has `SENTINEL_BRIDGE_TOKEN` set; it then
-also checks that the event stream refuses a caller without it. `--patience`
-(seconds, default 600) is how long it waits for a probe to finish.
+If the bridge has a token (it must, from v28), the script reads it from the
+`SENTINEL_BRIDGE_TOKEN` environment variable, and then also checks that the
+event stream refuses a caller without it. Do not type the token on the command
+line: on a shared login node that line is visible to every other user in the
+process list while it runs, and it stays in your shell history. (`--token` still
+exists and wins over the variable, for a machine where neither matters.) While a
+probe runs the script says what it is waiting for; a real agent can take minutes
+over one. `--patience` (seconds, default 600) is how long it waits for a probe.
 
 It checks the channel first and stops with exit 2 if the channel is down, the
 bridge is older than v27, or no agent is running, because in those cases every
@@ -45,7 +50,7 @@ submitted. Anything still waiting when the run ends is cancelled.
 | event stream, cursor | Asking again from the returned cursor repeats nothing |
 | event stream, long poll | A wait with nothing to report takes about as long as asked, then returns empty |
 | workflow | The counts and state of the whole workflow add up |
-| auth (with `--token`) | The event stream answers 401 without the token |
+| auth (with a token) | The event stream answers 401 without the token |
 
 A `SKIP` carries its reason. The usual one is that the agent finished the first
 probe before the script could cancel the one waiting on it; run it again.

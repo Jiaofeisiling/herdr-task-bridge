@@ -12,6 +12,7 @@ to be broken.
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -493,3 +494,79 @@ def test_the_acceptance_script_checks_authentication_when_given_a_token(world):
     assert "auth: the event stream refuses a caller without the token" in text
     assert "FAIL" not in text
     assert token not in text
+
+
+# -- the token should not have to be typed on a command line --------------------
+#
+# On a shared login node a command line is visible to every other user in the
+# process list for as long as it runs, and it stays in the shell's history. The
+# bridge's own token handling was made careful about that; the scripts that talk
+# to it took the token only as an argument.
+
+
+def _run_with_env(world, bridge, extra_env, *args):
+    report = world.root / "report.md"
+    environment = {k: v for k, v in os.environ.items() if k != "SENTINEL_BRIDGE_TOKEN"}
+    environment.update(extra_env)
+    done = subprocess.run(
+        [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{bridge.port}",
+         "--yes", "--report", str(report), *args],
+        capture_output=True, text=True, encoding="utf-8", timeout=240, env=environment,
+    )
+    return done, report
+
+
+def test_the_acceptance_script_reads_the_token_from_the_environment(world):
+    world.configure([ALPHA], {"alpha": {"text": json.dumps({"summary": "OK"})}})
+    token = "e" * 32
+    bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN=token)
+
+    done, report = _run_with_env(world, bridge, {"SENTINEL_BRIDGE_TOKEN": token})
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "auth: the event stream refuses a caller without the token" in report.read_text(encoding="utf-8")
+    assert token not in done.stdout + done.stderr + report.read_text(encoding="utf-8")
+
+
+def test_a_token_given_on_the_command_line_still_wins(world):
+    world.configure([ALPHA], {"alpha": {"text": json.dumps({"summary": "OK"})}})
+    token = "f" * 32
+    bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN=token)
+
+    done, _ = _run_with_env(world, bridge, {"SENTINEL_BRIDGE_TOKEN": "wrong-" * 6}, "--token", token)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_the_acceptance_script_says_what_it_is_waiting_for(world):
+    # Real agents take a while to answer a probe, and the script used to print
+    # nothing during that time. It looked hung, and was interrupted.
+    world.configure([ALPHA], {"alpha": {"delay": 3, "text": json.dumps({"summary": "OK"})}})
+    bridge = world.start_bridge()
+
+    done, _ = _run_acceptance(world, bridge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "waiting for" in done.stdout
+    # What it is waiting for, in words; never an id, which is not for sharing.
+    assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}", done.stdout)
+
+
+def test_the_smoke_test_reads_the_token_from_the_environment(world):
+    world.configure([ALPHA], {"alpha": {"text": "ok"}})
+    token = "s" * 32
+    bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN=token)
+    smoke = os.path.join(HERE, "..", "scripts", "smoke.py")
+    environment = {**os.environ, "SENTINEL_BRIDGE_TOKEN": token}
+
+    with_token = subprocess.run(
+        [sys.executable, smoke, "--url", f"http://127.0.0.1:{bridge.port}"],
+        capture_output=True, text=True, encoding="utf-8", timeout=120, env=environment)
+    environment.pop("SENTINEL_BRIDGE_TOKEN")
+    without = subprocess.run(
+        [sys.executable, smoke, "--url", f"http://127.0.0.1:{bridge.port}"],
+        capture_output=True, text=True, encoding="utf-8", timeout=120, env=environment)
+
+    assert with_token.returncode == 0, with_token.stdout + with_token.stderr
+    # And it is the token that made the difference.
+    assert without.returncode != 0

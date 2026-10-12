@@ -84,14 +84,30 @@ class Run:
     def task(self, task_id):
         return self.call("GET", f"/tasks/{task_id}")[1].get("task", {})
 
-    def wait(self, task_id, timeout=None):
-        """The task once it is in a final state, or None if it never got there."""
-        deadline = time.monotonic() + (timeout or self.patience)
+    def wait(self, task_id, label, timeout=None):
+        """The task once it is in a final state, or None if it never got there.
+
+        Says what it is waiting for, because a real agent can take minutes over
+        a probe and a script that prints nothing looks hung. Never the task id.
+        """
+        started = time.monotonic()
+        deadline = started + (timeout or self.patience)
+        last_status, last_said = None, started
+
         while time.monotonic() < deadline:
             task = self.task(task_id)
-            if task.get("status") in TERMINAL:
+            status = task.get("status")
+
+            if status in TERMINAL:
                 return task
+
+            now = time.monotonic()
+            if status != last_status or now - last_said >= 15:
+                print(f"  waiting for {label}: {status} ({now - started:.0f} s)", flush=True)
+                last_status, last_said = status, now
+
             time.sleep(1.5)
+
         return None
 
     def tidy(self):
@@ -142,7 +158,7 @@ def run_probes(run):
             "probe. Run it again",
         )
     else:
-        z_final = run.wait(z, timeout=60)
+        z_final = run.wait(z, "the cascade to cancel the task behind it", timeout=60)
         y_now, z_now = run.task(y), run.task(z)
         run.check(
             "cancellation: a task cancelled while it waited was never sent",
@@ -157,8 +173,8 @@ def run_probes(run):
         )
 
     # -- the tasks that really run ----------------------------------------------
-    a_final = run.wait(a)
-    b_final = run.wait(b)
+    a_final = run.wait(a, "the first probe")
+    b_final = run.wait(b, "the probe that depends on it")
 
     if not a_final or a_final["status"] != "done":
         run.check(
@@ -268,7 +284,10 @@ def write_report(path, health, families, run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--url", default=smoke.DEFAULT_URL)
-    parser.add_argument("--token", default=None)
+    # Read from the environment by default: a command line is visible to every
+    # user in the process list and stays in the shell history.
+    parser.add_argument("--token", default=os.environ.get("SENTINEL_BRIDGE_TOKEN"),
+                        help="access token (default: $SENTINEL_BRIDGE_TOKEN)")
     parser.add_argument("--yes", action="store_true",
                         help="actually send the probe tasks")
     parser.add_argument("--patience", type=int, default=600,
