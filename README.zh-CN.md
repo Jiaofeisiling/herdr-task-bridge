@@ -180,6 +180,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `task <task_id>` | GET | `/tasks/<id>` | 查询任务状态，附带执行中的 `progress`、`depends_on`、有结构化结果时的 `result_data`；处于 `queued` 时还会给出 `queued_reason`，说明它在等什么。 |
 | `wait <task_id>` | GET | `/tasks/<id>` | 每 3 秒轮询至终态，再输出结果或错误。 |
 | `events [task_id]` | GET | `/events` | 游标（`-After <seq>`）之后的状态变更，可选择最多挂起 30 秒（`-WaitSec`）直到有事发生；可按任务 id 或 `-WorkflowId` 过滤。见 [事件流](#事件流)。 |
+| `login` | — | — | 在本机保存访问令牌（见"配置与安全"一节）。提示输入时不回显，绝不接受作为命令行参数。 |
 | `cancel <task_id>` | POST | `/tasks/<id>/cancel` | 取消仍在 `queued` 的任务；已经开始的任务返回 `409`，因为桥无法在 agent 执行中途叫停它。 |
 | `workflow <workflow_id>` | GET | `/workflows/<id>` | 列出带该 `workflow_id` 的全部任务，附各状态计数 `counts` 和整体 `state`（`in_progress`、`done`、`failed`；全部任务都是被主动取消时为 `cancelled`）。 |
 | `tasks` | GET | `/tasks` | 列出最近 20 个任务。`status`（`queued`、`running`、`done`、`error`、`orphaned`、`quota_exhausted`、`cancelled`）和 `limit`（1–200）可以缩小或放宽范围——`tasks -Status queued` 就是找出正在等待的任务的办法。 |
@@ -199,6 +200,7 @@ $id = (.\sentinel.ps1 delegate "总结当前目录；不要修改文件" | Conve
 | `4` | **根本没有到达 bridge** —— 通道不通，bridge 本身的状态无从得知 |
 | `5` | **bridge 能回应 `/health`，但这一个请求没在时限内得到回复** —— 通道本身没问题，不要去重连任何东西 |
 | `6` | 任务以 `cancelled` 结束 —— 在开始之前就被叫停，什么都没有运行 |
+| `7` | **bridge 拒绝了访问令牌**，或根本没有发送令牌。这不是该重试的失败：用 `login` 保存令牌，或告诉用户。 |
 
 `4` 被刻意单列。SSH 转发不在时，远端的 bridge 通常好好地跑着、只是联系不上；把这种情况报成"bridge 故障"会把人引向错误的机器。消息里会指明是两种通道状态中的哪一种——没有东西在监听，还是连上了却不回应——因为二者的处理方式不同；并且明确说明 bridge 的状态是**未知**而非损坏。
 
@@ -384,6 +386,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_AUDIT_RETAIN_ROWS` | `50000` | 审计保留的行数，最旧的被丢弃。 |
 | `SENTINEL_TASK_RETENTION_DAYS` | `0` | `0` 表示保留所有任务，与以前相同。否则，已结束且早于该天数的任务每天被删除一次，连同它的事件。仍在排队或运行的任务、以及被等待中的任务所依赖的任务绝不会被删；审计记录另有上限。文件不再增长但不会变小，幂等键会随任务一起被遗忘，所以该值要大于客户端可能重试的最长窗口。 |
 | `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | 客户端：作为 `X-Sentinel-Client` 发送、用于审计的标签。 |
+| `SENTINEL_CONFIG_DIR` | `~/.sentinel` | 客户端：存放 `login` 所写令牌文件的目录。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
 | `SENTINEL_SLURM_POLICY` | `submit` | 部署级默认 Slurm 策略；请求里的 `slurm_policy` 可覆盖。 |
@@ -410,7 +413,9 @@ bash remote/bridge-set-token.sh           # 写入 remote/bridge.env（权限 60
 bash remote/bridge-restart.sh
 ```
 
-`bridge-restart` 会先问新的 bridge 是否接受当前设置（`bridge.py --check`），不接受就一个进程也不停，所以加上这层保护不会把正在运行的 bridge 搞挂。`--rotate` 用于替换正在使用的令牌，之后所有客户端都要更新。`/health` 不需要令牌，以便探测能判断进程是否存活；其余所有端点，包括 `/events`、`/workflows` 和 `/audit`，都需要。
+`bridge-restart` 会先问新的 bridge 是否接受当前设置（`bridge.py --check`），不接受就一个进程也不停，所以加上这层保护不会把正在运行的 bridge 搞挂。`--rotate` 用于替换正在使用的令牌，之后所有客户端都要更新。客户端（Windows）这一侧，在你自己的终端里保存一次令牌：`.\sentinel.ps1 login`。它提示输入时不回显，并写入 `~/.sentinel/token`，只有你自己能读。既有文件又有环境变量 `SENTINEL_BRIDGE_TOKEN`，是因为环境变量只会传给设置之后才启动的进程，而且不是你运行的每个工具都会继承它（沙箱里的助手、早就开着的窗口）；你个人目录里的文件则都能读到。两者并存时环境变量优先。`smoke.py` 和 `acceptance.py` 读同一个文件。命令因缺少令牌被拒时，退出码是 **7**，并给出该怎么办的说明，同时要求 AI 助手停下来询问，不要自己去找这个密钥。
+
+`/health` 不需要令牌，以便探测能判断进程是否存活；其余所有端点，包括 `/events`、`/workflows` 和 `/audit`，都需要。
 
 除令牌之外还做了什么，以及为什么不能只靠令牌：
 

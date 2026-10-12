@@ -16,7 +16,8 @@ param(
         "quota-reset",
         "cancel",
         "workflow",
-        "events"
+        "events",
+        "login"
     )]
     [string]$Command,
 
@@ -152,7 +153,7 @@ $ReadQuery = "?" + ($ReadQueryParts -join "&")
 # an option such as `--source visible` was silently dropped while the caller
 # believed it had been sent: 33 failed reads in a night, each followed by a
 # retry with the same dropped option. Refuse instead of pretending.
-$TakesNoText = @("read", "ready", "status", "health", "agents", "quota", "quota-reset", "tasks")
+$TakesNoText = @("read", "ready", "status", "health", "agents", "quota", "quota-reset", "tasks", "login")
 if (($TakesNoText -contains $Command) -and $Text -and ($Text.Count -gt 0)) {
     [Console]::Error.WriteLine("sentinel.ps1 ${Command}: unrecognised argument(s): " + ($Text -join " "))
     exit 1
@@ -332,6 +333,70 @@ function Exit-ChannelDown {
     exit 4
 }
 
+# Where a stored token lives: a file named `token` in SENTINEL_CONFIG_DIR, which
+# defaults to .sentinel under the user's home. A file, as well as the environment
+# variable, because an environment variable only reaches processes started after
+# it was set, and not every process a user runs inherits it (a sandboxed tool, a
+# window that was already open); a file in the user's own profile is read by all.
+function Get-SentinelTokenPath {
+    $dir = if ($env:SENTINEL_CONFIG_DIR) { $env:SENTINEL_CONFIG_DIR } else { Join-Path $HOME ".sentinel" }
+    return Join-Path $dir "token"
+}
+
+# The token and where it came from, or $null. The environment variable wins.
+function Get-SentinelTokenInfo {
+    if ($env:SENTINEL_BRIDGE_TOKEN) {
+        return @{ Value = $env:SENTINEL_BRIDGE_TOKEN; Source = "the SENTINEL_BRIDGE_TOKEN environment variable" }
+    }
+
+    $path = Get-SentinelTokenPath
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $value = [System.IO.File]::ReadAllText($path).Trim()
+        if ($value) {
+            return @{ Value = $value; Source = "the file $path" }
+        }
+    }
+
+    return $null
+}
+
+# Exit 7 -- the bridge refused the token, or there was none to send.
+#
+# Its own code, and a message that says what to do, because a refusal looks like
+# any other failed request otherwise (exit 1), and an AI caller seeing that will
+# retry, or go looking for the secret. Retrying cannot help, and a token is never
+# something to hunt for or to ask to have pasted into a conversation.
+function Exit-Unauthorized {
+    $info = Get-SentinelTokenInfo
+
+    $lines = if ($null -eq $info) {
+        @(
+            "AUTHENTICATION REQUIRED: the bridge refused this request because no access token was sent.",
+            "  Bridge v28 and later need one, and none was found in the SENTINEL_BRIDGE_TOKEN",
+            "  environment variable or in $(Get-SentinelTokenPath).",
+            "  Store it once, in your own terminal:  sentinel.ps1 login",
+            "  (the token is the value bridge-set-token.sh printed on the host).",
+            "  Retrying will not help."
+        )
+    }
+    else {
+        @(
+            "AUTHENTICATION FAILED: the bridge refused the access token from $($info.Source).",
+            "  It is wrong, or has been replaced on the host (bridge-set-token.sh --rotate).",
+            "  Store the current one with:  sentinel.ps1 login",
+            "  Retrying will not help."
+        )
+    }
+
+    $lines += @(
+        "  If you are an AI assistant: do not look for the token, read bridge.env, or ask for it",
+        "  to be pasted into this conversation. Tell the user that authentication is needed, and stop."
+    )
+
+    foreach ($line in $lines) { [Console]::Error.WriteLine($line) }
+    exit 7
+}
+
 function Invoke-SentinelApi {
     param(
         [Parameter(Mandatory=$true)][string]$Uri,
@@ -349,8 +414,9 @@ function Invoke-SentinelApi {
         "X-Sentinel-Client" = $(if ($env:SENTINEL_CLIENT_NAME) { $env:SENTINEL_CLIENT_NAME } else { "sentinel.ps1" })
     }
 
-    if ($env:SENTINEL_BRIDGE_TOKEN) {
-        $headers["X-Sentinel-Token"] = $env:SENTINEL_BRIDGE_TOKEN
+    $tokenInfo = Get-SentinelTokenInfo
+    if ($tokenInfo) {
+        $headers["X-Sentinel-Token"] = $tokenInfo.Value
     }
 
     try {
@@ -368,6 +434,13 @@ function Invoke-SentinelApi {
         # Invoke-RestMethod normally stores the already-read response body.
         $caughtError = $_
         $errResponse = $caughtError.Exception.Response
+
+        if ($null -ne $errResponse) {
+            $statusCode = try { [int]$errResponse.StatusCode } catch { 0 }
+            if ($statusCode -eq 401) {
+                Exit-Unauthorized
+            }
+        }
 
         if ($caughtError.ErrorDetails -and $caughtError.ErrorDetails.Message) {
             try {
@@ -660,6 +733,51 @@ switch ($Command) {
         if (-not $result.ok) {
             exit 1
         }
+    }
+
+    "login" {
+        # From stdin when it is piped, otherwise asked for with the input hidden.
+        # Never an argument: that would put the token on the command line, in the
+        # process list and in the shell history.
+        if ([Console]::IsInputRedirected) {
+            $given = [Console]::In.ReadLine()
+        }
+        else {
+            $secure = Read-Host "Access token (input is hidden)" -AsSecureString
+            $given = [System.Net.NetworkCredential]::new("", $secure).Password
+        }
+
+        # A byte order mark can arrive in front of piped text (PowerShell puts one
+        # there when it starts a native process with redirected input) and would
+        # otherwise make a good token look malformed.
+        $token = if ($given) { $given.TrimStart([char]0xFEFF).Trim() } else { "" }
+
+        if (-not $token) {
+            [Console]::Error.WriteLine("sentinel.ps1 login: no token was given.")
+            exit 1
+        }
+
+        # What bridge-set-token.sh makes is 64 hex characters; accept anything that
+        # could be a token of the right sort, and refuse a sentence or a mistake.
+        if ($token.Length -lt 16 -or $token -notmatch '^[\x21-\x7E]+$') {
+            [Console]::Error.WriteLine("sentinel.ps1 login: that does not look like an access token (at least 16 printable characters, no spaces).")
+            exit 1
+        }
+
+        $path = Get-SentinelTokenPath
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+        [System.IO.File]::WriteAllText($path, $token, (New-Object System.Text.UTF8Encoding($false)))
+
+        # Readable by its owner alone. Cutting inheritance keeps a parent
+        # directory's permissions from applying.
+        if ($env:OS -eq "Windows_NT") {
+            & icacls.exe $path /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+        }
+        else {
+            & chmod 600 $path
+        }
+
+        Write-Output "Saved the access token to $path (readable only by you)."
     }
 
     "events" {

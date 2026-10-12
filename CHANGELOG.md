@@ -60,6 +60,19 @@ is folded into 4.1.0.
 
 ### Fixed (after 4.1.0)
 
+- **A client without the token could not tell why it was refused.** It printed
+  `{"error": "unauthorized"}` and exited 1, the same as any failed request, so an
+  AI assistant could retry, or go looking for the secret. A refusal now exits 7
+  with `AUTHENTICATION REQUIRED` or `AUTHENTICATION FAILED`, says what to do, and
+  tells an assistant to stop and ask the user. `wait` gives up at once on it
+  instead of riding it out like a lost channel.
+- `sentinel.ps1 login` stores the token in `~/.sentinel/token` (readable by its
+  owner alone), asking with the input hidden and never taking it as an argument.
+  The client reads that file when `SENTINEL_BRIDGE_TOKEN` is not set: an
+  environment variable only reaches processes started after it was set, and not
+  every tool inherits it (a sandboxed assistant, a window that was already open).
+  `smoke.py` and `acceptance.py` read the same file.
+
 - `scripts/acceptance.py` and `scripts/smoke.py` read the token from
   `SENTINEL_BRIDGE_TOKEN` by default. They took it only as `--token <value>`,
   which on a shared login node is visible to every user in the process list and
