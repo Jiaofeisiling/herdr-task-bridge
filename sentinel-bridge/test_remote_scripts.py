@@ -149,3 +149,53 @@ def test_the_function_does_not_stop_the_bridge_if_it_cannot_find_the_script(tmp_
 
     assert result.returncode != 0
     assert not any(c.startswith(("screen", "pkill")) for c in _calls(calls))
+
+
+# -- the supervisor and the settings it reads --------------------------------
+#
+# bridge.env.example tells an operator to write SENTINEL_BRIDGE_TOKEN="..." in
+# bridge.env. The supervisor only *sourced* that file, which sets shell
+# variables without exporting them, and exported just a few by name. So the
+# token never reached bridge.py, and the bridge ran with no authentication while
+# its operator believed it was protected.
+
+
+def _supervisor_world(tmp_path, env_lines):
+    root, calls, env = _host(tmp_path)
+    shutil.copy(os.path.join(REMOTE, "bridge-supervisor.sh"), root / "remote" / "bridge-supervisor.sh")
+    (root / "remote" / "bridge.env").write_text("\n".join(env_lines) + "\n", newline="\n")
+
+    seen = tmp_path / "seen.txt"
+    stubs = tmp_path / "stubs"
+    # What bridge.py would have been given, written down instead of served.
+    _stub(
+        stubs / "python3",
+        f'echo "token=${{SENTINEL_BRIDGE_TOKEN-UNSET}} failover=${{SENTINEL_QUOTA_FAILOVER_AGENTS-UNSET}}" '
+        f'>> "{seen.as_posix()}"\nexit 0\n',
+    )
+    # The supervisor restarts bridge.py forever; end it after the first pass.
+    _stub(stubs / "sleep", "kill -9 $PPID\n")
+
+    return root, env, seen
+
+
+def test_a_token_in_bridge_env_reaches_bridge_py_without_an_export(tmp_path):
+    root, env, seen = _supervisor_world(tmp_path, [
+        'SENTINEL_BRIDGE_TOKEN="0123456789abcdef0123456789abcdef"',
+        'SENTINEL_QUOTA_FAILOVER_AGENTS="a,b"',
+    ])
+
+    _run([str(root / "remote" / "bridge-supervisor.sh")], env)
+
+    assert seen.read_text().strip() == (
+        "token=0123456789abcdef0123456789abcdef failover=a,b"
+    )
+
+
+def test_the_supervisor_runs_with_nothing_set_when_there_is_no_env_file(tmp_path):
+    root, env, seen = _supervisor_world(tmp_path, [])
+    (root / "remote" / "bridge.env").unlink()
+
+    _run([str(root / "remote" / "bridge-supervisor.sh")], env)
+
+    assert seen.read_text().strip() == "token=UNSET failover=UNSET"

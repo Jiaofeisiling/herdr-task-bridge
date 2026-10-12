@@ -24,9 +24,16 @@ LOG_FILE="$BRIDGE_DIR/bridge.log"
 # Sourcing it here rather than relying on ~/.bashrc means the settings hold
 # no matter how the supervisor was launched.
 ENV_FILE="$BRIDGE_ROOT/remote/bridge.env"
+
+# `set -a` exports everything the file assigns. Sourcing alone only sets shell
+# variables, and bridge.env.example shows plain assignments, so without it
+# SENTINEL_BRIDGE_TOKEN never reached bridge.py: the bridge ran with no
+# authentication while its operator believed it was protected.
 if [ -f "$ENV_FILE" ]; then
+    set -a
     # shellcheck disable=SC1090
     . "$ENV_FILE"
+    set +a
 fi
 
 # Only pass this on when a deployment actually set one. Defaulting it to
