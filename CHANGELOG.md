@@ -58,6 +58,16 @@ is folded into 4.1.0.
   take about 5 s and the worst concurrent wait was under 200 ms (1.7 s without
   the pause).
 
+### Upgrading to 4.1.0: tighten what already exists
+
+The bridge makes what it creates private and tightens its own database, but only
+warns about a directory it did not create, and cannot know about copies made by
+hand. After upgrading, `chmod 700` the directory holding `tasks.db` and the result
+directory, and `chmod 600` any hand-made backup of the database. On the reference
+host a deployment backup made with a plain `cp` was mode 644 in a 755 directory,
+and the result files were 644 in a 2755 one: readable by every other user of the
+login node. See the README's "After upgrading".
+
 ### Fixed (after 4.1.0)
 
 - **A client without the token could not tell why it was refused.** It printed

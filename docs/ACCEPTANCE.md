@@ -70,6 +70,44 @@ The report names the agent's runtime (`opencode`, `claude`) and nothing about
 the host: no hostnames, paths, task ids or pane ids. Paste each one below under
 its date, newest first, with the commit it was run at.
 
+### 2026-10-12 (UTC), bridge v28 (4.1.0)
+
+On the reference host (NeSI) against two live agents, with the access token that
+v28 requires, which this run checked is enforced.
+
+- Date: 2026-10-12 (UTC)
+- Bridge version: 28
+- Agent runtimes: agy, cursor
+- Result: 11 passed, 0 failed, 0 skipped
+
+| Result | Check | Detail |
+|---|---|---|
+| PASS | idempotency: a retry with the same key returns the original task | status 202 |
+| PASS | cancellation: a task cancelled while it waited was never sent |  |
+| PASS | cancellation cascades to the task that waited on it, also never sent |  |
+| PASS | the first probe is delivered |  |
+| PASS | structured result: served as fields when the agent wrote JSON, as text when it did not | this agent answered in json |
+| PASS | dependency: the waiting task started only after what it waited on finished |  |
+| PASS | event stream: a task's whole life is recorded, in order | 3 event(s) |
+| PASS | event stream: resuming from the cursor repeats nothing |  |
+| PASS | event stream: a long poll waits, then comes back empty | 2.4s |
+| PASS | workflow: counts and state add up | {'done': 2, 'cancelled': 2} -> failed |
+| PASS | auth: the event stream refuses a caller without the token | status 401 |
+
+The script checks behavior through the API. What it cannot see is the host's
+files, so a second, read-only check was made by an agent on the host. Findings:
+
+- `tasks.db`, `bridge.log` and `bridge.env` were mode 600: the bridge tightened
+  its own database at startup.
+- The database directory (755) and the result directory (2755) were open to other
+  users. The bridge said so in its log, with the command to run, as designed.
+- **Two database backups made by hand were mode 644 in that 755 directory, and the
+  result files were 644 in the 2755 one**: readable by every other user on the
+  login node. One of the backups was made during the v27 deployment with a plain
+  `cp`, which is how a database that was then still 644 stayed readable. The
+  bridge cannot fix these: it only warns about directories it did not create, and
+  it never saw the backups. See "After upgrading" in the README.
+
 ### 2026-10-11 (UTC), bridge v27 at `2cfc4a6`
 
 Deployed to the reference host (NeSI) and run against two live agents (`agy`,
