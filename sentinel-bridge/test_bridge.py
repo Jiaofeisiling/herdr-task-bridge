@@ -6300,3 +6300,103 @@ def test_a_connection_has_a_timeout_unless_someone_removed_it():
     # one itself; this is the one a real deployment gets.
     assert bridge.Handler.timeout is not None
     assert 0 < bridge.Handler.timeout <= 120
+
+
+# --- the bridge's files are private to its user -----------------------------
+#
+# tasks.db holds every task and result, in the clear. On a shared login node a
+# default umask of 022 leaves it readable by every other user on the machine,
+# which makes the access token beside the point: they can read the data off
+# the disk instead of asking for it.
+
+
+@pytest.fixture
+def posix_files(tmp_path, monkeypatch):
+    """Record chmod and umask instead of doing them, with modes we choose."""
+    modes = {}
+    calls = {"chmod": [], "umask": []}
+    monkeypatch.setattr(bridge, "POSIX", True)
+    monkeypatch.setattr(bridge, "_mode", lambda path: modes.get(str(path)))
+    monkeypatch.setattr(bridge.os, "chmod", lambda path, mode: calls["chmod"].append((str(path), mode)))
+    monkeypatch.setattr(bridge.os, "umask", lambda m: calls["umask"].append(m) or 0o022)
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "state" / "tasks.db"))
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "results"))
+    return modes, calls
+
+
+def test_new_files_are_created_private(posix_files):
+    _, calls = posix_files
+
+    bridge.harden_permissions()
+
+    assert calls["umask"] == [0o077]
+
+
+def test_the_umask_can_be_relaxed_for_a_deployment_that_shares_files(posix_files, monkeypatch):
+    _, calls = posix_files
+    monkeypatch.setattr(bridge, "PRIVATE_UMASK", 0o002)
+
+    bridge.harden_permissions()
+
+    assert calls["umask"] == [0o002]
+
+
+def test_a_readable_database_is_tightened(posix_files):
+    modes, calls = posix_files
+    modes[bridge.DB_PATH] = 0o644
+
+    bridge.harden_permissions()
+
+    assert (bridge.DB_PATH, 0o600) in calls["chmod"]
+
+
+def test_a_private_database_is_left_alone(posix_files):
+    modes, calls = posix_files
+    modes[bridge.DB_PATH] = 0o600
+
+    bridge.harden_permissions()
+
+    assert calls["chmod"] == []
+
+
+def test_a_directory_that_is_too_open_is_reported_not_changed(posix_files):
+    # A directory may be shared with something else (the operator can point
+    # these anywhere), and tightening one that is not ours is how a harmless
+    # setting becomes an outage. So it is named, with the command, and left.
+    modes, calls = posix_files
+    modes[bridge.RESULT_DIR] = 0o755
+    modes[os.path.dirname(bridge.DB_PATH)] = 0o755
+
+    warnings = bridge.harden_permissions()
+
+    assert calls["chmod"] == []
+    assert any(bridge.RESULT_DIR in w and "chmod 700" in w for w in warnings)
+    assert any(os.path.dirname(bridge.DB_PATH) in w for w in warnings)
+
+
+def test_nothing_is_said_when_nothing_exists_yet(posix_files):
+    assert bridge.harden_permissions() == []
+
+
+def test_a_system_without_posix_permissions_is_not_touched(posix_files, monkeypatch):
+    modes, calls = posix_files
+    monkeypatch.setattr(bridge, "POSIX", False)
+    modes[bridge.DB_PATH] = 0o644
+
+    assert bridge.harden_permissions() == []
+    assert calls == {"chmod": [], "umask": []}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX permission bits")
+def test_the_real_database_ends_up_private(tmp_path, monkeypatch):
+    db = tmp_path / "tasks.db"
+    db.write_text("x")
+    os.chmod(db, 0o644)
+    monkeypatch.setattr(bridge, "DB_PATH", str(db))
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "results"))
+    old_umask = os.umask(0o022)
+    try:
+        bridge.harden_permissions()
+        assert os.stat(db).st_mode & 0o077 == 0
+    finally:
+        os.umask(old_umask)

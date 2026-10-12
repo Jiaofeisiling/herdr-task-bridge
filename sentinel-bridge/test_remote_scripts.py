@@ -199,3 +199,17 @@ def test_the_supervisor_runs_with_nothing_set_when_there_is_no_env_file(tmp_path
     _run([str(root / "remote" / "bridge-supervisor.sh")], env)
 
     assert seen.read_text().strip() == "token=UNSET failover=UNSET"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX permission bits")
+def test_the_log_and_the_env_file_are_private_to_the_user(tmp_path):
+    root, env, seen = _supervisor_world(tmp_path, ['SENTINEL_BRIDGE_TOKEN="0123456789abcdef0123456789abcdef"'])
+    log = root / "sentinel-bridge" / "bridge.log"
+    log.write_text("an older line\n")
+    os.chmod(log, 0o644)
+    os.chmod(root / "remote" / "bridge.env", 0o644)
+
+    _run([str(root / "remote" / "bridge-supervisor.sh")], env)
+
+    assert os.stat(log).st_mode & 0o077 == 0
+    assert os.stat(root / "remote" / "bridge.env").st_mode & 0o077 == 0

@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -591,6 +592,63 @@ def auth_token_warning():
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+# Files the bridge writes hold every task and result in the clear. On a shared
+# login node a default umask of 022 leaves them readable by every other user,
+# which makes the access token beside the point: they can read the data off the
+# disk instead of asking for it. A deployment whose agents run as a different
+# user, and so need to share files, sets SENTINEL_UMASK (octal) to say so.
+POSIX = os.name == "posix"
+PRIVATE_UMASK = int(os.environ.get("SENTINEL_UMASK", "077"), 8)
+
+
+def _mode(path):
+    """Permission bits of an existing path, or None."""
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return None
+
+
+def harden_permissions():
+    """Make what the bridge writes private to its user; return warnings.
+
+    New files and directories are covered by the umask. The database is the
+    bridge's own file, so an existing one that is too open is tightened. A
+    directory is only reported, with the command to run: the operator can point
+    these anywhere, and tightening one that is shared with something else is
+    how a security setting becomes an outage.
+    """
+    if not POSIX:
+        return []
+
+    os.umask(PRIVATE_UMASK)
+
+    if PRIVATE_UMASK & 0o077 != 0o077:
+        return []          # deliberately shared; not ours to second-guess
+
+    warnings = []
+
+    mode = _mode(DB_PATH)
+    if mode is not None and mode & 0o077:
+        try:
+            os.chmod(DB_PATH, 0o600)
+        except OSError as e:
+            warnings.append(f"could not make {DB_PATH} private: {e}")
+
+    for label, path in (
+        ("the database directory", os.path.dirname(DB_PATH) or "."),
+        ("SENTINEL_RESULT_DIR", RESULT_DIR),
+    ):
+        mode = _mode(path)
+        if mode is not None and mode & 0o077:
+            warnings.append(
+                f"{label} {path} is accessible to other users (mode {mode:03o}); "
+                f"tighten it with: chmod 700 {path}"
+            )
+
+    return warnings
 
 
 def db_connect():
@@ -4306,6 +4364,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Before anything is created, so the database is born private.
+    for permission_warning in harden_permissions():
+        print(f"WARNING: {permission_warning}")
+
     init_db()
 
     worker = threading.Thread(

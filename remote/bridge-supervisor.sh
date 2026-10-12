@@ -13,6 +13,11 @@
 
 set -u
 
+# The log and bridge.env are private to this user. On a shared login node a
+# default umask leaves them readable by everyone, and the log records every
+# request while bridge.env holds the access token.
+umask 077
+
 BRIDGE_ROOT="$HOME/herdr-task-bridge"
 BRIDGE_DIR="$BRIDGE_ROOT/sentinel-bridge"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
@@ -24,6 +29,13 @@ LOG_FILE="$BRIDGE_DIR/bridge.log"
 # Sourcing it here rather than relying on ~/.bashrc means the settings hold
 # no matter how the supervisor was launched.
 ENV_FILE="$BRIDGE_ROOT/remote/bridge.env"
+
+# Tighten what holds secrets or request history before anything reads it.
+touch "$LOG_FILE" 2>/dev/null || true
+chmod 600 "$LOG_FILE" 2>/dev/null || true
+if [ -f "$ENV_FILE" ]; then
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+fi
 
 # `set -a` exports everything the file assigns. Sourcing alone only sets shell
 # variables, and bridge.env.example shows plain assignments, so without it
