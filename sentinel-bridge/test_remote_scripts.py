@@ -213,3 +213,95 @@ def test_the_log_and_the_env_file_are_private_to_the_user(tmp_path):
 
     assert os.stat(log).st_mode & 0o077 == 0
     assert os.stat(root / "remote" / "bridge.env").st_mode & 0o077 == 0
+
+
+# -- making an access token --------------------------------------------------------
+#
+# The token is the only thing standing between every user of a shared login node
+# and the agents. Making one should not mean remembering a command, and it
+# should not be a secret that passed through anyone else's hands: the script runs
+# in the operator's own terminal and shows it once.
+
+import re
+
+
+def _token_world(tmp_path, existing=None):
+    root, calls, env = _host(tmp_path)
+    shutil.copy(os.path.join(REMOTE, "bridge-set-token.sh"), root / "remote" / "bridge-set-token.sh")
+    env_file = root / "remote" / "bridge.env"
+    if existing is not None:
+        env_file.write_text(existing, newline="\n")
+    return root, env, env_file
+
+
+def _token_lines(env_file):
+    return [ln for ln in env_file.read_text().splitlines() if ln.startswith("SENTINEL_BRIDGE_TOKEN=")]
+
+
+def test_set_token_makes_a_long_random_token_and_shows_it_once(tmp_path):
+    root, env, env_file = _token_world(tmp_path)
+
+    result = _run([str(root / "remote" / "bridge-set-token.sh")], env)
+
+    assert result.returncode == 0, result.stderr
+    [line] = _token_lines(env_file)
+    token = line.split("=", 1)[1].strip('"')
+    assert re.fullmatch(r"[0-9a-f]{64}", token)
+    assert result.stdout.strip() == token         # shown exactly once, on stdout
+    assert token not in result.stderr
+
+
+def test_two_tokens_are_never_the_same(tmp_path):
+    root, env, env_file = _token_world(tmp_path)
+    first = _run([str(root / "remote" / "bridge-set-token.sh")], env).stdout.strip()
+    env_file.unlink()
+
+    second = _run([str(root / "remote" / "bridge-set-token.sh")], env).stdout.strip()
+
+    assert first != second
+
+
+def test_set_token_keeps_the_rest_of_the_file(tmp_path):
+    root, env, env_file = _token_world(tmp_path, 'SENTINEL_AGENT_PRIORITY="claude,opencode"\n# a note\n')
+
+    _run([str(root / "remote" / "bridge-set-token.sh")], env)
+
+    text = env_file.read_text()
+    assert 'SENTINEL_AGENT_PRIORITY="claude,opencode"' in text
+    assert "# a note" in text
+    assert len(_token_lines(env_file)) == 1
+
+
+def test_set_token_will_not_replace_a_token_that_is_in_use(tmp_path):
+    original = 'SENTINEL_BRIDGE_TOKEN="' + "a" * 40 + '"\n'
+    root, env, env_file = _token_world(tmp_path, original)
+
+    result = _run([str(root / "remote" / "bridge-set-token.sh")], env)
+
+    # Replacing it locks out every client until each is updated.
+    assert result.returncode != 0
+    assert "--rotate" in result.stderr
+    assert env_file.read_text() == original
+
+
+def test_rotating_replaces_the_token_and_leaves_one(tmp_path):
+    root, env, env_file = _token_world(
+        tmp_path, 'SENTINEL_BRIDGE_TOKEN="' + "a" * 40 + '"\nSENTINEL_AGENT_PRIORITY="claude"\n'
+    )
+
+    result = _run([str(root / "remote" / "bridge-set-token.sh"), "--rotate"], env)
+
+    assert result.returncode == 0, result.stderr
+    [line] = _token_lines(env_file)
+    assert "a" * 40 not in env_file.read_text()
+    assert result.stdout.strip() in line
+    assert 'SENTINEL_AGENT_PRIORITY="claude"' in env_file.read_text()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX permission bits")
+def test_the_file_that_holds_the_token_is_private(tmp_path):
+    root, env, env_file = _token_world(tmp_path)
+
+    _run([str(root / "remote" / "bridge-set-token.sh")], env)
+
+    assert os.stat(env_file).st_mode & 0o077 == 0
