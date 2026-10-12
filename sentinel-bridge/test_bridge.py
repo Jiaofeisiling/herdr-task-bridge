@@ -6762,3 +6762,69 @@ def test_a_database_made_before_the_indexes_gets_them(tmp_path, monkeypatch):
         names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     assert {"idx_tasks_status_created", "idx_tasks_created", "idx_task_events_workflow"} <= names
     assert bridge.get_task("old")["status"] == "queued"          # and nothing was lost
+
+
+# --- a task is picked up when it arrives, not at the next poll ----------------
+#
+# An idle worker used to look for work every two seconds, so a task delegated
+# just after a poll waited out the rest of it: about a second on average, added
+# to every task, before anything had even been sent to an agent.
+
+
+def test_an_idle_worker_starts_a_task_the_moment_it_is_queued(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+    # A poll so slow that only being woken can explain a quick start.
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 10)
+    monkeypatch.setattr(bridge, "execute_sentinel_task", lambda *a, **k: "done at once")
+
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    try:
+        time.sleep(0.5)                         # let it find the queue empty and go idle
+        started = time.monotonic()
+        task_id = bridge.enqueue_task("audit", 60000, "w1:p3")[0]
+
+        while bridge.get_task(task_id)["status"] != "done" and time.monotonic() - started < 6:
+            time.sleep(0.02)
+
+        assert bridge.get_task(task_id)["status"] == "done"
+        assert time.monotonic() - started < 2
+    finally:
+        stop.set()
+        bridge._work_available.set()            # let a worker that is waiting see the stop
+        worker.join(timeout=5)
+
+
+def test_a_wakeup_that_arrives_while_the_worker_is_busy_is_not_lost(tmp_path, monkeypatch):
+    # The worker clears the signal each time it wakes. A task queued while it
+    # was busy with another must still be found on its next pass.
+    _fresh_db(tmp_path, monkeypatch)
+    _only_these_agents(monkeypatch, LIVE)
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 10)
+    seen = []
+
+    def execute(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+        seen.append(task)
+        if task == "first":
+            second.append(bridge.enqueue_task("second", 60000, "w1:p3")[0])   # arrives mid-task
+        return "ok"
+
+    second = []
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    stop = threading_module.Event()
+    worker = threading_module.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    try:
+        time.sleep(0.3)
+        bridge.enqueue_task("first", 60000, "w1:p3")
+        deadline = time.monotonic() + 6
+        while len(seen) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert seen == ["first", "second"]
+    finally:
+        stop.set()
+        bridge._work_available.set()
+        worker.join(timeout=5)

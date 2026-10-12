@@ -1335,6 +1335,8 @@ def enqueue_task(task, timeout_ms, agent_name, slurm_policy=None,
             [(task_id, dependency) for dependency in depends_on],
         )
 
+    # After the commit, so what the worker wakes up to look for is there.
+    _work_available.set()
     return task_id, False
 
 
@@ -3248,6 +3250,11 @@ def acquire_agent_for_delegation(agent_name):
 
 WORKER_POLL_SECONDS = 2
 
+# Set when a task is queued, so an idle worker starts it at once instead of at
+# its next poll. The poll stays as the fallback for what no one announces: an
+# agent becoming free, a circuit expiring.
+_work_available = threading.Event()
+
 _worker_thread = None
 
 
@@ -3269,7 +3276,11 @@ def task_worker(stop_event=None):
             if task_row is None:
                 busy_this_pass.clear()
 
-                time.sleep(WORKER_POLL_SECONDS)
+                # Cleared before the next look, never after it: a task queued
+                # in between sets it again, so it is found rather than slept
+                # through.
+                _work_available.wait(WORKER_POLL_SECONDS)
+                _work_available.clear()
                 continue
 
             # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
