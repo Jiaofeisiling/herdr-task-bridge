@@ -1,9 +1,11 @@
 # Changelog
 
 The bridge reports its own version as `BRIDGE_VERSION` in `/health`; entries
-are listed against it. Earlier history is in `git log`.
+are listed against it, and releases are tagged `v4.x.y`. Earlier history is in
+`git log`. Bridge v27 was deployed to the reference host but never tagged; it
+is folded into 4.1.0.
 
-## Unreleased (bridge v28)
+## 4.1.0 (bridge v28)
 
 ### Breaking
 
@@ -56,7 +58,7 @@ are listed against it. Earlier history is in `git log`.
   take about 5 s and the worst concurrent wait was under 200 ms (1.7 s without
   the pause).
 
-## Bridge v27
+## Bridge v27 (deployed, not tagged; part of 4.1.0)
 
 ### Added
 
