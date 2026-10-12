@@ -49,17 +49,20 @@ def _free_port():
 class Bridge:
     """One running bridge.py process."""
 
-    def __init__(self, process, port, log_path):
+    def __init__(self, process, port, log_path, token=None):
         self.process = process
         self.port = port
         self.log_path = log_path
+        self.token = token
 
-    def request(self, method, path, body=None, timeout=15):
+    def request(self, method, path, body=None, timeout=15, token=True):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             payload = json.dumps(body).encode("utf-8") if body is not None else None
-            conn.request(method, path, body=payload,
-                         headers={"Content-Type": "application/json"})
+            headers = {"Content-Type": "application/json"}
+            if self.token and token:
+                headers["X-Sentinel-Token"] = self.token
+            conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
             return response.status, json.loads(response.read().decode("utf-8"))
         finally:
@@ -124,20 +127,26 @@ class World:
 
     def start_bridge(self, **env):
         port = _free_port()
+        # What the developer's own shell exports must not leak into the bridge
+        # under test; what the test asks for is applied on top, afterwards.
+        inherited_env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("SENTINEL_AGENT", "SENTINEL_BRIDGE_TOKEN",
+                         "SENTINEL_QUOTA_FAILOVER_AGENTS", "SENTINEL_AGENT_PRIORITY")
+        }
         environment = {
-            **os.environ,
+            **inherited_env,
             "HERDR_BIN": sys.executable,
             "FAKE_HERDR_DIR": str(self.fake),
             "SENTINEL_BRIDGE_PORT": str(port),
             "SENTINEL_DB": str(self.db),
             "SENTINEL_RESULT_DIR": str(self.results),
             "PYTHONUTF8": "1",
+            # Most scenarios are not about authentication, and the bridge will
+            # not start open unless told to; the ones that are pass a token.
+            "SENTINEL_ALLOW_NO_AUTH": "1",
             **{k: str(v) for k, v in env.items()},
         }
-        for inherited in ("SENTINEL_AGENT", "SENTINEL_BRIDGE_TOKEN",
-                          "SENTINEL_QUOTA_FAILOVER_AGENTS", "SENTINEL_AGENT_PRIORITY"):
-            environment.pop(inherited, None)
-
         log_path = self.root / f"bridge-{len(self.bridges)}.log"
         # A file, not a pipe: nobody reads the bridge's output while a test
         # runs, and a full pipe would block it.
@@ -148,7 +157,7 @@ class World:
         )
         log.close()
 
-        bridge = Bridge(process, port, log_path)
+        bridge = Bridge(process, port, log_path, token=env.get("SENTINEL_BRIDGE_TOKEN"))
         self.bridges.append(bridge)
 
         def healthy():
@@ -450,3 +459,37 @@ def test_the_acceptance_script_refuses_to_run_when_the_channel_is_down(world):
 
     assert done.returncode == 2
     assert "CHANNEL DOWN" in done.stdout
+
+
+# -- authentication, across a real process ---------------------------------------
+
+
+def test_a_bridge_with_a_token_answers_only_those_who_hold_it(world):
+    world.configure([ALPHA], {"alpha": {"text": "ok"}})
+    bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN="k" * 32)
+
+    # /health is open on purpose, so a probe can tell the bridge is alive.
+    assert bridge.get("/health", token=False)[0] == 200
+    assert bridge.get("/tasks", token=False)[0] == 401
+    assert bridge.post("/delegate", {"task": "x"}, token=False)[0] == 401
+    assert bridge.get("/events", token=False)[0] == 401
+
+    task_id = delegate(bridge, "audit")             # the token is sent for it
+    assert bridge.wait_status(task_id, "done")["status"] == "done"
+
+    # Nothing from the unauthenticated attempts reached an agent.
+    assert len(world.prompts()) == 1
+
+
+def test_the_acceptance_script_checks_authentication_when_given_a_token(world):
+    world.configure([ALPHA], {"alpha": {"text": json.dumps({"summary": "OK"})}})
+    token = "z" * 32
+    bridge = world.start_bridge(SENTINEL_BRIDGE_TOKEN=token)
+
+    done, report = _run_acceptance(world, bridge, "--token", token)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = report.read_text(encoding="utf-8")
+    assert "auth: the event stream refuses a caller without the token" in text
+    assert "FAIL" not in text
+    assert token not in text

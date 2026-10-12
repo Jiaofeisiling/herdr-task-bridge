@@ -114,7 +114,7 @@ workflow_id → task_id → command_run_id → slurm_job_id → artifact_id
 - [x] **Slurm 安全门控**：逐任务策略（`submit` / `test_only` / `dry_run_only`）写进 prompt 并记录在任务上，每种策略都要求回报 job ID，不明状态下绝不自动重投。属声明式而非强制——bridge 不在执行路径上，无法拦截 `sbatch`。
 - [ ] **结构化远端报告**：最终报告已结构化（artifacts、metrics、warnings、job ID），进度走文件通道；尚缺 `needs_input` 状态与实时进度事件。
 - [ ] **受控并发与写入隔离**：按 agent 并发执行异步任务，并对同项目写操作实施 single-writer 或 branch/worktree 隔离与显式交接。
-- [ ] **安全默认值**：生产部署 token 默认开启，增加 secret 管理、命令/目录 allowlist、任务级权限和审计记录。
+- [ ] **安全默认值**：已完成——没有令牌 bridge 就拒绝启动、令牌生成脚本、私有文件、请求限制和审计记录（见"配置与安全"一节）。做不到的是命令/目录白名单和任务级权限，因为 bridge 只是把文本交给 agent，由 agent 决定执行什么。
 - [ ] **可复现证据包**：最终报告固定包含 commit、workdir、命令、环境、job/task ID、日志/产物路径、指标配置、样本数及“可说/不可说”。
 - [ ] **真实端到端验收**：覆盖正常执行、bridge 重启、隧道中断、重复请求、超时/`orphaned`、授权暂停、Slurm 成败和通知恢复。
 - [ ] **发布收口**：安装/升级/卸载文档、兼容性说明、迁移脚本和一个经过 NeSI 实测的稳定 release/tag。
@@ -376,7 +376,13 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | SQLite 任务队列路径。 |
 | `SENTINEL_RESULT_DIR` | 系统临时目录中的 `sentinel-bridge-results` | agent 结果文件共用目录。 |
 | `SENTINEL_RESULT_RETENTION_DAYS` | `7` | 启动清扫删除未被取走结果文件的年龄阈值；`0` 表示关闭。 |
-| `SENTINEL_BRIDGE_TOKEN` | 未设置 | 可选的共享密钥鉴权令牌。 |
+| `SENTINEL_BRIDGE_TOKEN` | **必需** | 共享密钥鉴权令牌，至少 16 个字符。未设置时 bridge 拒绝启动。用 `remote/bridge-set-token.sh` 生成。 |
+| `SENTINEL_ALLOW_NO_AUTH` | 未设置 | 设为 `1` 允许无令牌启动。仅限别人够不到该端口的主机。 |
+| `SENTINEL_UMASK` | `077` | bridge 创建文件时用的八进制 umask。仅当 agent 以另一个用户运行时才放宽。 |
+| `SENTINEL_MAX_BODY_BYTES` | `1048576` | 请求体上限；超过则不读取、直接返回 413。 |
+| `SENTINEL_REQUEST_TIMEOUT_SEC` | `30` | 一个连接到时仍未发完请求就会被断开。 |
+| `SENTINEL_AUDIT_RETAIN_ROWS` | `50000` | 审计保留的行数，最旧的被丢弃。 |
+| `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | 客户端：作为 `X-Sentinel-Client` 发送、用于审计的标签。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
 | `SENTINEL_SLURM_POLICY` | `submit` | 部署级默认 Slurm 策略；请求里的 `slurm_policy` 可覆盖。 |
@@ -396,7 +402,22 @@ sentinel quota-reset -Agent "your-agent-name"
 
 将 [`remote/bridge.env.example`](remote/bridge.env.example) 复制为未追踪的 `remote/bridge.env`，再填写部署专用配置。绝不要提交真实主机名、项目标识、路径、用户名、任务提示词或令牌；项目的敏感信息规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-只有在 Linux 服务端和 Windows 客户端都设置了 `SENTINEL_BRIDGE_TOKEN` 后，鉴权才会启用。请使用高熵 ASCII 令牌，同时保护网络路径。为了简单存活探测，`/health` 会刻意保持无鉴权。
+在共享登录节点上，回环地址并不私密：机器上的每个用户都能访问这个端口，并通过 bridge 让 agent 以你的身份执行命令。所以 **bridge 没有令牌就不启动**，令牌短于 16 个字符也不行，并会说明原因（退出码 2）。生成方法：在主机上你自己的终端里运行下面的命令，把它只显示一次的值作为 `SENTINEL_BRIDGE_TOKEN` 交给每个客户端：
+
+```bash
+bash remote/bridge-set-token.sh           # 写入 remote/bridge.env（权限 600），令牌只显示一次
+bash remote/bridge-restart.sh
+```
+
+`bridge-restart` 会先问新的 bridge 是否接受当前设置（`bridge.py --check`），不接受就一个进程也不停，所以加上这层保护不会把正在运行的 bridge 搞挂。`--rotate` 用于替换正在使用的令牌，之后所有客户端都要更新。`/health` 不需要令牌，以便探测能判断进程是否存活；其余所有端点，包括 `/events`、`/workflows` 和 `/audit`，都需要。
+
+除令牌之外还做了什么，以及为什么不能只靠令牌：
+
+- **文件是私有的。** `tasks.db` 以明文保存每个任务和结果，默认 umask 会让节点上的其他用户都能读它。bridge 以私有 umask 运行，把已存在的数据库文件收紧到 600，并在它的数据库目录或 `SENTINEL_RESULT_DIR` 对他人开放时给出警告和要运行的命令（不会改动不是它自己创建的目录）。supervisor 把 `bridge.log` 和 `bridge.env` 设为 600。
+- **请求有界。** 超过 `SENTINEL_MAX_BODY_BYTES` 的请求体不被读取，直接 413；停滞的连接会被断开。这样本机用户无法耗尽 bridge 的内存或线程。
+- **有审计记录。** 所有非读取请求，以及每一次令牌被拒，都在回复发出**之前**写入；用 `GET /audit?after=<seq>&limit=` 读取。它不存令牌、查询串和请求体。只有一个共享令牌时它说不出"是谁"：`X-Sentinel-Client` 只是个标签。
+
+这一切并不让 bridge 变成沙箱。它把文本交给 agent，由 agent 决定执行什么，因此无法对命令或目录做白名单，`slurm_policy` 说明的是 agent 被告知了什么，而不是拦截了什么。持有令牌的人能做 agent 能做的一切：把它当密码对待，怀疑泄露就轮换。
 
 ## 参考部署：NeSI
 

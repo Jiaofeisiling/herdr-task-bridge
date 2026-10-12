@@ -37,6 +37,13 @@ refuse() {
 command -v screen >/dev/null 2>&1 || refuse "screen is not installed"
 command -v python3 >/dev/null 2>&1 || refuse "python3 is not installed"
 
+# Would the new bridge accept its own settings? Ask while the old one is still
+# running: a refusal (no access token, say) found after it was stopped is an
+# outage, and found before is a message.
+if ! bash "$SUPERVISOR" --check; then
+    refuse "a new bridge would refuse to start with the current settings (above)"
+fi
+
 # Tears down any existing `bridge` screen session (supervisor loop + whatever
 # bridge.py it is currently running) plus any orphaned bare bridge.py from
 # before the supervisor loop existed. See bridge-supervisor.sh for why

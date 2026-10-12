@@ -3648,6 +3648,8 @@ def test_a_real_signal_stops_the_bridge_in_an_orderly_way(tmp_path, sig_name):
         SENTINEL_RESULT_DIR=str(tmp_path / "results"),
         SENTINEL_SHUTDOWN_GRACE_SEC="1",
         HERDR_BIN="/bin/false",
+        # Not what is being tested; the bridge refuses to start open otherwise.
+        SENTINEL_ALLOW_NO_AUTH="1",
     )
     proc = subprocess_module.Popen(
         [sys.executable, "-u", "bridge.py"],
@@ -6213,3 +6215,425 @@ def test_the_dependency_sweep_still_works_once_a_task_has_waited(tmp_path, monke
 
     assert bridge.cancel_blocked_tasks() == 1
     assert bridge.get_task(second)["status"] == "cancelled"
+
+
+# --- a local caller must not be able to exhaust the bridge ------------------
+#
+# The bridge listens on loopback, but on a shared login node every user can
+# reach loopback. Before authentication there was no limit on how much a request
+# could claim to send or how long a connection could sit half-finished, and each
+# occupies a thread.
+
+import socket as socket_module
+
+
+def _raw(port, request, wait=5):
+    """Send raw bytes and return whatever the server answers before closing."""
+    with socket_module.create_connection(("127.0.0.1", port), timeout=wait) as s:
+        s.sendall(request)
+        chunks = []
+        try:
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        except socket_module.timeout:
+            chunks.append(b"<<timed out waiting for the server>>")
+    return b"".join(chunks)
+
+
+def test_a_request_claiming_a_huge_body_is_refused_without_reading_it(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_BODY_BYTES", 1000)
+
+    # Headers only: the body is claimed, never sent. A server that tried to read
+    # it would sit waiting, and one that allocated for it would be exhausted.
+    answer = _raw(live_server, (
+        b"POST /delegate HTTP/1.0\r\nContent-Type: application/json\r\n"
+        b"Content-Length: 99999999999\r\n\r\n"
+    ))
+
+    assert b" 413 " in answer.split(b"\r\n", 1)[0]
+    assert b"1000" in answer          # it says what the limit is
+
+
+@pytest.mark.parametrize("length", [b"abc", b"-5", b"1.5"])
+def test_a_nonsense_content_length_is_a_bad_request(live_server, length):
+    answer = _raw(live_server, (
+        b"POST /delegate HTTP/1.0\r\nContent-Length: " + length + b"\r\n\r\n"
+    ))
+
+    assert b" 400 " in answer.split(b"\r\n", 1)[0]
+
+
+def test_a_body_inside_the_limit_is_still_served(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_BODY_BYTES", 5000)
+
+    status, body = _post(live_server, "/delegate", {"task": "x" * 1000})
+
+    assert status == 202
+
+
+def test_the_size_limit_is_checked_after_authentication(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_BODY_BYTES", 1000)
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "s3cret-s3cret-s3cret")
+
+    answer = _raw(live_server, (
+        b"POST /delegate HTTP/1.0\r\nContent-Length: 99999999\r\n\r\n"
+    ))
+
+    # An unauthenticated caller learns nothing about limits: it is just refused.
+    assert b" 401 " in answer.split(b"\r\n", 1)[0]
+
+
+def test_a_connection_that_never_finishes_its_request_is_dropped(live_server, monkeypatch):
+    monkeypatch.setattr(bridge.Handler, "timeout", 1)
+
+    started = time.monotonic()
+    answer = _raw(live_server, b"POST /delegate HTTP/1.0\r\nContent-Length: 50\r\n\r\n{", wait=6)
+
+    # Closed by the server (with or without an error reply), not by our patience.
+    assert b"timed out waiting" not in answer
+    assert time.monotonic() - started < 5
+
+
+def test_a_connection_has_a_timeout_unless_someone_removed_it():
+    # socketserver's default is None: wait forever. The test above sets a short
+    # one itself; this is the one a real deployment gets.
+    assert bridge.Handler.timeout is not None
+    assert 0 < bridge.Handler.timeout <= 120
+
+
+# --- the bridge's files are private to its user -----------------------------
+#
+# tasks.db holds every task and result, in the clear. On a shared login node a
+# default umask of 022 leaves it readable by every other user on the machine,
+# which makes the access token beside the point: they can read the data off
+# the disk instead of asking for it.
+
+
+@pytest.fixture
+def posix_files(tmp_path, monkeypatch):
+    """Record chmod and umask instead of doing them, with modes we choose."""
+    modes = {}
+    calls = {"chmod": [], "umask": []}
+    monkeypatch.setattr(bridge, "POSIX", True)
+    monkeypatch.setattr(bridge, "_mode", lambda path: modes.get(str(path)))
+    monkeypatch.setattr(bridge.os, "chmod", lambda path, mode: calls["chmod"].append((str(path), mode)))
+    monkeypatch.setattr(bridge.os, "umask", lambda m: calls["umask"].append(m) or 0o022)
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "state" / "tasks.db"))
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "results"))
+    return modes, calls
+
+
+def test_new_files_are_created_private(posix_files):
+    _, calls = posix_files
+
+    bridge.harden_permissions()
+
+    assert calls["umask"] == [0o077]
+
+
+def test_the_umask_can_be_relaxed_for_a_deployment_that_shares_files(posix_files, monkeypatch):
+    _, calls = posix_files
+    monkeypatch.setattr(bridge, "PRIVATE_UMASK", 0o002)
+
+    bridge.harden_permissions()
+
+    assert calls["umask"] == [0o002]
+
+
+def test_a_readable_database_is_tightened(posix_files):
+    modes, calls = posix_files
+    modes[bridge.DB_PATH] = 0o644
+
+    bridge.harden_permissions()
+
+    assert (bridge.DB_PATH, 0o600) in calls["chmod"]
+
+
+def test_a_private_database_is_left_alone(posix_files):
+    modes, calls = posix_files
+    modes[bridge.DB_PATH] = 0o600
+
+    bridge.harden_permissions()
+
+    assert calls["chmod"] == []
+
+
+def test_a_directory_that_is_too_open_is_reported_not_changed(posix_files):
+    # A directory may be shared with something else (the operator can point
+    # these anywhere), and tightening one that is not ours is how a harmless
+    # setting becomes an outage. So it is named, with the command, and left.
+    modes, calls = posix_files
+    modes[bridge.RESULT_DIR] = 0o755
+    modes[os.path.dirname(bridge.DB_PATH)] = 0o755
+
+    warnings = bridge.harden_permissions()
+
+    assert calls["chmod"] == []
+    assert any(bridge.RESULT_DIR in w and "chmod 700" in w for w in warnings)
+    assert any(os.path.dirname(bridge.DB_PATH) in w for w in warnings)
+
+
+def test_nothing_is_said_when_nothing_exists_yet(posix_files):
+    assert bridge.harden_permissions() == []
+
+
+def test_a_system_without_posix_permissions_is_not_touched(posix_files, monkeypatch):
+    modes, calls = posix_files
+    monkeypatch.setattr(bridge, "POSIX", False)
+    modes[bridge.DB_PATH] = 0o644
+
+    assert bridge.harden_permissions() == []
+    assert calls == {"chmod": [], "umask": []}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX permission bits")
+def test_the_real_database_ends_up_private(tmp_path, monkeypatch):
+    db = tmp_path / "tasks.db"
+    db.write_text("x")
+    os.chmod(db, 0o644)
+    monkeypatch.setattr(bridge, "DB_PATH", str(db))
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path / "results"))
+    old_umask = os.umask(0o022)
+    try:
+        bridge.harden_permissions()
+        assert os.stat(db).st_mode & 0o077 == 0
+    finally:
+        os.umask(old_umask)
+
+
+# --- the bridge does not start open by accident ------------------------------
+#
+# With no SENTINEL_BRIDGE_TOKEN the bridge used to start anyway and print a
+# warning into a log nobody reads. On a shared login node that is everyone on
+# the machine able to run commands through the agents. Running without a token
+# is now something to ask for, by name.
+
+
+def test_no_token_is_a_reason_not_to_start(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "")
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", False)
+
+    [problem] = bridge.startup_security_problems()
+
+    # It says what to do about it, both ways.
+    assert "SENTINEL_BRIDGE_TOKEN" in problem
+    assert "SENTINEL_ALLOW_NO_AUTH" in problem
+
+
+def test_running_open_can_be_asked_for(monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "")
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", True)
+
+    assert bridge.startup_security_problems() == []
+
+
+def test_a_token_too_short_to_resist_guessing_is_refused(monkeypatch):
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", False)
+
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "a" * (bridge.MIN_TOKEN_LENGTH - 1))
+    [problem] = bridge.startup_security_problems()
+    assert str(bridge.MIN_TOKEN_LENGTH) in problem
+
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "a" * bridge.MIN_TOKEN_LENGTH)
+    assert bridge.startup_security_problems() == []
+
+
+def test_allowing_no_auth_does_not_excuse_a_weak_token(monkeypatch):
+    # Saying "open is fine" is not saying "a guessable secret is fine".
+    monkeypatch.setattr(bridge, "ALLOW_NO_AUTH", True)
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "short")
+
+    assert len(bridge.startup_security_problems()) == 1
+
+
+def _start_bridge_process(tmp_path, *args, **env):
+    environment = {
+        **os.environ,
+        "SENTINEL_DB": str(tmp_path / "state" / "tasks.db"),
+        "SENTINEL_RESULT_DIR": str(tmp_path / "results"),
+        "SENTINEL_BRIDGE_PORT": "0",
+        "HERDR_BIN": "this-program-does-not-exist",
+    }
+    for inherited in ("SENTINEL_BRIDGE_TOKEN", "SENTINEL_ALLOW_NO_AUTH"):
+        environment.pop(inherited, None)
+    environment.update({k: str(v) for k, v in env.items()})
+    return subprocess_module.run(
+        [sys.executable, bridge.__file__, *args],
+        env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30,
+    )
+
+
+def test_check_mode_reports_a_missing_token_and_changes_nothing(tmp_path):
+    done = _start_bridge_process(tmp_path, "--check")
+
+    assert done.returncode == 2
+    assert "SENTINEL_BRIDGE_TOKEN" in done.stdout + done.stderr
+    # A check only looks: no database, no results directory, nothing listening.
+    assert not (tmp_path / "state").exists()
+    assert not (tmp_path / "results").exists()
+
+
+def test_check_mode_passes_a_good_configuration_without_printing_the_token(tmp_path):
+    token = "t" * 32
+
+    done = _start_bridge_process(tmp_path, "--check", SENTINEL_BRIDGE_TOKEN=token)
+
+    assert done.returncode == 0
+    assert "ok" in done.stdout
+    assert token not in done.stdout + done.stderr
+
+
+def test_the_bridge_itself_refuses_to_start_without_a_token(tmp_path):
+    done = _start_bridge_process(tmp_path)
+
+    assert done.returncode == 2
+    assert "REFUSING TO START" in done.stdout + done.stderr
+    assert not (tmp_path / "state").exists()
+
+
+# --- an audit trail --------------------------------------------------------
+#
+# With one shared token there is no telling who did something, but there should
+# be a record that it was done: what was asked, how it ended, and every time the
+# token was refused. Reads that merely poll are left out, or they would drown
+# the rest; the token, the query string and the request body are never stored.
+
+
+def _audit_rows():
+    with bridge.db_session() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM audit_log ORDER BY seq")]
+
+
+def test_a_request_that_changes_something_is_recorded(live_server):
+    status, body = _post(live_server, "/delegate", {"task": "audit the disk"})
+
+    [row] = _audit_rows()
+    assert (row["method"], row["path"], row["status"]) == ("POST", "/delegate", 202)
+    assert row["task_id"] == body["task_id"]
+    assert row["at"]
+
+
+def test_cancelling_names_the_task(live_server):
+    task_id = _post(live_server, "/delegate", {"task": "x"})[1]["task_id"]
+
+    _post(live_server, f"/tasks/{task_id}/cancel", {})
+
+    assert _audit_rows()[-1]["task_id"] == task_id
+    assert _audit_rows()[-1]["path"] == f"/tasks/{task_id}/cancel"
+
+
+def test_a_refused_request_is_recorded_too(live_server):
+    _post(live_server, "/delegate", {"task": ""})            # a 400
+
+    assert _audit_rows()[-1]["status"] == 400
+
+
+def test_a_plain_read_is_not_recorded(live_server):
+    _get(live_server, "/health")
+    _get(live_server, "/tasks")
+    _get(live_server, "/events")
+
+    assert _audit_rows() == []
+
+
+def test_every_refusal_of_the_token_is_recorded_and_the_token_is_not(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "the-real-token-0123456789")
+
+    for guess in ("guess-one-0123456789", "guess-two-0123456789"):
+        conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+        conn.request("GET", "/tasks", headers={"X-Sentinel-Token": guess})
+        conn.getresponse().read()
+        conn.close()
+
+    rows = _audit_rows()
+    assert [(r["method"], r["path"], r["status"]) for r in rows] == [("GET", "/tasks", 401)] * 2
+    stored = json_module.dumps(rows)
+    for secret in ("the-real-token", "guess-one", "guess-two"):
+        assert secret not in stored
+
+
+def test_the_query_string_is_not_kept(live_server):
+    _post(live_server, "/quota/reset?agent=secret-looking-name", {})
+
+    assert _audit_rows()[-1]["path"] == "/quota/reset"
+    assert "secret-looking-name" not in json_module.dumps(_audit_rows())
+
+
+def test_a_client_can_say_who_it_is_and_it_is_kept_tidy(live_server):
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("POST", "/delegate", body=b'{"task": "x"}',
+                 headers={"Content-Type": "application/json",
+                          "X-Sentinel-Client": "sentinel.ps1 " + "x" * 100 + "\u00e9"})
+    conn.getresponse().read()
+    conn.close()
+
+    client = _audit_rows()[-1]["client"]
+    assert client.startswith("sentinel.ps1 ")
+    assert len(client) <= 64
+    assert client.isascii() and client.isprintable()
+
+
+def test_a_request_without_a_client_name_has_none(live_server):
+    _post(live_server, "/delegate", {"task": "x"})
+
+    assert _audit_rows()[-1]["client"] is None
+
+
+def test_the_trail_is_trimmed_to_the_newest_rows(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUDIT_RETAIN_ROWS", 5)
+
+    for i in range(12):
+        _post(live_server, "/delegate", {"task": f"t{i}"})
+
+    rows = _audit_rows()
+    assert len(rows) == 5
+    assert [r["seq"] for r in rows] == sorted(r["seq"] for r in rows)
+    assert rows[-1]["status"] == 202
+
+
+def test_a_failure_to_write_the_record_does_not_fail_the_request(live_server, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(bridge, "record_audit", boom)
+
+    status, body = _post(live_server, "/delegate", {"task": "x"})
+
+    assert status == 202 and body["ok"]
+
+
+def test_the_audit_endpoint_pages_through_the_trail(live_server):
+    for i in range(5):
+        _post(live_server, "/delegate", {"task": f"t{i}"})
+
+    _, first = _get(live_server, "/audit?limit=2")
+    _, rest = _get(live_server, f"/audit?after={first['next']}&limit=10")
+
+    assert len(first["entries"]) == 2
+    assert [e["seq"] for e in first["entries"] + rest["entries"]] == sorted(
+        e["seq"] for e in first["entries"] + rest["entries"]
+    )
+    assert len(first["entries"]) + len(rest["entries"]) == 5
+    # Looking at the trail does not add to it.
+    assert len(_audit_rows()) == 5
+
+
+def test_the_audit_endpoint_needs_the_token(live_server, monkeypatch):
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "the-real-token-0123456789")
+
+    conn = http.client.HTTPConnection("127.0.0.1", live_server, timeout=5)
+    conn.request("GET", "/audit")
+    response = conn.getresponse()
+    response.read()
+    conn.close()
+
+    assert response.status == 401
+
+
+def test_the_audit_endpoint_refuses_a_bad_query(live_server):
+    assert _get(live_server, "/audit?limit=0")[0] == 400
+    assert _get(live_server, "/audit?after=-1")[0] == 400
+    assert _get(live_server, "/audit?limit=100000")[0] == 400

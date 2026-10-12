@@ -13,6 +13,11 @@
 
 set -u
 
+# The log and bridge.env are private to this user. On a shared login node a
+# default umask leaves them readable by everyone, and the log records every
+# request while bridge.env holds the access token.
+umask 077
+
 BRIDGE_ROOT="$HOME/herdr-task-bridge"
 BRIDGE_DIR="$BRIDGE_ROOT/sentinel-bridge"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
@@ -24,9 +29,23 @@ LOG_FILE="$BRIDGE_DIR/bridge.log"
 # Sourcing it here rather than relying on ~/.bashrc means the settings hold
 # no matter how the supervisor was launched.
 ENV_FILE="$BRIDGE_ROOT/remote/bridge.env"
+
+# Tighten what holds secrets or request history before anything reads it.
+touch "$LOG_FILE" 2>/dev/null || true
+chmod 600 "$LOG_FILE" 2>/dev/null || true
 if [ -f "$ENV_FILE" ]; then
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+fi
+
+# `set -a` exports everything the file assigns. Sourcing alone only sets shell
+# variables, and bridge.env.example shows plain assignments, so without it
+# SENTINEL_BRIDGE_TOKEN never reached bridge.py: the bridge ran with no
+# authentication while its operator believed it was protected.
+if [ -f "$ENV_FILE" ]; then
+    set -a
     # shellcheck disable=SC1090
     . "$ENV_FILE"
+    set +a
 fi
 
 # Only pass this on when a deployment actually set one. Defaulting it to
@@ -46,6 +65,14 @@ fi
 
 cd "$BRIDGE_DIR" || exit 1
 
+# `--check` reports whether bridge.py would start with these settings, and
+# starts nothing. bridge-restart.sh runs it before stopping the running bridge:
+# a settings change that would be refused must not cost the bridge that works.
+if [ "${1:-}" = "--check" ]; then
+    python3 bridge.py --check
+    exit $?
+fi
+
 while true; do
     echo "$(date -Is) starting bridge.py (SENTINEL_AGENT=${SENTINEL_AGENT:-<auto-select>}, SENTINEL_RESULT_DIR=${SENTINEL_RESULT_DIR:-<default>})" >> "$LOG_FILE"
 
@@ -58,6 +85,13 @@ while true; do
     # no startup output at all.
     python3 -u bridge.py >> "$LOG_FILE" 2>&1
     exit_code=$?
+
+    # 2 is bridge.py refusing its own settings (no token, say). Starting it
+    # again every five seconds cannot change that, only fill the log.
+    if [ "$exit_code" -eq 2 ]; then
+        echo "$(date -Is) bridge.py refused to start (code 2) -- not restarting; fix the settings named above, then run bridge-restart" >> "$LOG_FILE"
+        exit 2
+    fi
 
     echo "$(date -Is) bridge.py exited (code $exit_code) -- restarting in 5s" >> "$LOG_FILE"
     sleep 5

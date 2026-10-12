@@ -13,12 +13,45 @@ issue.
 [README.md](README.md#架构)). It binds to `127.0.0.1` only, never
 `0.0.0.0`, so it is not directly reachable over the network by default.
 
-Authentication (`SENTINEL_BRIDGE_TOKEN`) is opt-in and off by default — with
-it disabled, **any local process that can reach the bound port can submit
-tasks to the Sentinel session**, including shell commands executed on your
-behalf. This is documented, expected behavior for a single-user local tool,
-not a vulnerability in itself. Treat any host where you run `bridge.py` as
-trusting every local process on that host.
+Loopback is not private on a shared login node: every user of the machine can
+reach `127.0.0.1:8765`, and through the bridge **have the agents run commands
+as you**. So the access token (`SENTINEL_BRIDGE_TOKEN`) is the one control that
+matters, and the bridge does not start without one:
+
+- With no token, or one shorter than 16 characters, `bridge.py` refuses to
+  start (exit 2). Running open is possible but has to be asked for by name,
+  with `SENTINEL_ALLOW_NO_AUTH=1`; it then still warns at every start.
+- `remote/bridge-set-token.sh` makes a 256-bit token in your own terminal,
+  shows it once, and writes it to `remote/bridge.env` (mode 600). It will not
+  replace a token in use without `--rotate`.
+- `bridge-restart` asks the new bridge whether it would accept its settings
+  (`bridge.py --check`) **before** stopping the running one, so a refusal costs
+  a message rather than an outage.
+- Everything except `/health` needs the token, compared in constant time.
+  `/health` answers without it so that a probe can tell the process is alive.
+
+What the token does not protect, and what is done about it:
+
+- **The data on disk.** `tasks.db` holds every task and result in the clear.
+  The bridge runs with a private umask, tightens an existing database file to
+  mode 600, and warns, with the command, when its database or result directory
+  is open to other users (it does not change a directory it did not make).
+  `bridge.log` and `bridge.env` are made mode 600 by the supervisor.
+- **Exhausting the bridge.** A request body over `SENTINEL_MAX_BODY_BYTES`
+  (1 MiB) is refused with 413 without being read, and a connection that does
+  not finish its request within `SENTINEL_REQUEST_TIMEOUT_SEC` (30 s) is
+  dropped.
+- **Knowing what was done.** Every request that is not a read, and every
+  refusal of the token, is written to an audit table before the reply goes
+  out (`GET /audit`). It stores no token, query string or request body. With one
+  shared token it cannot say *who*; the `X-Sentinel-Client` label a client
+  sends is only a label.
+
+What this is not: the bridge sends text to an agent and the agent decides what
+to run, so it cannot allow-list commands or directories. `slurm_policy` is a
+statement of what the agent was told, not a barrier. Anyone holding the token
+can do anything the agents can, so treat the token like the account's password
+and rotate it (`--rotate`) if it may have been seen.
 
 ### The result file is a clean data channel off the host
 

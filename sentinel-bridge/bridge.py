@@ -7,7 +7,9 @@ import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,7 +22,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("SENTINEL_BRIDGE_PORT", "8765"))
-BRIDGE_VERSION = 27
+BRIDGE_VERSION = 28
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 
@@ -64,6 +66,12 @@ HERDR_DEFAULT_TIMEOUT_SEC = int(os.environ.get("SENTINEL_HERDR_TIMEOUT_SEC", "30
 DEFAULT_AGENT = os.environ.get("SENTINEL_AGENT") or None
 
 AUTH_TOKEN = os.environ.get("SENTINEL_BRIDGE_TOKEN", "")
+
+# Without a token anyone who can reach the port can have the agents run commands,
+# and on a shared login node that is every user on the machine. So the bridge
+# does not start that way unless asked to, by name.
+ALLOW_NO_AUTH = os.environ.get("SENTINEL_ALLOW_NO_AUTH") == "1"
+MIN_TOKEN_LENGTH = 16
 
 DB_PATH = os.environ.get(
     "SENTINEL_DB",
@@ -377,6 +385,13 @@ TASKS_LIMIT_MAX = 200
 # counts three.
 MAX_PROMPT_BYTES = int(os.environ.get("SENTINEL_MAX_PROMPT_BYTES", "120000"))
 
+# The bridge listens on loopback, which on a shared login node every user can
+# reach. A request body is capped well above the largest legitimate one (a
+# prompt of MAX_PROMPT_BYTES plus its JSON), and a connection that does not
+# finish its request is dropped, since each one holds a thread.
+MAX_BODY_BYTES = int(os.environ.get("SENTINEL_MAX_BODY_BYTES", str(1024 * 1024)))
+REQUEST_TIMEOUT_SEC = int(os.environ.get("SENTINEL_REQUEST_TIMEOUT_SEC", "30"))
+
 
 class TaskTooLargeError(ValueError):
     reason = "task_too_large"
@@ -582,8 +597,90 @@ def auth_token_warning():
     return None
 
 
+def startup_security_problems():
+    """Reasons the bridge should not start with these settings.
+
+    Kept apart from auth_token_warning(), which only warns: these stop it.
+    """
+    problems = []
+
+    if not AUTH_TOKEN:
+        if not ALLOW_NO_AUTH:
+            problems.append(
+                "SENTINEL_BRIDGE_TOKEN is not set, so anyone who can reach "
+                f"http://{HOST}:{PORT} could have the agents run commands. Set it "
+                "to a random secret (remote/bridge-set-token.sh makes one), or "
+                "set SENTINEL_ALLOW_NO_AUTH=1 to run open knowingly."
+            )
+    elif len(AUTH_TOKEN) < MIN_TOKEN_LENGTH:
+        # Saying open is fine is not saying a guessable secret is fine.
+        problems.append(
+            f"SENTINEL_BRIDGE_TOKEN is too short to resist guessing: use at "
+            f"least {MIN_TOKEN_LENGTH} characters."
+        )
+
+    return problems
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+# Files the bridge writes hold every task and result in the clear. On a shared
+# login node a default umask of 022 leaves them readable by every other user,
+# which makes the access token beside the point: they can read the data off the
+# disk instead of asking for it. A deployment whose agents run as a different
+# user, and so need to share files, sets SENTINEL_UMASK (octal) to say so.
+POSIX = os.name == "posix"
+PRIVATE_UMASK = int(os.environ.get("SENTINEL_UMASK", "077"), 8)
+
+
+def _mode(path):
+    """Permission bits of an existing path, or None."""
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return None
+
+
+def harden_permissions():
+    """Make what the bridge writes private to its user; return warnings.
+
+    New files and directories are covered by the umask. The database is the
+    bridge's own file, so an existing one that is too open is tightened. A
+    directory is only reported, with the command to run: the operator can point
+    these anywhere, and tightening one that is shared with something else is
+    how a security setting becomes an outage.
+    """
+    if not POSIX:
+        return []
+
+    os.umask(PRIVATE_UMASK)
+
+    if PRIVATE_UMASK & 0o077 != 0o077:
+        return []          # deliberately shared; not ours to second-guess
+
+    warnings = []
+
+    mode = _mode(DB_PATH)
+    if mode is not None and mode & 0o077:
+        try:
+            os.chmod(DB_PATH, 0o600)
+        except OSError as e:
+            warnings.append(f"could not make {DB_PATH} private: {e}")
+
+    for label, path in (
+        ("the database directory", os.path.dirname(DB_PATH) or "."),
+        ("SENTINEL_RESULT_DIR", RESULT_DIR),
+    ):
+        mode = _mode(path)
+        if mode is not None and mode & 0o077:
+            warnings.append(
+                f"{label} {path} is accessible to other users (mode {mode:03o}); "
+                f"tighten it with: chmod 700 {path}"
+            )
+
+    return warnings
 
 
 def db_connect():
@@ -657,6 +754,20 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_task_events_task "
             "ON task_events(task_id)"
         )
+
+        # Who asked for what, and every refusal of the token. No token, query
+        # string or request body is ever stored here.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                status INTEGER NOT NULL,
+                client TEXT,
+                task_id TEXT
+            )
+        """)
 
         # Which tasks a task waits on. A separate table because the scheduler
         # has to ask "is everything this waits on done?" in SQL.
@@ -1339,6 +1450,46 @@ def list_events(after=0, limit=EVENTS_LIMIT_DEFAULT, task_id=None,
             f"SELECT * FROM task_events WHERE {' AND '.join(clauses)} "
             "ORDER BY seq ASC LIMIT ?",
             [*params, limit],
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+AUDIT_RETAIN_ROWS = int(os.environ.get("SENTINEL_AUDIT_RETAIN_ROWS", "50000"))
+
+
+def clean_client_label(value):
+    """A client's self-declared name, made safe to store, or None.
+
+    It is only a label the caller chose: with one shared token nothing proves it.
+    """
+    if not value:
+        return None
+
+    cleaned = "".join(c for c in value if c.isascii() and c.isprintable())[:64].strip()
+    return cleaned or None
+
+
+def record_audit(method, path, status, client=None, task_id=None):
+    """Append one row, and drop the oldest beyond AUDIT_RETAIN_ROWS."""
+    with db_session() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (at, method, path, status, client, task_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (now_iso(), method, path, status, client, task_id),
+        )
+        conn.execute(
+            "DELETE FROM audit_log WHERE seq <= "
+            "(SELECT MAX(seq) FROM audit_log) - ?",
+            (AUDIT_RETAIN_ROWS,),
+        )
+
+
+def list_audit(after=0, limit=EVENTS_LIMIT_DEFAULT):
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+            (after, limit),
         ).fetchall()
 
     return [dict(row) for row in rows]
@@ -3359,6 +3510,10 @@ def graceful_shutdown(server, grace_sec=None, signame="signal"):
 
 class Handler(BaseHTTPRequestHandler):
 
+    # Applies to reading the request and writing the reply, not to the time the
+    # bridge spends working in between, so a slow /ask is unaffected.
+    timeout = REQUEST_TIMEOUT_SEC
+
     def log_message(self, format, *args):
         # 保留最基本日志即可。
         print(
@@ -3368,6 +3523,12 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def send_json(self, obj, status=200):
+        # Recorded before the reply goes out, so that a caller who has been told
+        # something happened can rely on the trail saying so, and a bridge killed
+        # between the two cannot have done it unrecorded.
+        task_id = obj.get("task_id") if isinstance(obj, dict) else None
+        self._audit(status, task_id if isinstance(task_id, str) else None)
+
         data = json.dumps(
             obj,
             ensure_ascii=False,
@@ -3436,6 +3597,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         with track_inflight():
             self._do_GET_guarded()
+
+    def _audit(self, status, task_id):
+        """Record this request if it is the kind worth a record.
+
+        Anything that is not a read, and every refusal of the token. Polling
+        reads are left out; they would bury the rest.
+        """
+        if getattr(self, "_audited", False):
+            return
+
+        self._audited = True
+
+        if self.command == "GET" and status != 401:
+            return
+
+        try:
+            record_audit(
+                self.command,
+                urlparse(self.path).path[:200],
+                status,
+                clean_client_label(self.headers.get("X-Sentinel-Client")),
+                task_id,
+            )
+        except Exception as e:
+            # A trail that cannot be written must not take the request with it.
+            print(f"[audit] could not record a {self.command} request: {e}")
 
     def _do_GET_guarded(self):
         try:
@@ -3718,6 +3905,27 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if path == "/audit":
+            try:
+                after, limit, _, _, _ = validate_events_query({
+                    k: v for k, v in parse_qs(
+                        urlparse(self.path).query, keep_blank_values=True
+                    ).items() if k in ("after", "limit")
+                })
+            except (TypeError, ValueError) as e:
+                self.send_json(
+                    {"ok": False, "error": f"invalid request: {e}"}, 400
+                )
+                return
+
+            entries = list_audit(after, limit)
+            self.send_json({
+                "ok": True,
+                "entries": entries,
+                "next": entries[-1]["seq"] if entries else after,
+            })
+            return
+
         if path == "/events":
             try:
                 after, limit, wait, task_id, workflow_id = validate_events_query(
@@ -3873,6 +4081,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if not (self.command == "GET" and path == "/health") and not self.check_auth():
             self.send_json({"ok": False, "error": "unauthorized"}, 401)
+            return
+
+        # After authentication, so a caller without the token learns nothing
+        # about the limits. Refused on the header alone: the body is never read.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+
+        if length < 0:
+            self.send_json({"ok": False, "error": "invalid Content-Length"}, 400)
+            self.close_connection = True
+            return
+
+        if length > MAX_BODY_BYTES:
+            self.send_json({
+                "ok": False,
+                "error": f"request body too large: the limit is {MAX_BODY_BYTES} bytes",
+            }, 413)
+            self.close_connection = True
             return
 
         if path.startswith("/tasks/") and path.endswith("/cancel"):
@@ -4275,6 +4503,27 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    problems = startup_security_problems()
+
+    # `--check` only looks. The restart script runs it before stopping the
+    # running bridge, so a settings change that would be refused costs nothing.
+    if "--check" in sys.argv[1:]:
+        for problem in problems:
+            print(f"bridge --check: REFUSED -- {problem}")
+        if not problems:
+            print("bridge --check: ok "
+                  f"(authentication: {'on' if AUTH_TOKEN else 'OFF, by request'})")
+        sys.exit(2 if problems else 0)
+
+    if problems:
+        for problem in problems:
+            print(f"REFUSING TO START: {problem}")
+        sys.exit(2)
+
+    # Before anything is created, so the database is born private.
+    for permission_warning in harden_permissions():
+        print(f"WARNING: {permission_warning}")
+
     init_db()
 
     worker = threading.Thread(

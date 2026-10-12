@@ -120,7 +120,11 @@ BeforeAll {
     }
 
     function Wait-SentinelExit {
-        param([Parameter(Mandatory = $true)]$Process, [int]$TimeoutMs = 10000)
+        # Not a bound on the client, whose own timeouts are tested separately: only
+        # how long a test waits for a process it started. A cold PowerShell on a
+        # busy machine can take longer than ten seconds merely to start, which
+        # failed an unrelated test about once in four runs.
+        param([Parameter(Mandatory = $true)]$Process, [int]$TimeoutMs = 30000)
 
         if (-not $Process.WaitForExit($TimeoutMs)) {
             $Process.Kill()
@@ -1400,6 +1404,43 @@ Describe "events" {
             $result.ExitCode | Should -Not -Be 0
             # Refused for the wait itself, not merely for being an unknown command.
             $result.StdErr | Should -Match "WaitSec"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+}
+
+
+Describe "who the client says it is" {
+    # The bridge keeps an audit trail. One shared token cannot say who made a
+    # request, so a client names itself, as a label rather than a proof.
+
+    It "names itself on every request" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("health")
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.Headers["X-Sentinel-Client"] | Should -Be "sentinel.ps1"
+        }
+        finally { $stub.Listener.Stop() }
+    }
+
+    It "uses the name the operator gave it" {
+        $stub = Start-StubListener
+        try {
+            $proc = Start-SentinelUnderTest -BaseUrl $stub.BaseUrl -ScriptArgs @("health") `
+                -Env @{ SENTINEL_CLIENT_NAME = "claude-code on laptop" }
+
+            $req = Receive-StubRequest -Listener $stub.Listener -TimeoutMs 8000
+            $req | Should -Not -BeNullOrEmpty
+            Send-StubResponse -Context $req.Context -Status 200 -Payload @{ ok = $true }
+            Wait-SentinelExit -Process $proc | Out-Null
+
+            $req.Context.Request.Headers["X-Sentinel-Client"] | Should -Be "claude-code on laptop"
         }
         finally { $stub.Listener.Stop() }
     }
