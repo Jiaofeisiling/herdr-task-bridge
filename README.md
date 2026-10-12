@@ -114,7 +114,7 @@ Not yet. Below is the acceptance checklist from v4 to that point. Only once ever
 - [x] **Slurm safety gate** — a per-task policy (`submit` / `test_only` / `dry_run_only`) stated in the prompt and recorded against the task, job IDs requested in every result, and no automatic resubmission from an unknown state. Declared rather than enforced: the bridge is not in the execution path and cannot block an `sbatch`.
 - [ ] **Structured remote reporting** — the final report is structured (artifacts, metrics, warnings, job IDs) and progress travels a file channel; still missing are a `needs_input` state and live progress events.
 - [ ] **Controlled concurrency and write isolation** — execute asynchronous tasks concurrently per agent, with single-writer or branch/worktree isolation and explicit handover for writes to the same project.
-- [ ] **Secure defaults** — token authentication on by default for production deployments, plus secret management, command/directory allowlists, per-task permissions, and audit records.
+- [ ] **Secure defaults** — done: the bridge refuses to start without a token, a token script, private files, request limits and an audit trail (see [Configuration and security](#configuration-and-security)). Not possible: command and directory allowlists and per-task permissions, because the bridge sends text to an agent and the agent decides what to run.
 - [ ] **Reproducible evidence bundle** — a final report that always carries the commit, workdir, commands, environment, job/task IDs, log and artifact paths, metric configuration, sample counts, and what may and may not be claimed.
 - [ ] **Real end-to-end acceptance** — covering normal execution, bridge restart, tunnel interruption, duplicate requests, timeout/`orphaned`, authorisation pauses, Slurm success and failure, and notification recovery.
 - [ ] **Release readiness** — install/upgrade/uninstall documentation, compatibility notes, migration scripts, and a stable release/tag verified on real NeSI.
@@ -376,7 +376,13 @@ The remote service reads the following environment variables:
 | `SENTINEL_DB` | `~/sentinel-bridge/tasks.db` | SQLite task-queue path. |
 | `SENTINEL_RESULT_DIR` | System temp directory / `sentinel-bridge-results` | Shared directory for agent result files. |
 | `SENTINEL_RESULT_RETENTION_DAYS` | `7` | Age at which the startup sweep deletes uncollected result files. `0` disables it. |
-| `SENTINEL_BRIDGE_TOKEN` | unset | Optional shared-secret authentication token. |
+| `SENTINEL_BRIDGE_TOKEN` | **required** | Shared-secret authentication token, at least 16 characters. Without it the bridge refuses to start. Make one with `remote/bridge-set-token.sh`. |
+| `SENTINEL_ALLOW_NO_AUTH` | unset | `1` lets the bridge start with no token. For a host nobody else can reach. |
+| `SENTINEL_UMASK` | `077` | Octal umask for files the bridge creates. Relax it only if agents run as another user. |
+| `SENTINEL_MAX_BODY_BYTES` | `1048576` | Largest request body; larger is refused with 413 unread. |
+| `SENTINEL_REQUEST_TIMEOUT_SEC` | `30` | A connection that has not finished its request by then is dropped. |
+| `SENTINEL_AUDIT_RETAIN_ROWS` | `50000` | Audit rows kept; the oldest are dropped. |
+| `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | Client-side: the label sent as `X-Sentinel-Client` for the audit trail. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |
 | `SENTINEL_SLURM_POLICY` | `submit` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
@@ -396,7 +402,22 @@ The remote service reads the following environment variables:
 
 Copy [`remote/bridge.env.example`](remote/bridge.env.example) to the untracked `remote/bridge.env` for deployment-specific values. Never commit real hostnames, project identifiers, paths, usernames, prompts, or tokens; see [CONTRIBUTING.md](CONTRIBUTING.md) for the project's sensitive-data rules.
 
-Authentication is disabled until `SENTINEL_BRIDGE_TOKEN` is set on both the Linux service and Windows client. Use an ASCII-only, high-entropy token and protect the network path as well. `/health` intentionally remains unauthenticated so it can be used for simple liveness probes.
+Loopback is not private on a shared login node: every user of the machine can reach the port and, through the bridge, have the agents run commands as you. So **the bridge does not start without a token**, or with one shorter than 16 characters, and says why (exit 2). To make one, run this in your own terminal on the host and give the value it prints once to each client as `SENTINEL_BRIDGE_TOKEN`:
+
+```bash
+bash remote/bridge-set-token.sh           # writes remote/bridge.env (mode 600), prints the token once
+bash remote/bridge-restart.sh
+```
+
+`bridge-restart` first asks the new bridge whether it would accept its settings (`bridge.py --check`) and stops nothing if not, so adding this protection cannot take down the bridge that is running. `--rotate` replaces a token in use; every client must then be updated. `/health` answers without the token so a probe can tell the process is alive; everything else, including `/events`, `/workflows` and `/audit`, needs it.
+
+What else is done, and why it is not left to the token alone:
+
+- **Files are private.** `tasks.db` holds every task and result in the clear, and a default umask leaves it readable by every other user on the node. The bridge runs with a private umask, tightens an existing database file to mode 600, and warns, with the command to run, if its database directory or `SENTINEL_RESULT_DIR` is open to others (it does not change a directory it did not create). The supervisor makes `bridge.log` and `bridge.env` mode 600.
+- **Requests are bounded.** A body over `SENTINEL_MAX_BODY_BYTES` is refused with 413 without being read, and a connection that stalls is dropped, so a local user cannot exhaust the bridge's memory or threads.
+- **There is an audit trail.** Every request that is not a read, and every refusal of the token, is written before the reply is sent; read it with `GET /audit?after=<seq>&limit=`. It stores no token, query string or request body. With one shared token it cannot say who: the `X-Sentinel-Client` label is only a label.
+
+None of this makes the bridge a sandbox. It sends text to an agent and the agent decides what to run, so it cannot allow-list commands or directories, and `slurm_policy` states what the agent was told rather than blocking anything. Whoever holds the token can do what the agents can: treat it like a password, and rotate it if it may have been seen.
 
 ## Reference deployment: NeSI
 

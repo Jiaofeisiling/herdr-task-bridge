@@ -3,7 +3,39 @@
 The bridge reports its own version as `BRIDGE_VERSION` in `/health`; entries
 are listed against it. Earlier history is in `git log`.
 
-## Unreleased (bridge v27)
+## Unreleased (bridge v28)
+
+### Breaking
+
+- **The bridge does not start without an access token.** With no
+  `SENTINEL_BRIDGE_TOKEN`, or one shorter than 16 characters, `bridge.py` exits
+  with status 2. `SENTINEL_ALLOW_NO_AUTH=1` runs open knowingly. Before
+  deploying this version, make a token with `remote/bridge-set-token.sh` and
+  give it to every client. `bridge-restart` checks first (`bridge.py --check`)
+  and stops nothing if the new bridge would refuse, so a missing token costs a
+  message, not an outage.
+
+### Security
+
+- A token set in `bridge.env` now reaches `bridge.py`. The supervisor only
+  sourced the file, which sets shell variables without exporting them, so the
+  token the example file showed never took effect and the bridge ran open
+  without saying so.
+- `remote/bridge-set-token.sh` makes a 256-bit token in the operator's own
+  terminal, shows it once, and writes it to `bridge.env` (mode 600).
+- Files are private: a private umask, an existing `tasks.db` tightened to mode
+  600, warnings (with the command) when the database directory or the result
+  directory is open to others, and `bridge.log` and `bridge.env` set to 600 by
+  the supervisor.
+- Request bodies over `SENTINEL_MAX_BODY_BYTES` (1 MiB) are refused unread, and
+  a connection that stalls for `SENTINEL_REQUEST_TIMEOUT_SEC` is dropped.
+- An audit trail: every request that is not a read, and every refusal of the
+  token, is recorded before the reply goes out. `GET /audit`. No token, query
+  string or request body is stored. `sentinel.ps1` sends `X-Sentinel-Client`.
+- The supervisor stops instead of restarting every five seconds when
+  `bridge.py` refuses its own settings.
+
+## Bridge v27
 
 ### Added
 
