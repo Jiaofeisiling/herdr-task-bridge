@@ -423,6 +423,16 @@ bash remote/bridge-restart.sh
 - **请求有界。** 超过 `SENTINEL_MAX_BODY_BYTES` 的请求体不被读取，直接 413；停滞的连接会被断开。这样本机用户无法耗尽 bridge 的内存或线程。
 - **有审计记录。** 所有非读取请求，以及每一次令牌被拒，都在回复发出**之前**写入；用 `GET /audit?after=<seq>&limit=` 读取。它不存令牌、查询串和请求体。只有一个共享令牌时它说不出"是谁"：`X-Sentinel-Client` 只是个标签。
 
+**升级之后，要收紧已经存在的东西。** bridge 会把它新创建的东西设为私有，也会收紧它自己的数据库，但对不是它创建的目录只会*警告*，对你手工复制出来的副本更是无从知晓。在共享登录节点上，请在主机上运行下面这些（路径换成你自己的 `SENTINEL_DB` 和 `SENTINEL_RESULT_DIR`；bridge 的启动日志会打印出确切的命令）：
+
+```
+chmod 700 <放 tasks.db 的目录>
+chmod 700 <SENTINEL_RESULT_DIR>
+chmod 600 <放 tasks.db 的目录>/*.bak       # 你手工做过的任何备份
+```
+
+用普通的 `cp` 做备份，得到的权限就是复制当时数据库的权限，而 v28 之前的 bridge 下它是 644。备份请用 `cp -p` 再 `chmod 600`，或者在 `umask 077` 的 shell 里做。Agent 写的文件（结果、进度）用的是 Agent 自己的 umask，所以让它们保持私有的是目录上的 `700`。
+
 这一切并不让 bridge 变成沙箱。它把文本交给 agent，由 agent 决定执行什么，因此无法对命令或目录做白名单，`slurm_policy` 说明的是 agent 被告知了什么，而不是拦截了什么。持有令牌的人能做 agent 能做的一切：把它当密码对待，怀疑泄露就轮换。
 
 ## 参考部署：NeSI

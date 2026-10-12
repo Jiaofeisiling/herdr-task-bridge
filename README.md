@@ -423,6 +423,16 @@ What else is done, and why it is not left to the token alone:
 - **Requests are bounded.** A body over `SENTINEL_MAX_BODY_BYTES` is refused with 413 without being read, and a connection that stalls is dropped, so a local user cannot exhaust the bridge's memory or threads.
 - **There is an audit trail.** Every request that is not a read, and every refusal of the token, is written before the reply is sent; read it with `GET /audit?after=<seq>&limit=`. It stores no token, query string or request body. With one shared token it cannot say who: the `X-Sentinel-Client` label is only a label.
 
+**After upgrading, tighten what already exists.** The bridge makes what it creates private and tightens its own database, but it only *warns* about a directory it did not create, and it cannot know about copies you made. On a shared login node, run these on the host (adjust the paths to your `SENTINEL_DB` and `SENTINEL_RESULT_DIR`; the bridge's startup log prints the exact commands):
+
+```
+chmod 700 <the directory holding tasks.db>
+chmod 700 <SENTINEL_RESULT_DIR>
+chmod 600 <the directory holding tasks.db>/*.bak       # any backups you made by hand
+```
+
+A backup made with a plain `cp` takes the mode the database had at the time, which on a bridge older than v28 was 644. Make backups with `cp -p` followed by `chmod 600`, or from a shell with `umask 077`. Files that agents write (results, progress) get the agents' own umask, so it is the directory's `700` that keeps them private.
+
 None of this makes the bridge a sandbox. It sends text to an agent and the agent decides what to run, so it cannot allow-list commands or directories, and `slurm_policy` states what the agent was told rather than blocking anything. Whoever holds the token can do what the agents can: treat it like a password, and rotate it if it may have been seen.
 
 ## Reference deployment: NeSI
