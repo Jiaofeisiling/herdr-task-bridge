@@ -1417,6 +1417,12 @@ def cancel_blocked_tasks():
 
     while True:
         with db_session() as conn:
+            # Most deployments never declare a dependency, and this runs on
+            # every worker pass: don't scan the tasks table for work that
+            # cannot exist.
+            if conn.execute("SELECT 1 FROM task_deps LIMIT 1").fetchone() is None:
+                return cancelled
+
             blocked = conn.execute(f"""
                 SELECT t.task_id AS task_id, u.task_id AS upstream,
                        u.status AS upstream_status

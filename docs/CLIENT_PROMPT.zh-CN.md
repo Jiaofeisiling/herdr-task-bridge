@@ -60,10 +60,14 @@ bridge 的状态是未知，不是故障**——远端多半跑得好好的。�
 GET  /health              桥的版本与存活状态
 GET  /agents              所有 agent：name、pane_id、agent_status、cwd
 GET  /tasks/<task_id>     单个任务的状态与结果
+GET  /workflows/<id>      一个 workflow 里的全部任务及进度
+GET  /events              游标之后的状态变更（见"监听变化"）
 GET  /quota               当前因额度被熔断的 agent
 POST /ask                 同步执行，阻塞直到有结果
 POST /delegate            异步入队，立即返回 task_id
-     body: {"task": "...", "agent": "...", "timeout_ms": N}
+     body: {"task": "...", "agent": "...", "timeout_ms": N,
+            "workflow_id": "...", "depends_on": ["<task_id>", ...]}
+POST /tasks/<task_id>/cancel   取消仍在排队的任务
 
 **默认不要指定 agent**——省略它，桥会自动挑一个当下能接活的。指定某个
 agent 意味着任务只能等它，别的 agent 再空闲也不会接手；只有确实需要它的
@@ -76,7 +80,8 @@ agent 意味着任务只能等它，别的 agent 再空闲也不会接手；只�
 queued            尚未开始。`queued_reason` 字段会说明原因——通常是目标
                   agent 正忙。这不是故障，等着就行；若它说该 agent 根本
                   不在运行，就重新派发且不要指定 agent
-done              完成，result_text 是结果
+done              完成，result_text 是结果；agent 写了 JSON 时，result_data
+                  把它拆成字段
 error             执行或结果收集失败，见 error_text
 error / orphaned  不一定是终态。如果 agent 在桥放弃等待之后才交付结果，该
                   任务会自己变成 done，并带上 `recovered_at`。ask 返回 504
@@ -85,6 +90,46 @@ error / orphaned  不一定是终态。如果 agent 在桥放弃等待之后才�
 orphaned          桥在任务执行期间重启了。任务可能已部分或全部执行完，
                   不要假定它没跑过
 quota_exhausted   所有合资格备用 agent 都被额度熔断，任务不会再重试
+cancelled         在开始之前就被叫停——被你取消，或它所等待的任务失败了。
+                  什么都没运行，可放心重新提交
+
+## 读取结果
+
+优先读 `result_data`，不要自己去解析 `result_text`。agent 把结果写成 JSON 对象时，
+`result_format` 是 `json`，`result_data` 带有 `summary`、`status`、`job_ids`、
+`artifacts`、`metrics`、`warnings`、`changed_files`；否则 `result_format` 是 `text`，
+只有 `result_text`。`result_text` 永远是 agent 的原话。
+
+有两个东西都叫 status。任务自己的 `status` 只说明桥有没有把结果送到；
+`result_data.status`（`success`、`partial`、`failed`、`blocked`）是 agent 对这项
+工作的说法。任务可以是 `done` 而 `result_data.status` 为 `failed`：要按"作业失败"
+汇报，不能当成功。`done` 任务的 `error_text` 里若有说明，可能是 agent 写的 JSON
+不可用、被按文本保留了；工作本身是交付了的。
+
+## 互相依赖的步骤
+
+把相关任务放进同一个 `workflow_id`，用 `depends_on` 写明一个任务要等哪些任务先
+完成。它会一直保持 `queued`，直到列出的每一个都是 `done`，期间 worker 会去跑别的。
+`queued_reason` 会说明它在等谁；`workflow <id>` 能看到全貌（`state` 为
+`in_progress`、`done`、`failed` 或 `cancelled`）。
+
+- 只能依赖已经存在的任务，所以先提交第一步，再用它的 task_id 提交第二步。依赖一个
+  已经失败的任务会被 422 拒绝。
+- 某一步失败时，所有等它的任务都会被取消，且从未发给任何 agent，可放心重新提交。
+  以 `orphaned` 结束的步骤也算在内，但它的结果可能还会迟到：重新提交被它挡住的
+  工作之前，先查一次它。
+- `cancel <task_id>` 能停止仍在排队的任务；已经开始的停不了（409），而且它不会
+  取消任务已经提交的 Slurm 作业——那是另一个动作，与任何其他取消受同样的授权
+  范围限制。
+- `-Reroute any` 允许桥在指定的 agent 已消失时，把任务改派给别的 agent。你很少用得
+  上：不指定 agent，这个问题根本不会出现。
+
+## 监听变化
+
+`events` 列出游标之后的状态变更（任务被创建、开始、完成、取消）。保存它返回的
+`next`，下次作为 `-After` 传入：即使中间断线重连，也不会漏、不会重。`-WaitSec 20`
+会让请求挂起到有事发生为止，比循环轮询 `task` 省事。事件只记录状态变更，不记录
+agent 正在做什么。
 
 ## Slurm 作业：大胆提交
 
@@ -218,6 +263,10 @@ herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocke
 | `400 task_too_large` | 任务超过约 120 KB | 把材料写进主机上的文件，让任务去读 |
 | `409 busy` | 该 agent 腾不出手 | 正常。省略 `-Agent`，或者等 |
 | `422` | `-IdempotencyKey` 被拿去配了不同的参数 | 换一个新 key |
+| `422 unknown_dependency` / `dependency_failed` | `depends_on` 里有不存在的任务，或已经失败的任务 | 改正 id；若它已失败，先处理那个任务 |
+| 退出码 6、`cancelled` | 在开始之前就被叫停：你取消了它，或它所等待的任务失败了 | 什么都没运行。`error_text` 会说明是哪种。原因处理后再重新提交 |
+| `cancel` 返回 `409` | 任务已经开始或结束 | 停不了它。等它结束，再判断结果 |
+| `done` 且 `result_data.status: failed` | 桥送达了结果；agent 说工作失败了 | 按"作业失败"汇报，不能当成功 |
 | `429` | 队列满了 | 等任务跑完。不要继续堆 |
 | `404 agent_not_found` | 你指定的 agent 不存在 | 运行 `agents`。省略 `-Agent` |
 | `health` 报 `worker_dead`（503） | 桥的 worker 线程挂了 | 告诉用户桥需要重启 |

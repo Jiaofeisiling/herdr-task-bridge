@@ -384,3 +384,69 @@ def test_the_event_stream_records_a_tasks_whole_life_over_http(world):
     assert [(e["from_status"], e["to_status"]) for e in events] == [
         (None, "queued"), ("queued", "running"), ("running", "done"),
     ]
+
+
+# -- the acceptance script itself ---------------------------------------------
+#
+# scripts/acceptance.py is for running against a real bridge and real agents.
+# It is only worth carrying out there if it is known to work, so it is run here
+# against the real bridge and the fake herdr.
+
+ACCEPTANCE = os.path.join(HERE, "..", "scripts", "acceptance.py")
+
+
+def _run_acceptance(world, bridge, *extra):
+    report = world.root / "report.md"
+    done = subprocess.run(
+        [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{bridge.port}",
+         "--yes", "--report", str(report), *extra],
+        capture_output=True, text=True, encoding="utf-8", timeout=240,
+    )
+    return done, report
+
+
+def test_the_acceptance_script_passes_against_a_working_bridge(world):
+    world.configure(
+        [{**ALPHA, "name": "secret-agent-name"}],
+        {"secret-agent-name": {"text": json.dumps({"status": "success", "summary": "OK"})}},
+    )
+    bridge = world.start_bridge()
+
+    done, report = _run_acceptance(world, bridge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = report.read_text(encoding="utf-8")
+    assert "FAIL" not in text
+    for claim in ("structured result", "dependency", "never sent", "event", "idempotency"):
+        assert claim in text.lower(), claim
+
+    # A report is meant to be shared: it names what kind of agent ran, never
+    # which agent, and nothing about the host.
+    assert "secret-agent-name" not in text
+    assert "w1:p" not in text
+    assert str(world.root) not in text
+
+
+def test_the_acceptance_script_sends_nothing_without_being_told_to(world):
+    world.configure([ALPHA], {"alpha": {"text": "ok"}})
+    bridge = world.start_bridge()
+
+    done = subprocess.run(
+        [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{bridge.port}"],
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+
+    assert done.returncode == 2
+    assert "--yes" in done.stdout
+    assert world.prompts() == []
+    assert bridge.get("/tasks")[1]["tasks"] == []
+
+
+def test_the_acceptance_script_refuses_to_run_when_the_channel_is_down(world):
+    done = subprocess.run(
+        [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{_free_port()}", "--yes"],
+        capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+
+    assert done.returncode == 2
+    assert "CHANNEL DOWN" in done.stdout

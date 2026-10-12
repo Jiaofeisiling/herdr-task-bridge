@@ -6183,3 +6183,33 @@ def test_workflow_and_idempotency_labels_are_judged_alike():
             bridge.validate_idempotency_key(bad)
         with pytest.raises(ValueError):
             bridge.validate_workflow_id(bad)
+
+
+def test_the_dependency_sweep_costs_nothing_when_no_task_has_ever_waited(tmp_path, monkeypatch):
+    # The worker runs the sweep on every pass, and most deployments never use
+    # depends_on: for them it should not scan the tasks table at all.
+    _fresh_db(tmp_path, monkeypatch)
+    bridge.create_task("audit", 60000, "w1:p1")
+    statements = []
+    real = bridge.db_connect
+
+    def traced():
+        conn = real()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(bridge, "db_connect", traced)
+
+    assert bridge.cancel_blocked_tasks() == 0
+    assert not any("JOIN" in statement for statement in statements)
+
+
+def test_the_dependency_sweep_still_works_once_a_task_has_waited(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    first = bridge.create_task("a", 60000, "w1:p1")
+    second = bridge.enqueue_task("b", 60000, "w1:p1", depends_on=[first])[0]
+    bridge.claim_task(first)
+    bridge.fail_task(first, "broke")
+
+    assert bridge.cancel_blocked_tasks() == 1
+    assert bridge.get_task(second)["status"] == "cancelled"

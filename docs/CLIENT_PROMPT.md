@@ -72,10 +72,14 @@ used.
 GET  /health              bridge version and liveness
 GET  /agents              every agent: name, pane_id, agent_status, cwd
 GET  /tasks/<task_id>     one task's status, result, and progress so far
+GET  /workflows/<id>      every task in one workflow, and how far along it is
+GET  /events              status changes after a cursor (see "Watching")
 GET  /quota               agents currently circuit-broken on quota
 POST /ask                 synchronous; blocks until there is a result
 POST /delegate            asynchronous; returns a task_id immediately
-     body: {"task": "...", "agent": "...", "timeout_ms": N}
+     body: {"task": "...", "agent": "...", "timeout_ms": N,
+            "workflow_id": "...", "depends_on": ["<task_id>", ...]}
+POST /tasks/<task_id>/cancel   cancel a task that is still queued
 
 **Prefer not to name an agent.** Omit it and the bridge picks one that
 can take work now. Naming one ties the task to that agent, so it waits
@@ -92,7 +96,8 @@ queued            not started yet. The `queued_reason` field says why --
                   usually the target agent is busy. That is not a fault;
                   wait. If it says the agent is not running at all,
                   delegate again without naming an agent
-done              finished; result_text holds the answer
+done              finished; result_text holds the answer, and result_data
+                  holds it as fields when the agent wrote JSON
 error             execution or result collection failed; see error_text
 error / orphaned  not always final. If the agent delivers after the bridge
                   gave up, the task turns into done by itself, with
@@ -103,6 +108,54 @@ orphaned          the bridge restarted mid-task. It may have run partly
                   or completely -- do not assume it did not run
 quota_exhausted   every eligible fallback agent was quota-blocked; the
                   task will not be retried
+cancelled         stopped before it started -- by you, or because a task it
+                  waited on failed. Nothing ran; resubmitting is safe
+
+## Reading a result
+
+Prefer `result_data` to parsing `result_text`. When the agent wrote its result
+as a JSON object, `result_format` is `json` and `result_data` carries
+`summary`, `status`, `job_ids`, `artifacts`, `metrics`, `warnings` and
+`changed_files`. Otherwise `result_format` is `text` and `result_text` is all
+there is. `result_text` is always the agent's original words.
+
+Two different things are called status. The task's own `status` says whether
+the bridge delivered a result. `result_data.status` (`success`, `partial`,
+`failed`, `blocked`) is the agent's account of the work. A task can be `done`
+with `result_data.status` of `failed`: report that as a failed job, not a
+successful one. A note in `error_text` on a `done` task can mean the agent's
+JSON was unusable and was kept as text; the work itself was delivered.
+
+## Steps that depend on each other
+
+Give related tasks one `workflow_id`, and name what a task needs finished first
+in `depends_on`. It stays queued until every task it names is `done`, and the
+worker runs other things meanwhile. `queued_reason` says what it is waiting
+for; `workflow <id>` shows the whole picture (`state` is `in_progress`, `done`,
+`failed`, or `cancelled`).
+
+- You can only depend on a task that already exists, so submit the first step
+  and use its task_id for the second. A dependency that has already failed is
+  refused with 422.
+- If a step fails, everything that waited on it is cancelled and was never sent
+  to any agent, so resubmitting it is safe. That includes a step that ended
+  `orphaned`, whose result may still arrive late: check it before resubmitting
+  the work it was blocking.
+- `cancel <task_id>` stops a task that is still queued. It cannot stop one that
+  has started (409), and it does not cancel a Slurm job a task already
+  submitted: that is a separate action, under the same authorization limits as
+  any other cancellation.
+- `-Reroute any` lets the bridge send a task that names an agent to a different
+  one if that agent has vanished. You rarely need it: do not name an agent and
+  the question never arises.
+
+## Watching
+
+`events` lists status changes (a task created, started, finished, cancelled)
+after a cursor. Keep the `next` it returns and pass it as `-After` next time:
+nothing is missed or repeated, even across a reconnect. `-WaitSec 20` holds the
+request open until something happens, which is cheaper than polling `task` in a
+loop. Events record status changes only, not what an agent is doing.
 
 ## Slurm jobs: submit boldly
 
@@ -261,6 +314,10 @@ has refused.
 | `400 task_too_large` | The task is over about 120 KB | Write the material to a file on the host and have the task read it |
 | `409 busy` | That agent has no hands free | Ordinary. Omit `-Agent`, or wait |
 | `422` | The `-IdempotencyKey` was reused with different parameters | Use a new key |
+| `422 unknown_dependency` / `dependency_failed` | `depends_on` names a task that does not exist, or has already failed | Fix the id; if it failed, deal with that task first |
+| exit 6, `cancelled` | Stopped before it started: you asked, or a task it waited on failed | Nothing ran. `error_text` says which. Resubmit once the cause is dealt with |
+| `409` from `cancel` | The task has already started or finished | It cannot be stopped. Wait for it, then judge the result |
+| `done`, `result_data.status: failed` | The bridge delivered the result; the agent says the work failed | Report a failed job, not a successful one |
 | `429` | The queue is full | Wait for tasks to finish. Do not pile on |
 | `404 agent_not_found` | The agent you named does not exist | Run `agents`. Omit `-Agent` |
 | `health` reports `worker_dead` (503) | The bridge's worker thread has died | Tell the user the bridge needs restarting |
