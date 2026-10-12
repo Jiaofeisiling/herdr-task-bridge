@@ -754,6 +754,12 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_task_events_task "
             "ON task_events(task_id)"
         )
+        # Events for one workflow, in order. Without it that query walks every
+        # event after the cursor and throws away the other workflows' rows.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_events_workflow "
+            "ON task_events(workflow_id, seq)"
+        )
 
         # Who asked for what, and every refusal of the token. No token, query
         # string or request body is ever stored here.
@@ -810,6 +816,19 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_tasks_workflow_id
             ON tasks(workflow_id) WHERE workflow_id IS NOT NULL
         """)
+
+        # tasks is never pruned and each row carries its prompt and result, so
+        # a query that reads every row only gets slower. Measured on 20,000
+        # tasks: the worker's poll (every two seconds) and the queue-cap count
+        # that /delegate makes while holding the write lock took 65 ms each, and
+        # listing the newest twenty 360 ms. These make them lookups.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status_created "
+            "ON tasks(status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)"
+        )
 
         # Rows from before structured results stay NULL here: they were
         # never claimed to be structured, so they read back as plain text.
@@ -3249,6 +3268,7 @@ def task_worker(stop_event=None):
 
             if task_row is None:
                 busy_this_pass.clear()
+
                 time.sleep(WORKER_POLL_SECONDS)
                 continue
 

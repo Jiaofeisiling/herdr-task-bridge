@@ -6637,3 +6637,128 @@ def test_the_audit_endpoint_refuses_a_bad_query(live_server):
     assert _get(live_server, "/audit?limit=0")[0] == 400
     assert _get(live_server, "/audit?after=-1")[0] == 400
     assert _get(live_server, "/audit?limit=100000")[0] == 400
+
+
+# --- the queries the bridge runs all the time do not read the whole table -----
+#
+# tasks is never pruned and every row carries its prompt and result, so on the
+# live host it only grows. With no index on status or created_at, the worker's
+# poll (every two seconds), the queue-cap count that /delegate makes while
+# holding the write lock, and the newest-twenty listing each read every row:
+# measured on 20,000 tasks, 65 ms, 65 ms and 360 ms, rising in step with the
+# table. These tests look at the plan SQLite chooses for the statements the code
+# really runs, which says the same thing without depending on how fast the
+# machine is.
+
+
+def _plans_of(monkeypatch, work):
+    """The query plan of every SELECT that `work()` runs against the database."""
+    statements = []
+    real = bridge.db_connect
+
+    def traced():
+        conn = real()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(bridge, "db_connect", traced)
+    work()
+    monkeypatch.setattr(bridge, "db_connect", real)
+
+    plans = []
+    with bridge.db_session() as conn:
+        for sql in statements:
+            if sql.lstrip().upper().startswith("SELECT"):
+                plans += [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql)]
+    return plans
+
+
+def _a_busy_database(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "MAX_QUEUE_DEPTH", 10**6)
+    with bridge.db_session() as conn:
+        conn.executemany(
+            "INSERT INTO tasks (task_id, task, agent, status, created_at, timeout_ms)"
+            " VALUES (?, 't', 'w1:p1', ?, ?, 1)",
+            [(f"id-{i}", "done" if i % 10 else "queued", f"2026-01-01T00:00:{i % 60:02d}+00:00")
+             for i in range(300)],
+        )
+
+
+def _scans_the_tasks_table(plans):
+    return [p for p in plans if p.startswith("SCAN tasks") and "INDEX" not in p]
+
+
+def test_the_worker_poll_does_not_scan_the_tasks_table(tmp_path, monkeypatch):
+    _a_busy_database(tmp_path, monkeypatch)
+
+    plans = _plans_of(monkeypatch, bridge.peek_next_task)
+
+    assert plans and not _scans_the_tasks_table(plans), plans
+    assert not any("TEMP B-TREE" in p for p in plans), plans      # nor sorts its way to the oldest
+
+
+def test_counting_the_queue_does_not_scan_the_tasks_table(tmp_path, monkeypatch):
+    _a_busy_database(tmp_path, monkeypatch)
+
+    plans = _plans_of(monkeypatch, bridge.count_queued_tasks)
+
+    assert plans and not _scans_the_tasks_table(plans), plans
+
+
+def test_enqueueing_does_not_scan_the_tasks_table_under_the_write_lock(tmp_path, monkeypatch):
+    _a_busy_database(tmp_path, monkeypatch)
+
+    plans = _plans_of(monkeypatch, lambda: bridge.enqueue_task("t", 60000, "w1:p1"))
+
+    assert plans and not _scans_the_tasks_table(plans), plans
+
+
+def test_listing_the_newest_tasks_does_not_scan_and_sort_the_table(tmp_path, monkeypatch):
+    _a_busy_database(tmp_path, monkeypatch)
+
+    plans = _plans_of(monkeypatch, bridge.list_tasks)
+
+    assert plans and not _scans_the_tasks_table(plans), plans
+    assert not any("TEMP B-TREE" in p for p in plans), plans
+
+
+def test_listing_by_status_does_not_scan_and_sort_the_table(tmp_path, monkeypatch):
+    _a_busy_database(tmp_path, monkeypatch)
+
+    plans = _plans_of(monkeypatch, lambda: bridge.list_tasks(20, "queued"))
+
+    assert plans and not _scans_the_tasks_table(plans), plans
+    assert not any("TEMP B-TREE" in p for p in plans), plans
+
+
+def test_events_for_one_workflow_are_found_by_workflow(tmp_path, monkeypatch):
+    _a_busy_database(tmp_path, monkeypatch)
+
+    plans = _plans_of(monkeypatch, lambda: bridge.list_events(0, workflow_id="run-7"))
+
+    # Walking the whole event table from the cursor and discarding other
+    # workflows' rows is the scan.
+    assert any("idx_task_events_workflow" in p for p in plans), plans
+
+
+def test_a_database_made_before_the_indexes_gets_them(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    monkeypatch.setattr(bridge, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,"
+        " status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,"
+        " timeout_ms INTEGER NOT NULL, result_text TEXT, error_text TEXT)"
+    )
+    conn.execute("INSERT INTO tasks (task_id, task, agent, status, created_at, timeout_ms)"
+                 " VALUES ('old', 't', 'a', 'queued', '2026-01-01T00:00:00+00:00', 1)")
+    conn.commit()
+    conn.close()
+
+    bridge.init_db()
+
+    with bridge.db_session() as conn:
+        names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    assert {"idx_tasks_status_created", "idx_tasks_created", "idx_task_events_workflow"} <= names
+    assert bridge.get_task("old")["status"] == "queued"          # and nothing was lost
