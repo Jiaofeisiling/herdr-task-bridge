@@ -58,6 +58,16 @@ is folded into 4.1.0.
   take about 5 s and the worst concurrent wait was under 200 ms (1.7 s without
   the pause).
 
+### Fixed (after 4.1.0)
+
+- `scripts/acceptance.py` and `scripts/smoke.py` read the token from
+  `SENTINEL_BRIDGE_TOKEN` by default. They took it only as `--token <value>`,
+  which on a shared login node is visible to every user in the process list and
+  stays in the shell history. `--token` still works and wins.
+- `acceptance.py` says what it is waiting for. A real agent can take minutes
+  over a probe, and a script that printed nothing looked hung and was
+  interrupted.
+
 ## Bridge v27 (deployed, not tagged; part of 4.1.0)
 
 ### Added

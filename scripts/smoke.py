@@ -20,6 +20,7 @@ the guard is the point of this file, not an extra.
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -108,7 +109,10 @@ def check_channel(base, token):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=DEFAULT_URL)
-    parser.add_argument("--token", default=None)
+    # Read from the environment by default: a command line is visible to every
+    # user in the process list and stays in the shell history.
+    parser.add_argument("--token", default=os.environ.get("SENTINEL_BRIDGE_TOKEN"),
+                        help="access token (default: $SENTINEL_BRIDGE_TOKEN)")
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
