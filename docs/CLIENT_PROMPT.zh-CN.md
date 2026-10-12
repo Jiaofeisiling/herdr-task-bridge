@@ -247,12 +247,29 @@ herdr 的 `blocked` 状态在 agent 忙碌时会闪烁：实测出现过 `blocke
 - `tasks -Status queued` 会列出正在等待的任务。不带参数的 `tasks` 只是最新
   20 条，所以卡了一段时间的任务不在里面。
 
+## 认证
+
+从 bridge v28 起，除 `/health` 之外的每个请求都需要访问令牌。客户端从环境变量
+`SENTINEL_BRIDGE_TOKEN` 取，或者从用户用 `sentinel.ps1 login` 存下的文件里取。
+
+如果某条命令以退出码 **7** 结束（`AUTHENTICATION REQUIRED` 或 `AUTHENTICATION FAILED`）：
+
+- 停下。重试没有用，bridge 本身也没有别的问题。
+- 告诉用户：bridge 需要访问令牌，而这个会话没有可用的令牌；他们可以在自己的终端里
+  用 `sentinel.ps1 login` 保存一次。
+- **不要去找令牌。** 不要为它去读 `bridge.env`、环境变量转储、shell 历史或任何别的文件，
+  不要让用户把它贴进这段对话，也不要把它放进命令行。它是密码：用户只在 `login` 里输入
+  一次，输入时不回显。
+- `AUTHENTICATION FAILED` 表示发送了令牌但被拒：它过期了（主机上轮换过）。
+  `REQUIRED` 表示根本没找到令牌。
+
 ## 常见错误速查
 
 | 你看到 | 意味着 | 怎么做 |
 |---|---|---|
 | 退出码 4、`CHANNEL DOWN` | SSH 转发断了。桥的状态未知，不是坏了 | 请用户重连。不要断言远端故障 |
 | 退出码 5、`NO REPLY` | 桥在线，只是这一个请求卡住了 | 只读命令：重试。`delegate`：用同一个 `-IdempotencyKey` 重试。`ask`/`prompt`：先查 `ready`/`read` |
+| 退出码 7、`AUTHENTICATION REQUIRED` / `FAILED` | bridge 需要访问令牌，而这个会话没有，或令牌被拒 | 停下，告诉用户运行 `sentinel.ps1 login`。不要重试，也绝不要去找令牌 |
 | 退出码 3、`quota_exhausted` | 所有合格 agent 都被额度熔断 | 从 `quota` 里读出恢复时间并汇报。不要重试 |
 | 退出码 2、`orphaned` | 桥重启或失去跟踪，工作可能已执行 | 不要重试。过一会儿再查这个任务（迟到的结果会让它变成 `done`），再做只读核查 |
 | `reason: provider_rejected`、`kind: context_limit` | 该 agent 的会话超过了它的模型上限 | 改用另一个 agent。告诉用户该会话需要在它的终端里压缩或重启 |

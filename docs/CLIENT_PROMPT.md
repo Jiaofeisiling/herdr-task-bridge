@@ -298,12 +298,32 @@ has refused.
 - `tasks -Status queued` lists what is waiting. The plain `tasks` is only the
   newest twenty, so a task that has been stuck for a while is not in it.
 
+## Authentication
+
+From bridge v28 every request except `/health` needs an access token. The client
+takes it from the `SENTINEL_BRIDGE_TOKEN` environment variable, or from the file
+the user stored with `sentinel.ps1 login`.
+
+If a command exits **7** (`AUTHENTICATION REQUIRED` or `AUTHENTICATION FAILED`):
+
+- Stop. Retrying cannot help, and nothing else is wrong with the bridge.
+- Tell the user that the bridge needs an access token and this session has no
+  working one, and that they can store it once, in their own terminal, with
+  `sentinel.ps1 login`.
+- **Do not look for the token.** Do not read `bridge.env`, environment dumps,
+  shell history or any other file for it, do not ask the user to paste it into
+  this conversation, and do not put it on a command line. It is a password: the
+  user types it once into `login`, which hides it.
+- `AUTHENTICATION FAILED` means a token was sent and refused: it is out of date
+  (the host rotated it). `REQUIRED` means none was found.
+
 ## Errors at a glance
 
 | You see | It means | Do |
 |---|---|---|
 | exit 4, `CHANNEL DOWN` | The SSH forward is down. The bridge is unknown, not broken | Ask the user to reconnect. Do not claim the remote is down |
 | exit 5, `NO REPLY` | The bridge is up; this one request stalled | Read-only: retry. `delegate`: retry with the same `-IdempotencyKey`. `ask`/`prompt`: check `ready`/`read` first |
+| exit 7, `AUTHENTICATION REQUIRED` / `FAILED` | The bridge needs an access token and this session has none, or it was refused | Stop and tell the user to run `sentinel.ps1 login`. Do not retry, and never look for the token |
 | exit 3, `quota_exhausted` | Every eligible agent is quota-blocked | Report the reset time from `quota`. Do not retry |
 | exit 2, `orphaned` | The bridge restarted or lost track; the work may have run | Do not retry. Query the task again shortly (a late result turns it `done`), then a read-only check |
 | `reason: provider_rejected`, `kind: context_limit` | That agent's session outgrew its model's limit | Use another agent. Tell the user the session needs compacting or restarting in its terminal |
