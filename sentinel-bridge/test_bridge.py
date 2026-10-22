@@ -3426,7 +3426,7 @@ def test_an_ask_with_no_result_after_a_reminder_is_recoverable_too(tmp_path, mon
     assert bridge.get_task(body["task_id"])["status"] == "error"
 
 
-def test_a_successful_ask_still_writes_no_row(tmp_path, monkeypatch, live_server):
+def test_a_successful_ask_persists_its_answer(tmp_path, monkeypatch, live_server):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     _live(monkeypatch, [{"agent": "opencode", "pane_id": "w1:p1", "agent_status": "idle"}])
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
@@ -3434,9 +3434,12 @@ def test_a_successful_ask_still_writes_no_row(tmp_path, monkeypatch, live_server
 
     status, body = _post(live_server, "/ask", {"task": "audit", "agent": "w1:p1", "timeout_ms": 5000})
 
-    # The success path is untouched: no new write, no new place to go wrong.
+    # A response can be lost after execution: the answer remains queryable.
     assert status == 200
-    assert bridge.get_task(body["task_id"]) is None
+    row = bridge.get_task(body["task_id"])
+    assert row["status"] == "done"
+    assert row["result_text"] == "done"
+    assert row["executed_agent"] == "w1:p1"
 
 
 def test_a_refused_ask_writes_no_row(tmp_path, monkeypatch, live_server):

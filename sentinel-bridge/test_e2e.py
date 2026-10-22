@@ -267,6 +267,36 @@ def test_the_answer_of_a_killed_bridges_agent_is_recovered_after_the_restart(wor
     assert len(world.prompts()) == 1
 
 
+def test_p1_second_process_cannot_orphan_a_live_instances_task(world):
+    world.configure([ALPHA], {"alpha": {"delay": 3, "text": "the answer"}})
+    first = world.start_bridge()
+    task_id = delegate(first, "a bounded task")
+    first.wait_status(task_id, "running")
+    wait_for(world.prompts, what="the first instance to dispatch")
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("SENTINEL_")}
+    environment.update({
+        "HERDR_BIN": sys.executable, "FAKE_HERDR_DIR": str(world.fake),
+        "SENTINEL_BRIDGE_PORT": str(_free_port()), "SENTINEL_DB": str(world.db),
+        "SENTINEL_RESULT_DIR": str(world.results), "SENTINEL_ALLOW_NO_AUTH": "1",
+        "PYTHONUTF8": "1",
+    })
+    second = subprocess.Popen(
+        [sys.executable, BRIDGE], cwd=world.fake, env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    try:
+        output, _ = second.communicate(timeout=2)
+        assert second.returncode != 0, output
+        assert b"already" in output.lower(), output
+        assert first.task(task_id)["status"] == "running"
+    finally:
+        if second.poll() is None:
+            second.kill()
+            second.communicate(timeout=5)
+        first.wait_status(task_id, "done")
+    assert len(world.prompts()) == 1
+
+
 # -- the same request, many times at once -----------------------------------
 
 

@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -689,6 +690,47 @@ def db_connect():
     return conn
 
 
+class InstanceAlreadyRunningError(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def bridge_instance():
+    """Own this database for the entire process lifetime, including recovery.
+
+    Keep the lock file after release: unlinking a locked inode lets another
+    process create a different lock at the same path. Kernel locks disappear
+    on process death, so no PID guessing or stale-file removal is needed.
+    """
+    lock_path = os.path.realpath(DB_PATH) + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                raise InstanceAlreadyRunningError("A bridge already owns this database") from error
+        else:
+            import fcntl
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise InstanceAlreadyRunningError("A bridge already owns this database") from error
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def db_session():
     # sqlite3.Connection used as `with conn:` only commits/rolls back —
@@ -811,6 +853,9 @@ def init_db():
 
         if "workflow_id" not in existing_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN workflow_id TEXT")
+
+        if "executed_agent" not in existing_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN executed_agent TEXT")
 
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_workflow_id
@@ -1199,22 +1244,23 @@ def adopt_all_late_results():
 
 def record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
                         status, error_text):
-    """Leave a row behind for a synchronous ask that failed in a way a result
-    could still follow.
+    """Settle a failed synchronous ask, retaining its original execution target.
 
-    /ask never wrote a row. When its answer arrived after the timeout, the
-    caller held a task_id that returned 404 and the answer had nowhere to go:
-    111 of the 189 discarded results on the live host were exactly this.
-    Only the failures after which a result is possible get one -- success
-    needs no record, and a refusal (busy, unavailable, quota) means nothing
-    ran -- so the success path is untouched.
-
-    Best effort: failing to record must never replace the error being
-    reported with a database one.
+    Also accepts failures predating begin_sync_attempt (for example an
+    interruption in the dispatch wrapper). A database error must not mask the
+    original execution error.
     """
     try:
         now = now_iso()
         with db_session() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (task_id,),
+            ).fetchone()
+            if existing:
+                return bool(_transition_where(conn, status, "running", {
+                    "finished_at": now, "error_text": error_text,
+                }, task_id=task_id))
             conn.execute("""
                 INSERT INTO tasks (
                     task_id, task, agent, status, created_at, started_at,
@@ -1237,6 +1283,26 @@ SYNC_RECOVERY_HINT = (
     "it is recovered automatically: query this task_id later "
     "(GET /tasks/<id>, or `sentinel.ps1 task <id>`)."
 )
+
+
+def begin_sync_attempt(task_id, task, timeout_ms, requested_agent, target, slurm_policy):
+    """Persist ownership before a synchronous prompt can reach an agent."""
+    with _shutdown_guard:
+        if _shutting_down:
+            raise SentinelUnavailableError("Bridge is shutting down")
+        with db_session() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                _insert_task(conn, task_id, task, timeout_ms, requested_agent, slurm_policy)
+                _transition_where(conn, "running", "queued", {
+                    "started_at": now_iso(),
+                }, task_id=task_id)
+            elif row["status"] != "running":
+                raise SentinelUnavailableError("Task is no longer running; it was not resent")
+            conn.execute("UPDATE tasks SET executed_agent = ? WHERE task_id = ?", (target, task_id))
 
 
 def find_task_by_idempotency_key(key):
@@ -1772,7 +1838,10 @@ def peek_next_task(exclude_agents=()):
 
 
 def claim_task(task_id):
-    return transition(task_id, "running", "queued", started_at=now_iso())
+    with _shutdown_guard:
+        if _shutting_down:
+            return False
+        return transition(task_id, "running", "queued", started_at=now_iso())
 
 
 def requeue_task(task_id):
@@ -1826,6 +1895,14 @@ def routing_note(requested, used):
         f"Ran on {used}, not the requested {requested}, "
         f"whose provider refused it{why}."
     )
+
+
+def settle_completed_task(task_id, result, note, used_agent):
+    if complete_task(task_id, result, note=note):
+        print(f"[task {task_id}] done (agent={used_agent})")
+    else:
+        print(f"[task {task_id}] finished on {used_agent} but is no longer running; "
+              "its result file is left for late adoption")
 
 
 def fail_task(task_id, error_text):
@@ -1963,6 +2040,52 @@ def clear_agent_quota_blocks(agent_name=None):
 # for the agents this bridge ever sees is not worth cleaning up.
 _agent_locks = {}
 _agent_locks_guard = threading.Lock()
+_agent_locks_changed = threading.Condition(_agent_locks_guard)
+
+
+class AgentLock:
+    """A lock whose identity can merge without invalidating existing holders."""
+    def __init__(self):
+        self.parent = self
+        self.holders = 0
+
+    def _root(self):
+        node = self
+        while node.parent is not node:
+            node = node.parent
+        return node
+
+    def acquire(self, blocking=True, timeout=-1):
+        deadline = None if timeout < 0 else time.monotonic() + timeout
+        with _agent_locks_changed:
+            while self._root().holders:
+                if not blocking:
+                    return False
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                _agent_locks_changed.wait(remaining)
+            self._root().holders += 1
+            return True
+
+    def release(self):
+        with _agent_locks_changed:
+            root = self._root()
+            if not root.holders:
+                raise RuntimeError("release unlocked agent lock")
+            root.holders -= 1
+            _agent_locks_changed.notify_all()
+
+    def locked(self):
+        with _agent_locks_guard:
+            return bool(self._root().holders)
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
 
 AVAILABLE_STATES = {
     "idle",
@@ -1974,10 +2097,13 @@ def get_agent_lock(agent_name):
     # Include old queued rows, which can still carry a pane id alias.
     aliases = live_agent_aliases(agent_name)
     with _agent_locks_guard:
-        lock = next((_agent_locks[alias] for alias in aliases
-                     if alias in _agent_locks), None)
-        if lock is None:
-            lock = threading.Lock()
+        known = list(dict.fromkeys(
+            _agent_locks[alias]._root() for alias in aliases if alias in _agent_locks
+        ))
+        lock = known[0] if known else AgentLock()
+        for other in known[1:]:
+            lock.holders += other.holders
+            other.parent = lock
         # Remember both addresses so a temporary discovery outage, or a
         # name disappearing, cannot give a known pane a second lock.
         for alias in aliases:
@@ -2677,26 +2803,32 @@ def fresh_provider_refusal(before, after, ignore=None):
     """A provider refusal in `after` that was not already in `before`.
 
     A terminal keeps old errors in view, so finding one after a prompt proves
-    nothing -- it may be last hour's. Each hit is keyed on the wording plus
-    the few characters after it, which is where the figures sit ("... exceeded:
-    334110 > 185528"): a repeat refusal carries different figures, while the
-    same old error scrolling about does not. The surrounding text is left out
-    of the key on purpose -- in a two-column TUI it is the sidebar, which
-    changes with every message.
+    nothing -- it may be last hour's. Only refusal wording and explicit size
+    figures identify an error; adjoining task output or sidebar text cannot
+    prove a new refusal. Counts preserve an identical appended error.
     """
     def keys(text):
         haystack, matches = _provider_error_hits(text, ignore)
-        return {
-            " ".join(haystack[m.start():m.end() + 24].split()): m
-            for m in matches
-        }, haystack
+        found = []
+        for match in matches:
+            wording = " ".join(match.group().lower().split())
+            figures = None
+            if CONTEXT_LIMIT_PATTERN.fullmatch(match.group()):
+                suffix = haystack[match.end():].split("\n", 1)[0]
+                numeric = re.match(r"\s*:\s*(\d+)\s*>\s*(\d+)", suffix)
+                if numeric:
+                    figures = numeric.groups()
+            found.append(((wording, figures), match))
+        return found, haystack
 
-    seen, _ = keys(before)
-    now, haystack = keys(after)
+    previous, _ = keys(before)
+    seen = Counter(key for key, _ in previous)
+    current, haystack = keys(after)
 
-    for key, match in now.items():
-        if key not in seen:
+    for key, match in current:
+        if not seen[key]:
             return _evidence_window(haystack, match)
+        seen[key] -= 1
 
     return None
 
@@ -3333,6 +3465,7 @@ WORKER_POLL_SECONDS = 2
 _work_available = threading.Event()
 
 _worker_thread = None
+_worker_stop = None
 
 
 def task_worker(stop_event=None):
@@ -3345,8 +3478,23 @@ def task_worker(stop_event=None):
     # different, already-idle agent's tasks sitting behind it.
     busy_this_pass = set()
     last_prune = float("-inf")
+    settlement = None
 
-    while stop_event is None or not stop_event.is_set():
+    while True:
+        if settlement is not None:
+            finish, args = settlement
+            try:
+                finish(*args)
+                settlement = None
+            except Exception as error:
+                print(f"[worker] task state was not persisted; retrying only persistence: {error}")
+                if _shutting_down or (stop_event is not None and stop_event.is_set()):
+                    return
+                time.sleep(WORKER_POLL_SECONDS)
+                continue
+
+        if _shutting_down or (stop_event is not None and stop_event.is_set()):
+            return
         try:
             cancel_blocked_tasks()
             task_row = peek_next_task(exclude_agents=busy_this_pass)
@@ -3375,16 +3523,19 @@ def task_worker(stop_event=None):
             claimed = False
 
             try:
-                operation = lambda target: execute_sentinel_task(
-                    agent_name=target,
-                    task_id=task_id,
-                    task=task_row["task"],
-                    timeout_ms=task_row["timeout_ms"],
-                    # From the row, not the current default: a task queued
-                    # under one policy must run under that one, or the
-                    # recorded value becomes a comforting fiction.
-                    slurm_policy=task_row["slurm_policy"],
-                )
+                def operation(target):
+                    with db_session() as conn:
+                        changed = conn.execute(
+                            "UPDATE tasks SET executed_agent = ? "
+                            "WHERE task_id = ? AND status = 'running'", (target, task_id),
+                        ).rowcount
+                    if not changed:
+                        raise SentinelUnavailableError("Task is no longer running")
+                    return execute_sentinel_task(
+                        agent_name=target, task_id=task_id, task=task_row["task"],
+                        timeout_ms=task_row["timeout_ms"],
+                        slurm_policy=task_row["slurm_policy"],
+                    )
 
                 if get_agent_quota_block(agent_name):
                     # The primary was already proved unavailable for quota
@@ -3405,22 +3556,15 @@ def task_worker(stop_event=None):
                             agent_name, operation, primary_locked=True
                         )
 
-                if complete_task(
-                    task_id, result, note=routing_note(agent_name, used_agent)
-                ):
-                    print(f"[task {task_id}] done (agent={used_agent})")
-                else:
-                    print(
-                        f"[task {task_id}] finished on {used_agent} but is no "
-                        "longer running; its result file is left for late "
-                        "adoption"
-                    )
+                settlement = (settle_completed_task, (
+                    task_id, result, routing_note(agent_name, used_agent), used_agent,
+                ))
 
             except TimeoutError as e:
                 # The agent may still be executing, so it cannot safely be
                 # retried on another provider.
                 if claimed:
-                    orphan_task(task_id, str(e))
+                    settlement = (orphan_task, (task_id, str(e)))
                     print(f"[task {task_id}] orphaned")
 
             except QuotaFailoverExhaustedError as e:
@@ -3428,7 +3572,7 @@ def task_worker(stop_event=None):
                 if e.raw_output:
                     detail += "\n\nRaw provider output:\n" + e.raw_output
                 if claimed:
-                    quota_exhausted_task(task_id, detail)
+                    settlement = (quota_exhausted_task, (task_id, detail))
                     print(f"[task {task_id}] quota exhausted: {e}")
 
             except (SentinelBusyError, SentinelUnavailableError) as unavailable:
@@ -3450,7 +3594,7 @@ def task_worker(stop_event=None):
                     # unreachable. Preserve the task and retry later; do not
                     # misreport this as either a completed fallback or a
                     # permanent quota failure.
-                    requeue_task(task_id)
+                    settlement = (requeue_task, (task_id,))
 
                 # This agent's busy/unreachable -- remember that for the
                 # rest of this pass and immediately look for a task
@@ -3471,7 +3615,7 @@ def task_worker(stop_event=None):
                             "\n\nRaw Sentinel output (last 4000 chars):\n"
                             + raw_output
                         )
-                    fail_task(task_id, detail)
+                    settlement = (fail_task, (task_id, detail))
                     print(f"[task {task_id}] error: {e}")
 
         except Exception as e:
@@ -3601,6 +3745,10 @@ def graceful_shutdown(server, grace_sec=None, signame="signal"):
         if _shutting_down:
             return True
         _shutting_down = True
+
+    if _worker_stop is not None:
+        _worker_stop.set()
+    _work_available.set()
 
     grace = SHUTDOWN_GRACE_SEC if grace_sec is None else grace_sec
 
@@ -4473,12 +4621,14 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
-            result_text, used_agent = run_with_quota_failover(
-                agent_name,
-                lambda target: execute_sentinel_task(
-                    target, task_id, task, timeout_ms, read_lines, slurm_policy
-                ),
-            )
+            def execute(target):
+                begin_sync_attempt(task_id, task, timeout_ms, agent_name, target, slurm_policy)
+                return execute_sentinel_task(
+                    target, task_id, task, timeout_ms, read_lines, slurm_policy,
+                )
+
+            result_text, used_agent = run_with_quota_failover(agent_name, execute)
+            complete_task(task_id, result_text, note=routing_note(agent_name, used_agent))
 
             result_data, _ = parse_structured_result(result_text)
 
@@ -4492,13 +4642,12 @@ class Handler(BaseHTTPRequestHandler):
                     "data": result_data,
                 },
             })
-            # Synchronous asks have no completion transaction. Keep their
-            # recovery copy until the response has been written successfully.
-            discard_result_file(task_id)
-            discard_progress_file(task_id)
             return
 
         except QuotaFailoverExhaustedError as e:
+            if path == "/ask" and get_task(task_id):
+                record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
+                                    "quota_exhausted", str(e))
             self.send_json(
                 {
                     "ok": False,
@@ -4531,6 +4680,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         except SentinelBusyError as e:
+            if path == "/ask" and get_task(task_id):
+                record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
+                                    "error", str(e))
             self.send_json(
                 {
                     "ok": False,
@@ -4543,6 +4695,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         except SentinelUnavailableError as e:
+            if path == "/ask" and get_task(task_id):
+                record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
+                                    "error", str(e))
             self.send_json(
                 {
                     "ok": False,
@@ -4606,7 +4761,7 @@ class Handler(BaseHTTPRequestHandler):
             # Where the prompt may have landed, a result can still follow, so
             # leave the row it would be adopted into. A confirmed block is an
             # error; "unknown whether delivered" is lost tracking.
-            if path == "/ask" and e.reason in ("blocked_confirmed", "delivery_unknown"):
+            if path == "/ask":
                 if record_sync_failure(
                     task_id, task, timeout_ms, agent_name, slurm_policy,
                     "error" if e.reason == "blocked_confirmed" else "orphaned",
@@ -4618,7 +4773,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
-if __name__ == "__main__":
+def main():
     problems = startup_security_problems()
 
     # `--check` only looks. The restart script runs it before stopping the
@@ -4629,50 +4784,58 @@ if __name__ == "__main__":
         if not problems:
             print("bridge --check: ok "
                   f"(authentication: {'on' if AUTH_TOKEN else 'OFF, by request'})")
-        sys.exit(2 if problems else 0)
+        return 2 if problems else 0
 
     if problems:
         for problem in problems:
             print(f"REFUSING TO START: {problem}")
-        sys.exit(2)
+        return 2
 
     # Before anything is created, so the database is born private.
     for permission_warning in harden_permissions():
         print(f"WARNING: {permission_warning}")
 
-    init_db()
+    try:
+        with bridge_instance():
+            # Reserve the listener before recovery or dispatch changes any task.
+            # Windows SO_REUSEADDR permits two listeners on the same address.
+            server = ThreadingHTTPServer((HOST, PORT), Handler, bind_and_activate=False)
+            server.allow_reuse_address = os.name != "nt"
+            try:
+                server.server_bind()
+                server.server_activate()
+                init_db()
+                recovered = adopt_all_late_results()
+                if recovered:
+                    print(f"Recovered {recovered} late result(s) for failed or orphaned tasks")
+                swept = purge_stale_result_files()
+                if swept:
+                    print(f"Swept {swept} result file(s) older than {RESULT_RETENTION_DAYS}d")
+                for startup_warning in (auth_token_warning(), result_dir_scope_warning()):
+                    if startup_warning:
+                        print(startup_warning)
+                serve_bridge(server)
+            finally:
+                server.server_close()
+    except (InstanceAlreadyRunningError, OSError) as error:
+        print(f"Bridge could not start: {error}")
+        return 1
+    return 0
 
+
+def serve_bridge(server):
+    global _worker_thread, _worker_stop
+    _worker_stop = threading.Event()
     worker = threading.Thread(
-        target=task_worker,
-        daemon=True,
-        name="sentinel-task-worker",
+        target=task_worker, args=(_worker_stop,), daemon=True, name="sentinel-task-worker",
     )
-    worker.start()
     _worker_thread = worker
+    worker.start()
 
     print(f"Sentinel Bridge v{BRIDGE_VERSION}")
     print(f"Default agent: {DEFAULT_AGENT}")
     print(f"Database: {DB_PATH}")
     print(f"Listening: http://{HOST}:{PORT}")
-
-    # Before the sweep, which would otherwise delete a result that is still
-    # wanted: adopt what a task is owed, then discard what nobody is.
-    recovered = adopt_all_late_results()
-    if recovered:
-        print(f"Recovered {recovered} late result(s) for failed or orphaned tasks")
-
-    swept = purge_stale_result_files()
-    if swept:
-        print(f"Swept {swept} result file(s) older than {RESULT_RETENTION_DAYS}d")
-
-    for startup_warning in (auth_token_warning(), result_dir_scope_warning()):
-        if startup_warning:
-            print(startup_warning)
-
-    server = ThreadingHTTPServer(
-        (HOST, PORT),
-        Handler,
-    )
 
     shutdown_done = threading.Event()
     signalled = threading.Event()
@@ -4702,3 +4865,11 @@ if __name__ == "__main__":
 
     if signalled.is_set():
         shutdown_done.wait(timeout=SHUTDOWN_GRACE_SEC + 5)
+    else:
+        graceful_shutdown(server, signame="KeyboardInterrupt")
+    _worker_stop.set()
+    _work_available.set()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

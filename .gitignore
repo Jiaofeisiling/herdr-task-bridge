@@ -11,6 +11,7 @@ sentinel-bridge/.venv/
 # Runtime state -- generated locally or on the deployed remote host,
 # never something to version
 sentinel-bridge/tasks.db
+sentinel-bridge/tasks.db.lock
 sentinel-bridge/bridge.log
 
 # Stray logs from editors/tooling that happen to run in this directory
