@@ -446,7 +446,19 @@ def _isolated_env(world, **extra):
     environment = {k: v for k, v in os.environ.items() if k != "SENTINEL_BRIDGE_TOKEN"}
     environment["SENTINEL_CONFIG_DIR"] = str(empty)
     environment.update(extra)
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
     return environment
+
+
+def test_script_subprocess_output_is_utf8_even_with_a_legacy_parent_encoding(world, monkeypatch):
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    monkeypatch.setenv("PYTHONIOENCODING", "cp936")
+    done = subprocess.run(
+        [sys.executable, "-c", "print(chr(0x4e2d))"], env=_isolated_env(world),
+        capture_output=True, text=True, encoding="utf-8", timeout=10,
+    )
+    assert done.returncode == 0 and done.stdout.strip() == "中"
 
 
 def _run_acceptance(world, bridge, *extra):
@@ -489,6 +501,7 @@ def test_the_acceptance_script_sends_nothing_without_being_told_to(world):
     done = subprocess.run(
         [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{bridge.port}"],
         capture_output=True, text=True, encoding="utf-8", timeout=60,
+        env=_isolated_env(world),
     )
 
     assert done.returncode == 2
@@ -501,6 +514,7 @@ def test_the_acceptance_script_refuses_to_run_when_the_channel_is_down(world):
     done = subprocess.run(
         [sys.executable, ACCEPTANCE, "--url", f"http://127.0.0.1:{_free_port()}", "--yes"],
         capture_output=True, text=True, encoding="utf-8", timeout=60,
+        env=_isolated_env(world),
     )
 
     assert done.returncode == 2

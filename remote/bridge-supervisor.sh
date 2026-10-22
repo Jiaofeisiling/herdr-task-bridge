@@ -18,7 +18,7 @@ set -u
 # request while bridge.env holds the access token.
 umask 077
 
-BRIDGE_ROOT="$HOME/herdr-task-bridge"
+BRIDGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE_DIR="$BRIDGE_ROOT/sentinel-bridge"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
 

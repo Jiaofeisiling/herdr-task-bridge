@@ -22,7 +22,6 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUPERVISOR="$ROOT/remote/bridge-supervisor.sh"
 LOG_FILE="$ROOT/sentinel-bridge/bridge.log"
-URL="http://127.0.0.1:${SENTINEL_BRIDGE_PORT:-8765}/health"
 
 # Tunable for tests; the defaults are what a real host wants.
 SETTLE="${BRIDGE_SETTLE_SEC:-2}"
@@ -32,6 +31,14 @@ refuse() {
     echo "bridge-restart: refusing -- $1; nothing was stopped" >&2
     exit 2
 }
+
+# Use the same settings as the supervisor. A child sourcing bridge.env cannot
+# change the parent's health URL, and the file overrides inherited settings.
+if [ -f "$ROOT/remote/bridge.env" ]; then
+    # shellcheck disable=SC1091
+    . "$ROOT/remote/bridge.env" || refuse "bridge.env could not be loaded"
+fi
+URL="http://127.0.0.1:${SENTINEL_BRIDGE_PORT:-8765}/health"
 
 [ -f "$SUPERVISOR" ] || refuse "$SUPERVISOR does not exist"
 command -v screen >/dev/null 2>&1 || refuse "screen is not installed"
@@ -56,16 +63,25 @@ fi
 # after it. Hit this for real. Anchoring works because the wrapper's command
 # line always starts with "bash", never "python3".
 screen -S bridge -X quit >/dev/null 2>&1
-pkill -f '^python3 bridge\.py$' 2>/dev/null
+pkill -f '^python3( -u)? bridge\.py$' 2>/dev/null
 sleep "$SETTLE"
 
-screen -dmS bridge bash "$SUPERVISOR"
+if ! screen -dmS bridge bash "$SUPERVISOR"; then
+    echo "bridge-restart: FAILED -- screen could not start the supervisor" >&2
+    exit 1
+fi
 sleep "$SETTLE"
 
 came_back=""
 deadline=$((SECONDS + WAIT))
 while [ "$SECONDS" -lt "$deadline" ]; do
-    if health="$(curl -sS -m 3 "$URL" 2>/dev/null)"; then
+    if health="$(curl -fsS -m 3 "$URL" 2>/dev/null)" &&
+       printf '%s' "$health" | python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+sys.exit(0 if isinstance(body, dict) and body.get("ok") is True
+         and body.get("service") == "nesi-sentinel-bridge" else 1)
+' 2>/dev/null; then
         came_back=1
         break
     fi

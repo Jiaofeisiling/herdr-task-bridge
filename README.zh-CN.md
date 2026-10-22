@@ -303,7 +303,7 @@ $train = (.\sentinel.ps1 delegate -WorkflowId run-7 -DependsOn $build "train the
 - **排队等待一个已不存在的 agent 的任务，不再永远等下去。** herdr 在 agent 进程重启时会丢掉它的名字。曾有两个排队给 `sentinel-claude` 和 `sentinel-opencode` 的任务在 `queued` 状态停了三周：桥知道不会有人接手（`queued_reason` 就这么说），却从不采取行动，所以调用方的 `wait` 会无限等下去，这些任务还一直占着队列名额；而 `/tasks` 只显示最新 20 条，没人看到它们。现在，排队超过 `SENTINEL_STALE_TARGET_SEC`（10 分钟）、且 herdr 已不再列出其 agent 的任务，会被判为失败，错误信息说明它从未被发送、可以放心重新提交。它不会被改派给别的 agent：把任务发给错的 agent，比不发更糟。它会先等满这段时间，因为正在重启的 agent 会短暂地从列表里消失；而当 herdr 无法应答，或 agent 存在但在忙时，它什么也不做。
 - **被杀掉的 `herdr agent prompt` 不等于 prompt 失败。** `bridge-restart` 会挂断整个进程组，包括 worker 正在等待的那次调用。那次调用没有任何输出就结束，被报告成"Herdr prompt command failed:"后面一片空白，任务被标成 `error`——这等于告诉调用方重试是安全的，而 prompt 是否已送达从来没有人知道。现在，一次调用若没有任何输出就结束，按"失去跟踪"处理（任务为 `orphaned`：“可能仍在执行”），并且 `error` 不再能覆盖 `orphaned`，无论关停和 worker 谁后到。
 - **`/prompt` 与任务一样处理等待中止**（v23 只修了任务）：瞬时的 `blocked` 不会再导致一个说 agent “需要交互输入”的 500。
-- **同步 `ask` 超时（504）或提醒后仍无结果（502）时，现在会留下一条任务记录**，并在 `hint` 中告知。此前那个响应里的 `task_id` 查询会返回 404，所以一分钟后才到的结果无处可去——这就是上面的 111 个。成功的 ask 和被拒绝的 ask（忙、不可用、额度）不写任何东西：前者不需要记录，后者什么都没发生，所以成功路径保持不变。
+- **同步 `ask` 在派发前创建任务记录，结果持久化后才发送 HTTP 响应。** 客户端断线后，可通过 `/tasks` 和 `/tasks/<id>` 找回结果。派发之前被拒绝的请求不创建任务。结果落库暂时失败时，返回带任务 ID 的 `503 completion_pending`；worker 和任务查询只重试落库，不重新执行远端任务。
 - `quota_exhausted` 表示所有合资格备用 agent 也被额度熔断或报告了额度/余额失败；任务到此为止，不会继续重试。
 - bridge 重启时，所有仍为 `running` 的任务会被标记为 `orphaned`，绝不会被自动重跑。
 
@@ -362,9 +362,9 @@ sentinel quota-reset -Agent "your-agent-name"
 
 - 熔断在 `/quota` 和 `/ready` 里标为 `kind: context_limit`（额度是 `kind: quota`），`/ready` 还会给出 `hint`：这个会话必须在它自己的终端里压缩或重启，再给它发任务只会以同样方式失败。
 - 它在 `SENTINEL_CONTEXT_BLOCK_TTL_SECONDS`（默认 10 分钟）后失效，而不是额度的一小时：治法是有人动手，比这更久的熔断会让已经恢复的 agent 继续被挡在外面。
-- 发生故障转移的任务会记录它实际在别处运行：任务行里保留的是被请求的 agent，另有一条备注说明由哪个 agent 完成。
+- `agent` 保留请求的目标；每次尝试前写入 `executed_agent`，即使该次尝试超时也能查到实际执行者。完成备注也会说明是否由备用 agent 执行。
 - `/prompt` 会比较 prompt 发送前后 agent 终端的内容。**新出现**的拒绝会被报告为 `ok: false`、`reason: provider_rejected`（HTTP 502）；屏幕上本来就有的旧错误不算：它说明不了这一次 prompt 的任何事，把它当成证据会给一个健康的 agent 开熔断。发送前读不到终端时，不下任何结论。
-- 一轮在 `SENTINEL_QUICK_END_SEC`（默认 15 秒）内结束且没有结果文件，不可能真的执行过任务。此时会报告 `reason: ended_quickly` 并如实说明，而不是把人引向权限问题。这个判断不依赖提供商的措辞，所以也覆盖 bridge 没有对应模式的拒绝。只匹配实际见过的措辞：往里加猜测的措辞，会给健康的 agent 开熔断。
+- 一轮在 `SENTINEL_QUICK_END_SEC`（默认 15 秒）内结束且没有结果文件时，报告 `reason: ended_quickly`。任务可能已经执行；耗时本身不能证明请求被拒绝，也不代表可以安全重试。先检查终端和实际副作用。
 
 ## 配置与安全
 
@@ -401,7 +401,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_CONTEXT_BLOCK_TTL_SECONDS` | `600` | 因会话过大被拒而开启的熔断保持多久。比额度的短，因为治法是有人去压缩或重启会话。 |
 | `SENTINEL_MAX_PROMPT_BYTES` | `120000` | bridge 接受的最大委派 prompt（含信封，按 UTF-8 字节）。Linux 把单个命令行参数限制在 131072 字节，而 herdr 把 prompt 当作一个参数。 |
 | `SENTINEL_STALE_TARGET_SEC` | `600` | 排队任务最多等待一个 herdr 已不再列出的 agent 多久，之后按"从未发送"判为失败。 |
-| `SENTINEL_QUICK_END_SEC` | `15` | 一轮结束得比这更快且没有结果文件，就报告为 `ended_quickly`：快到不可能执行过任务。 |
+| `SENTINEL_QUICK_END_SEC` | `15` | `ended_quickly` 缺失结果提示的时间阈值；执行状态仍不确定。 |
 | `SENTINEL_QUOTA_BLOCK_TTL_SECONDS` | `3600` | 额度熔断自动失效前保持的秒数；`0` 表示必须人工清除。 |
 
 将 [`remote/bridge.env.example`](remote/bridge.env.example) 复制为未追踪的 `remote/bridge.env`，再填写部署专用配置。绝不要提交真实主机名、项目标识、路径、用户名、任务提示词或令牌；项目的敏感信息规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。

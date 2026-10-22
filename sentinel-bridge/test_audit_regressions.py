@@ -9,6 +9,8 @@ import pytest
 
 import bridge
 
+REAL_LIST_AGENTS = bridge.list_agents
+
 
 AGENTS = [
     {"name": "primary", "pane_id": "w1:p1", "agent": "opencode", "agent_status": "idle"},
@@ -21,6 +23,7 @@ def isolated_bridge(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     monkeypatch.setattr(bridge, "_agent_locks", {})
+    monkeypatch.setattr(bridge, "_pending_sync_completions", {})
     monkeypatch.setattr(bridge, "_shutting_down", False)
     monkeypatch.setattr(bridge, "list_agents", lambda: (AGENTS, {"ok": True}))
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a: ("idle", {"ok": True}))
@@ -159,3 +162,247 @@ def test_p1_worker_retries_completion_without_reexecuting(monkeypatch):
         stop.set()
         bridge._work_available.set()
         worker.join(timeout=2)
+
+
+def test_p2_identical_refusal_appended_during_turn_is_detected():
+    error = "Error: insufficient credits for this request. Please add funds.\n"
+    assert bridge.fresh_provider_refusal(error, error + error) is not None
+
+
+@pytest.mark.parametrize("status, expected", [("done", ["done"]), ("error", [])])
+def test_p2_task_filter_applies_after_late_recovery(status, expected):
+    task_id = bridge.create_task("audit", 1000, "primary")
+    bridge.claim_task(task_id)
+    bridge.fail_task(task_id, "file not delivered yet")
+    result_file(task_id)
+    handler = request("/tasks?status=" + status)
+    handler._do_GET()
+    assert [row["status"] for row in handler.replies[-1][1]["tasks"]] == expected
+
+
+def test_p2_runtime_family_reset_clears_the_resolved_circuit():
+    bridge.mark_agent_quota_blocked("primary", "insufficient credits")
+    assert bridge.clear_agent_quota_blocks("opencode") == 1
+    assert bridge.get_agent_quota_block("primary") is None
+
+
+def test_p2_ready_reports_dispatch_lock():
+    with bridge.get_agent_lock("primary"):
+        handler = request("/ready?agent=primary")
+        handler._do_GET()
+        reply = handler.replies[-1][1]
+        assert reply["ready"] is False
+        assert reply["reason"] == "locked"
+
+
+def test_p2_worker_does_not_dispatch_after_shutdown(monkeypatch):
+    task_id = bridge.create_task("audit", 1000, "primary")
+    monkeypatch.setattr(bridge, "_shutting_down", True)
+    assert bridge.claim_task(task_id) is False
+    monkeypatch.setattr(bridge, "execute_sentinel_task", lambda **k: pytest.fail("dispatched during shutdown"))
+    worker = threading.Thread(target=bridge.task_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert bridge.get_task(task_id)["status"] == "queued"
+
+
+def test_p2_fallback_timeout_preserves_the_actual_executor(monkeypatch):
+    bridge.mark_agent_quota_blocked("primary", "insufficient credits")
+    called = []
+
+    def execute(agent, *args):
+        called.append(agent)
+        raise TimeoutError("may still be executing")
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    handler = request("/ask", {"task": "audit", "agent": "primary"})
+    handler._do_POST()
+    status, reply = handler.replies[-1]
+    assert status == 504 and called == ["backup"]
+    assert bridge.get_task(reply["task_id"])["executed_agent"] == "backup"
+
+
+def test_p2_fast_work_without_result_does_not_claim_it_never_ran(monkeypatch):
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: ("idle", None))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: "file write denied")
+    monkeypatch.setattr(bridge, "deliver_prompt", lambda *a: None)
+    with pytest.raises(bridge.SentinelResultMissingError) as error:
+        bridge.execute_sentinel_task("primary", "task-audit", "perform a small operation", 1000)
+    message = str(error.value).lower()
+    assert "may already have executed" in message
+    assert "too quickly to have run" not in message
+    assert "never started" not in message
+
+
+def test_p2_task_and_reminder_share_one_deadline(monkeypatch):
+    now, budgets = [0.0], []
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: now[0])
+
+    def before(*args):
+        now[0] += 0.2
+        return "idle", None
+
+    def tail(*args):
+        now[0] += 0.2
+        return "idle"
+
+    def deliver(agent, prompt, timeout_ms, task_id):
+        budgets.append(timeout_ms)
+        now[0] += 0.4 if len(budgets) == 1 else 0.05
+        if len(budgets) == 2:
+            result_file(task_id)
+
+    monkeypatch.setattr(bridge, "_terminal_read", before)
+    monkeypatch.setattr(bridge, "_read_terminal_tail", tail)
+    monkeypatch.setattr(bridge, "deliver_prompt", deliver)
+    bridge.execute_sentinel_task("primary", "task-audit", "audit", 1000)
+    assert 0 < budgets[0] <= 800
+    assert 0 < budgets[1] <= 200
+
+
+def test_p2_queue_diagnostics_have_a_short_total_budget(monkeypatch):
+    task_id = bridge.create_task("audit", 1000, "primary")
+    monkeypatch.setattr(bridge, "list_agents", REAL_LIST_AGENTS)
+
+    budgets = []
+    def hung_herdr(*args, **kwargs):
+        budgets.append(kwargs["timeout"])
+        raise bridge.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(bridge.subprocess, "run", hung_herdr)
+    handler = request("/tasks/" + task_id)
+    handler._do_GET()
+    assert handler.replies[-1][0] == 200
+    assert budgets and all(0 < budget <= 1 for budget in budgets)
+
+
+def test_p2_sync_completion_is_retried_after_database_recovers(monkeypatch):
+    complete = bridge.complete_task
+    attempts = []
+
+    def execute(agent, task_id, *args):
+        result_file(task_id)
+        return "delivered"
+
+    def temporarily_locked(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return complete(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    monkeypatch.setattr(bridge, "complete_task", temporarily_locked)
+    handler = request("/ask", {"task": "audit", "agent": "primary"})
+    handler._do_POST_guarded()
+    status, reply = handler.replies[-1]
+    assert status == 503 and reply["task_id"]
+    lookup = request("/tasks/" + reply["task_id"])
+    lookup._do_GET()
+    assert lookup.replies[-1][1]["task"]["status"] == "done"
+
+
+def test_refusal_identity_ignores_sidebar_but_keeps_explicit_size_figures():
+    before = "Prompt tokens limit exceeded: 100 > 90 │ Context: 3%"
+    moved = "Prompt tokens limit exceeded: 100 > 90 │ Context: 4%"
+    assert bridge.fresh_provider_refusal(before, moved) is None
+    assert "101" in bridge.fresh_provider_refusal(before, moved.replace("100", "101"))
+
+
+def test_an_old_size_refusal_becoming_more_visible_is_not_new():
+    partial = "Prompt tokens limit exceeded"
+    complete = partial + ": 100 > 90"
+    assert bridge.fresh_provider_refusal(partial, complete) is None
+    assert bridge.fresh_provider_refusal(complete, partial) is None
+
+
+def test_instance_lock_is_released_without_deleting_its_file():
+    with bridge.bridge_instance():
+        with pytest.raises(bridge.InstanceAlreadyRunningError):
+            with bridge.bridge_instance():
+                pytest.fail("second owner admitted")
+    assert Path(bridge.DB_PATH + ".lock").exists()
+    with bridge.bridge_instance():
+        pass
+
+
+def test_worker_retries_timeout_settlement_without_resending(monkeypatch):
+    task_id = bridge.create_task("audit", 1000, "primary")
+    stop = threading.Event()
+    original = bridge.orphan_task
+    executions, attempts = [], []
+
+    def timeout(**kwargs):
+        executions.append(kwargs["task_id"])
+        raise TimeoutError("may still be running")
+
+    def persist(*args):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        moved = original(*args)
+        stop.set()
+        return moved
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", timeout)
+    monkeypatch.setattr(bridge, "orphan_task", persist)
+    monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.001)
+    worker = threading.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    try:
+        assert bridge.get_task(task_id)["status"] == "orphaned"
+        assert executions == [task_id] and len(attempts) == 3
+    finally:
+        stop.set()
+        bridge._work_available.set()
+        worker.join(timeout=2)
+
+
+class StartupServer:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def server_bind(self):
+        pass
+
+    def server_activate(self):
+        pass
+
+    def server_close(self):
+        pass
+
+
+def test_startup_recovers_answers_before_dependency_cancellation(monkeypatch):
+    upstream, _ = bridge.enqueue_task("audit", 1000, "primary")
+    child, _ = bridge.enqueue_task("next step", 1000, "primary", depends_on=(upstream,))
+    bridge.claim_task(upstream)
+    result_file(upstream)
+    monkeypatch.setattr(bridge, "startup_security_problems", lambda: [])
+    monkeypatch.setattr(bridge, "harden_permissions", lambda: [])
+    monkeypatch.setattr(bridge, "ThreadingHTTPServer", StartupServer)
+    started = []
+
+    def start_worker(server):
+        started.append(1)
+        bridge.cancel_blocked_tasks()
+        assert bridge.get_task(upstream)["status"] == "done"
+        assert bridge.get_task(child)["status"] == "queued"
+
+    monkeypatch.setattr(bridge, "serve_bridge", start_worker)
+    assert bridge.main() == 0 and started == [1]
+
+
+def test_an_unavailable_listener_prevents_database_recovery(monkeypatch):
+    task_id = bridge.create_task("audit", 1000, "primary")
+    bridge.claim_task(task_id)
+
+    class BusyPort(StartupServer):
+        def server_bind(self):
+            raise OSError("Address already in use")
+
+    monkeypatch.setattr(bridge, "startup_security_problems", lambda: [])
+    monkeypatch.setattr(bridge, "harden_permissions", lambda: [])
+    monkeypatch.setattr(bridge, "ThreadingHTTPServer", BusyPort)
+    assert bridge.main() == 1
+    assert bridge.get_task(task_id)["status"] == "running"

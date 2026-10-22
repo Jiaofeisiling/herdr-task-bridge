@@ -5,6 +5,26 @@ are listed against it, and releases are tagged `v4.x.y`. Earlier history is in
 `git log`. Bridge v27 was deployed to the reference host but never tagged; it
 is folded into 4.1.0.
 
+## Unreleased
+
+- Persist synchronous asks before dispatch and commit their results before HTTP
+  delivery. Retry interrupted result/state persistence without resending work.
+- Hold an OS lock per database before startup recovery, reserve the listener
+  before changing tasks, recover answers before scheduling dependencies, and
+  stop claiming queued work when shutdown begins.
+- Merge agent alias locks without losing active holders. Keep the actual
+  execution agent on failed fallback attempts as well as successful ones.
+- Compare stable provider refusal evidence and repeated occurrences without
+  interpreting ordinary text appended to an old error as a new refusal.
+- Share one execution deadline across discovery, diagnostics, failover and result
+  reminders. Bound queued-task explanations and filter lists after late recovery.
+- Include dispatch locks in readiness, resolve runtime-family quota resets, and
+  keep execution uncertain when a quick task loses its result.
+- Validate restart health responses, use the configured port and script checkout,
+  and recognise the supervisor's unbuffered Python command in process checks.
+- Add isolated regressions, native Bash deployment-script tests on Windows when
+  available, and explicit UTF-8 subprocess output for the E2E suite.
+
 ## 4.1.0 (bridge v28)
 
 ### Breaking

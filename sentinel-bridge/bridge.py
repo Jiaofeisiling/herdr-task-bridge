@@ -148,11 +148,8 @@ CONTEXT_BLOCK_TTL_SECONDS = int(
     os.environ.get("SENTINEL_CONTEXT_BLOCK_TTL_SECONDS", "600")
 )
 
-# A turn that ends this quickly, with no result file, cannot have run the
-# task. Observed: an agent whose provider refused every prompt ended its turn
-# in about a second, and the bridge reported it as a missing file and sent the
-# caller to check permissions. The timing is the one signal that does not
-# depend on knowing the provider's wording.
+# Timing selects a concise missing-result diagnostic, never a verdict about
+# whether work ran: small operations can have effects within a second.
 QUICK_END_SEC = float(os.environ.get("SENTINEL_QUICK_END_SEC", "15"))
 
 QUOTA_FAILOVER_AGENTS = tuple(
@@ -682,6 +679,34 @@ def harden_permissions():
             )
 
     return warnings
+
+
+_execution_clock = threading.local()
+
+
+@contextlib.contextmanager
+def execution_budget(timeout_ms):
+    previous = getattr(_execution_clock, "deadline", None)
+    deadline = time.monotonic() + timeout_ms / 1000
+    _execution_clock.deadline = min(previous, deadline) if previous is not None else deadline
+    try:
+        yield
+    finally:
+        _execution_clock.deadline = previous
+
+
+def remaining_seconds(maximum):
+    deadline = getattr(_execution_clock, "deadline", None)
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Bridge execution deadline expired; the agent may still be executing")
+    return min(maximum, remaining)
+
+
+def remaining_ms(maximum):
+    return max(1, int(remaining_seconds(maximum / 1000) * 1000))
 
 
 def db_connect():
@@ -1905,6 +1930,36 @@ def settle_completed_task(task_id, result, note, used_agent):
               "its result file is left for late adoption")
 
 
+_pending_sync_completions = {}
+_pending_sync_guard = threading.Lock()
+
+
+def defer_sync_completion(task_id, result, note):
+    with _pending_sync_guard:
+        _pending_sync_completions[(os.path.realpath(DB_PATH), task_id)] = (result, note)
+    _work_available.set()
+
+
+def retry_sync_completions(task_id=None):
+    database = os.path.realpath(DB_PATH)
+    with _pending_sync_guard:
+        pending = [(key, value) for key, value in _pending_sync_completions.items()
+                   if key[0] == database and (task_id is None or key[1] == task_id)]
+    for key, (result, note) in pending:
+        try:
+            if not complete_task(key[1], result, note=note):
+                row = get_task(key[1])
+                if row and row["status"] in LATE_RESULT_STATUSES:
+                    row = adopt_late_result(key[1]) or row
+                if not row or row["status"] != "done":
+                    continue
+        except (sqlite3.Error, OSError) as error:
+            print(f"[ask {key[1]}] completion still pending: {error}")
+            continue
+        with _pending_sync_guard:
+            _pending_sync_completions.pop(key, None)
+
+
 def fail_task(task_id, error_text):
     discard_progress_file(task_id)
 
@@ -2020,7 +2075,14 @@ def list_agent_quota_blocks():
 
 
 def clear_agent_quota_blocks(agent_name=None):
-    aliases = live_agent_aliases(agent_name) if agent_name is not None else None
+    aliases = None
+    if agent_name is not None:
+        try:
+            agent_name = resolve_agent(agent_name)
+        except AgentNotFoundError:
+            # An offline concrete identifier can still own a persisted circuit.
+            pass
+        aliases = live_agent_aliases(agent_name)
     with db_session() as conn:
         if agent_name is None:
             cursor = conn.execute("DELETE FROM quota_blocks")
@@ -2394,7 +2456,7 @@ class QuotaFailoverExhaustedError(AgentQuotaExhaustedError):
 class SentinelResultMissingError(RuntimeError):
     def __init__(self, message, raw_output="", reason=None):
         self.raw_output = raw_output
-        # "ended_quickly" when the turn was too short to have done the work.
+        # "ended_quickly" records elapsed time, not whether work executed.
         self.reason = reason
         super().__init__(message)
 
@@ -2617,6 +2679,11 @@ def explain_queued(agent_name):
     )
 
 
+def bounded_queue_explanation(agent_name):
+    with execution_budget(1000):
+        return explain_queued(agent_name)
+
+
 def discard_progress_file(task_id):
     try:
         os.remove(progress_file_path(task_id))
@@ -2826,9 +2893,13 @@ def fresh_provider_refusal(before, after, ignore=None):
     current, haystack = keys(after)
 
     for key, match in current:
-        if not seen[key]:
+        compatible = key if seen[key] else next((
+            old for old, count in seen.items()
+            if count and old[0] == key[0] and (old[1] is None or key[1] is None)
+        ), None)
+        if compatible is None:
             return _evidence_window(haystack, match)
-        seen[key] -= 1
+        seen[compatible] -= 1
 
     return None
 
@@ -2930,6 +3001,7 @@ def build_result_reminder_prompt(task_id):
 
 
 def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False):
+    timeout_ms = remaining_ms(timeout_ms)
     try:
         result = run_herdr(
             "agent",
@@ -3141,6 +3213,11 @@ def deliver_prompt(agent_name, delegated_prompt, timeout_ms, task_id):
 
 
 def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
+    with execution_budget(timeout_ms):
+        return _run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy)
+
+
+def _run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
     delegated_prompt = build_delegation_prompt(task, task_id, slurm_policy)
 
     # herdr reports an agent whose provider refused the prompt as done, just
@@ -3153,7 +3230,7 @@ def run_prompt_only(agent_name, task_id, task, timeout_ms, slurm_policy=None):
     # checking.
     before, _ = _terminal_read(agent_name, READ_LINES_DEFAULT)
 
-    result = deliver_prompt(agent_name, delegated_prompt, timeout_ms, task_id)
+    result = deliver_prompt(agent_name, delegated_prompt, remaining_ms(timeout_ms), task_id)
 
     if before is not None:
         after, _ = _terminal_read(agent_name, READ_LINES_DEFAULT)
@@ -3241,6 +3318,12 @@ def _read_terminal_tail(agent_name, read_lines):
 
 def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
                           slurm_policy=None):
+    with execution_budget(timeout_ms):
+        return _execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines, slurm_policy)
+
+
+def _execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
+                           slurm_policy=None):
     os.makedirs(RESULT_DIR, exist_ok=True)
 
     # Old terminal errors are not evidence that this request was refused.
@@ -3249,7 +3332,7 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
     deliver_prompt(
         agent_name,
         build_delegation_prompt(task, task_id, slurm_policy),
-        timeout_ms,
+        remaining_ms(timeout_ms),
         task_id,
     )
     turn_sec = time.monotonic() - turn_began
@@ -3289,7 +3372,7 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
             deliver_prompt(
                 agent_name,
                 build_result_reminder_prompt(task_id),
-                RESULT_REMINDER_TIMEOUT_MS,
+                remaining_ms(RESULT_REMINDER_TIMEOUT_MS),
                 task_id,
             )
         except AgentQuotaExhaustedError as error:
@@ -3306,15 +3389,12 @@ def execute_sentinel_task(agent_name, task_id, task, timeout_ms, read_lines=500,
         response = read_result_file(task_id, cleanup=False)
 
     if response is None and turn_sec < QUICK_END_SEC:
-        # Too quick to have run anything. Say that, instead of sending the
-        # caller to check permissions on a directory the agent never reached.
+        # A fast turn can still have completed side effects before losing its file.
         raise SentinelResultMissingError(
             f"Sentinel's turn ended after {turn_sec:.0f}s without a result "
-            "file -- too quickly to have run the task. It most likely "
-            "refused it or never started it: a provider error (a size "
-            "limit, a rejected key) or a refusal, which its terminal will "
-            "show. The tail below is the evidence; waiting longer, or "
-            "sending the same prompt again, will not change it.",
+            "file. It may already have executed the task and failed only "
+            "to deliver the answer. Check its terminal and actual effects "
+            "before retrying; elapsed time does not establish whether work ran.",
             raw_output=_read_terminal_tail(agent_name, read_lines),
             reason="ended_quickly",
         )
@@ -3496,6 +3576,7 @@ def task_worker(stop_event=None):
         if _shutting_down or (stop_event is not None and stop_event.is_set()):
             return
         try:
+            retry_sync_completions()
             cancel_blocked_tasks()
             task_row = peek_next_task(exclude_agents=busy_this_pass)
 
@@ -3544,17 +3625,17 @@ def task_worker(stop_event=None):
                     if not claim_task(task_id):
                         continue
                     claimed = True
-                    result, used_agent = run_with_quota_failover(
-                        agent_name, operation
-                    )
+                    with execution_budget(task_row["timeout_ms"]):
+                        result, used_agent = run_with_quota_failover(agent_name, operation)
                 else:
                     with acquire_agent_for_delegation(agent_name):
                         if not claim_task(task_id):
                             continue
                         claimed = True
-                        result, used_agent = run_with_quota_failover(
-                            agent_name, operation, primary_locked=True
-                        )
+                        with execution_budget(task_row["timeout_ms"]):
+                            result, used_agent = run_with_quota_failover(
+                                agent_name, operation, primary_locked=True,
+                            )
 
                 settlement = (settle_completed_task, (
                     task_id, result, routing_note(agent_name, used_agent), used_agent,
@@ -3633,7 +3714,7 @@ def run_herdr(*args, timeout=None):
         [HERDR, *args],
         text=True,
         capture_output=True,
-        timeout=timeout if timeout is not None else HERDR_DEFAULT_TIMEOUT_SEC,
+        timeout=remaining_seconds(timeout if timeout is not None else HERDR_DEFAULT_TIMEOUT_SEC),
     )
 
     return {
@@ -4024,6 +4105,9 @@ class Handler(BaseHTTPRequestHandler):
             # is worse than no check. herdr happily reports a quota-blocked
             # agent as idle, so /ready used to answer ready:true and the
             # dispatch that followed was refused 429 by the circuit.
+            if get_agent_lock(agent_name).locked():
+                self.send_json({"ok": True, "ready": False, "reason": "locked"})
+                return
             quota_block = get_agent_quota_block(agent_name)
 
             if quota_block:
@@ -4154,12 +4238,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            # A late result may have arrived since anyone last looked.
+            retry_sync_completions()
+            # Recover before filtering/paging, so the response matches its filter.
+            adopt_all_late_results()
             tasks = [
-                task_view(
-                    (adopt_late_result(t["task_id"]) or t)
-                    if t["status"] in LATE_RESULT_STATUSES else t
-                )
+                task_view(t)
                 for t in list_tasks(limit, status_filter)
             ]
 
@@ -4221,6 +4304,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/workflows/"):
+            retry_sync_completions()
             workflow_id = unquote(path[len("/workflows/"):])
             rows = list_workflow_tasks(workflow_id)
 
@@ -4257,6 +4341,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/tasks/"):
             task_id = path[len("/tasks/"):]
+            retry_sync_completions(task_id)
             task = get_task(task_id)
 
             if task is None:
@@ -4290,7 +4375,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Waiting for " + ", ".join(
                         f"task {t} ({status})" for t, status in waiting
                     ) + " to finish before it can start."
-                    if waiting else explain_queued(task["agent"])
+                    if waiting else bounded_queue_explanation(task["agent"])
                 )
 
             self.send_json({
@@ -4588,6 +4673,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(invalid_request_payload(e), 400)
             return
 
+        return self._run_sync_request(body, task, agent_name, timeout_ms, slurm_policy, read_lines)
+
+    def _run_sync_request(self, body, task, agent_name, timeout_ms, slurm_policy, read_lines):
+        with execution_budget(timeout_ms):
+            return self._execute_sync_request(body, task, agent_name, timeout_ms, slurm_policy, read_lines)
+
+    def _execute_sync_request(self, body, task, agent_name, timeout_ms, slurm_policy, read_lines):
+        path = urlparse(self.path).path
         try:
             agent_name = agent_or_auto(agent_name)
         except AgentNotFoundError as e:
@@ -4628,7 +4721,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
             result_text, used_agent = run_with_quota_failover(agent_name, execute)
-            complete_task(task_id, result_text, note=routing_note(agent_name, used_agent))
+            note = routing_note(agent_name, used_agent)
+            try:
+                complete_task(task_id, result_text, note=note)
+            except (sqlite3.Error, OSError) as error:
+                defer_sync_completion(task_id, result_text, note)
+                self.send_json({
+                    "ok": False, "task_id": task_id, "agent": used_agent,
+                    "status": "completion_pending",
+                    "error": f"Result delivered; database persistence is pending: {error}",
+                    "hint": "Query this task_id later. Do not execute the task again.",
+                }, 503)
+                return
 
             result_data, _ = parse_structured_result(result_text)
 

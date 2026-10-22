@@ -9,11 +9,16 @@ import shutil
 import stat
 import subprocess
 import sys
+import shlex
+from pathlib import Path
 
 import pytest
 
 REMOTE = os.path.join(os.path.dirname(__file__), "..", "remote")
 BASH = shutil.which("bash")
+if sys.platform == "win32":
+    native_bash = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/bin/bash.exe"
+    BASH = str(native_bash) if native_bash.is_file() else None
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is not available")
 
@@ -28,7 +33,10 @@ pytestmark = pytest.mark.skipif(BASH is None, reason="bash is not available")
 
 
 def _stub(path, body):
-    with open(path, "w", newline="\n") as fh:
+    if path.name == "python3":
+        interpreter = shlex.quote(Path(sys.executable).as_posix())
+        body = f'if [ "${{1:-}}" = "-c" ]; then exec {interpreter} "$@"; fi\n' + body
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("#!/usr/bin/env bash\n" + body)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
 
@@ -52,12 +60,14 @@ def _host(tmp_path, supervisor=True):
 
     for name in ("screen", "pkill", "pgrep"):
         _stub(stubs / name, f'echo "{name} $*" >> "{calls.as_posix()}"\nexit 0\n')
+    _stub(stubs / "python3", "exit 0\n")
 
     # `curl` answers like a healthy bridge unless told otherwise.
     _stub(
         stubs / "curl",
         f'echo "curl $*" >> "{calls.as_posix()}"\n'
-        'if [ "${STUB_HEALTH:-ok}" = ok ]; then echo \'{"ok": true, "version": 99}\'; exit 0; fi\n'
+        'if [ "${STUB_HEALTH:-ok}" = unhealthy ]; then echo \'{"ok": false, "reason": "worker_dead"}\'; exit 0; fi\n'
+        'if [ "${STUB_HEALTH:-ok}" = ok ]; then echo \'{"ok": true, "version": 99, "service": "nesi-sentinel-bridge"}\'; exit 0; fi\n'
         "exit 7\n",
     )
 
@@ -74,8 +84,19 @@ def _host(tmp_path, supervisor=True):
 
 
 def _run(args, env, cwd=None):
+    env = dict(env, PYTHONUTF8="1")
+    if sys.platform == "win32":
+        env["HOME"] = env["HOME"].replace("\\", "/")
+        env["BRIDGE_TEST_STUBS"] = env["PATH"].split(os.pathsep, 1)[0]
+        args = list(args)
+        if args and args[0] != "-c":
+            args[0] = Path(args[0]).as_posix()
+        command = [BASH, "-c", 'export PATH="$(cygpath -u "$BRIDGE_TEST_STUBS"):$PATH"; '
+                   'exec bash "$@"', "bridge-tests", *args]
+    else:
+        command = [BASH, *args]
     return subprocess.run(
-        [BASH, *args], env=env, cwd=cwd, capture_output=True, text=True, timeout=60
+        command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8", timeout=60
     )
 
 
@@ -119,6 +140,31 @@ def test_a_restart_that_comes_back_succeeds_and_starts_the_right_script(tmp_path
     # that may be empty.
     assert started[0].endswith("bridge-supervisor.sh")
     assert "herdr-task-bridge" in started[0]
+
+
+def test_a_restart_rejects_an_unhealthy_http_reply(tmp_path):
+    root, calls, env = _host(tmp_path)
+    env["STUB_HEALTH"] = "unhealthy"
+    result = _run([str(root / "remote/bridge-restart.sh")], env)
+    assert result.returncode != 0
+    assert "bridge-restart: ok" not in result.stdout
+
+
+def test_a_restart_probes_the_port_configured_in_bridge_env(tmp_path):
+    root, calls, env = _host(tmp_path)
+    (root / "remote/bridge.env").write_text('SENTINEL_BRIDGE_PORT="18765"\n', encoding="utf-8")
+    env.pop("SENTINEL_BRIDGE_PORT", None)
+    result = _run([str(root / "remote/bridge-restart.sh")], env)
+    assert result.returncode == 0, result.stderr
+    assert any("18765/health" in call for call in _calls(calls) if call.startswith("curl"))
+
+
+def test_status_recognises_the_supervisors_unbuffered_python(tmp_path):
+    root, calls, env = _host(tmp_path)
+    _stub(tmp_path / "stubs/pgrep", 'printf "%s\\n" "python3 -u bridge.py" | grep -E -- "$2"\n')
+    result = _run(["-c", f'source "{(root / "remote/bridge-aliases.sh").as_posix()}"; bridge-status'], env)
+    assert result.returncode == 0, result.stderr
+    assert "(not running)" not in result.stdout
 
 
 def test_the_shell_function_works_from_a_child_shell_without_the_variable(tmp_path):
@@ -199,6 +245,13 @@ def test_the_supervisor_runs_with_nothing_set_when_there_is_no_env_file(tmp_path
     _run([str(root / "remote" / "bridge-supervisor.sh")], env)
 
     assert seen.read_text().strip() == "token=UNSET failover=UNSET"
+
+
+def test_the_supervisor_uses_its_checkout_when_home_has_no_repo(tmp_path):
+    root, env, seen = _supervisor_world(tmp_path, [])
+    env["HOME"] = str(tmp_path / "another-home")
+    _run([str(root / "remote/bridge-supervisor.sh")], env)
+    assert seen.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX permission bits")

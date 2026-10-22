@@ -712,9 +712,11 @@ def test_health_reports_worker_alive_flag(tmp_path, monkeypatch):
 
 
 def test_execute_sentinel_task_recovery_timeout_raises_timeout_error(monkeypatch):
+    prompts = []
     def fake_run_herdr(*args, **kwargs):
         if args[1] == "prompt":
-            if "120000" in args:
+            prompts.append(args)
+            if len(prompts) == 2:
                 # this is the recovery prompt call
                 raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=135)
             return {"ok": True, "stdout": "", "stderr": ""}
@@ -747,9 +749,11 @@ def test_task_worker_orphans_on_recovery_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "WORKER_POLL_SECONDS", 0.02)
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a, **k: ("idle", {"ok": True}))
 
+    prompts = []
     def fake_run_herdr(*args, **kwargs):
         if args[1] == "prompt":
-            if "120000" in args:
+            prompts.append(args)
+            if len(prompts) == 2:
                 raise subprocess_module.TimeoutExpired(cmd="herdr", timeout=135)
             return {"ok": True, "stdout": "", "stderr": ""}
         return {"ok": True, "stdout": "没有 marker", "stderr": ""}
@@ -4116,7 +4120,7 @@ def test_ready_and_quota_explain_a_size_limit_block(live_server, monkeypatch):
     assert body["blocked_agents"][0]["kind"] == "context_limit"
 
 
-def test_a_turn_that_ends_in_seconds_with_no_result_says_nothing_was_done(tmp_path, monkeypatch):
+def test_a_fast_turn_without_a_result_keeps_execution_uncertain(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     # Wording no pattern knows: the signature is the timing, not the text.
     monkeypatch.setattr(bridge, "run_herdr", lambda *a, **k: {
@@ -4130,8 +4134,9 @@ def test_a_turn_that_ends_in_seconds_with_no_result_says_nothing_was_done(tmp_pa
 
     error = exc_info.value
     assert error.reason == "ended_quickly"
-    assert "never started" in str(error)
-    # The permission advice is the wrong lead when no work happened at all.
+    assert "may already have executed" in str(error)
+    assert "never started" not in str(error)
+    # The terminal is evidence; elapsed time alone does not establish refusal.
     assert "permission" not in str(error)
     assert "gateway refused" in error.raw_output
 
@@ -4146,8 +4151,7 @@ def test_a_slow_turn_with_no_result_keeps_the_original_advice(tmp_path, monkeypa
     with pytest.raises(bridge.SentinelResultMissingError) as exc_info:
         bridge.execute_sentinel_task("w1:p1", "1", "audit", 1000)
 
-    # Work that ran for a while and then lost its file really can be a
-    # permissions problem; only a turn too short to have done anything is not.
+    # Delivery may fail independently of how long the original turn took.
     assert exc_info.value.reason is None
     assert "permission system" in str(exc_info.value)
 
