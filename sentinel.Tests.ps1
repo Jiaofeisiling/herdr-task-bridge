@@ -1660,9 +1660,9 @@ Describe "login" {
         (Get-Content -LiteralPath (Join-Path $Script:Dir "token") -Raw).Trim() | Should -Be $token
     }
 
-    It "makes the file readable by its owner alone" -Skip:($env:OS -ne "Windows_NT") {
+    It "makes the file readable by its owner alone" -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
-            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn "typed-by-the-owner-0123456789ab"
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir; OS = "" } -StdIn "typed-by-the-owner-0123456789ab"
         Wait-SentinelExit -Process $proc | Out-Null
 
         $acl = Get-Acl -LiteralPath (Join-Path $Script:Dir "token")
@@ -1672,7 +1672,7 @@ Describe "login" {
         ($acl.Access | Where-Object { $_.IdentityReference.Value -match "Everyone|BUILTIN\\Users" }) | Should -BeNullOrEmpty
     }
 
-    It "leaves the owner able to delete the file again" -Skip:($env:OS -ne "Windows_NT") {
+    It "leaves the owner able to delete the file again" -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         # To log out or to start over. A first version granted read and write only,
         # which PowerShell's Remove-Item got round (the owner can delete files in
         # their own directory), but a tool such as MSYS's rm, which asks for the

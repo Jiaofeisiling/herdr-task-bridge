@@ -24,6 +24,9 @@ is folded into 4.1.0.
   and recognise the supervisor's unbuffered Python command in process checks.
 - Add isolated regressions, native Bash deployment-script tests on Windows when
   available, and explicit UTF-8 subprocess output for the E2E suite.
+- Detect Windows from the native platform when securing the client token file;
+  a missing `OS` environment variable must not bypass ACL protection or its tests.
+  Include the audit regression module in the Windows CI run.
 
 ## 4.1.0 (bridge v28)
 

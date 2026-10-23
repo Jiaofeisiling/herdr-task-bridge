@@ -39,7 +39,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cd sentinel-bridge
-          python -m pytest -v test_bridge.py test_e2e.py
+          python -m pytest -v test_bridge.py test_e2e.py test_audit_regressions.py
 
   pester-windows-powershell:
     name: pester (powershell)

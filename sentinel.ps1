@@ -770,7 +770,7 @@ switch ($Command) {
 
         # Readable by its owner alone. Cutting inheritance keeps a parent
         # directory's permissions from applying.
-        if ($env:OS -eq "Windows_NT") {
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             & icacls.exe $path /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
         }
         else {
