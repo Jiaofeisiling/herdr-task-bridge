@@ -7,6 +7,15 @@ is folded into 4.1.0.
 
 ## Unreleased
 
+- Never resend a failed prompt through a newly resolved target outside its
+  dispatch lock. Unknown delivery errors retain the original execution target.
+- Retry synchronous failure settlement after database outages, retain task IDs
+  on unexpected execution errors, and keep optional routing diagnostics from
+  preventing successful result persistence.
+- Recover available late parent results before cancelling dependent tasks during
+  normal operation, with cancellation decisions serialized against adoption.
+- Keep advisory startup discovery failures and Windows cross-drive paths from
+  preventing the HTTP service from starting.
 - Persist synchronous asks before dispatch and commit their results before HTTP
   delivery. Retry interrupted result/state persistence without resending work.
 - Hold an OS lock per database before startup recovery, reserve the listener

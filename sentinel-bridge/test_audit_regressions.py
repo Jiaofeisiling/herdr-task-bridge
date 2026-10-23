@@ -2,6 +2,7 @@
 import io
 import json
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 
@@ -24,6 +25,7 @@ def isolated_bridge(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
     monkeypatch.setattr(bridge, "_agent_locks", {})
     monkeypatch.setattr(bridge, "_pending_sync_completions", {})
+    monkeypatch.setattr(bridge, "_pending_sync_failures", {})
     monkeypatch.setattr(bridge, "_shutting_down", False)
     monkeypatch.setattr(bridge, "list_agents", lambda: (AGENTS, {"ok": True}))
     monkeypatch.setattr(bridge, "get_agent_status", lambda *a: ("idle", {"ok": True}))
@@ -406,3 +408,134 @@ def test_an_unavailable_listener_prevents_database_recovery(monkeypatch):
     monkeypatch.setattr(bridge, "ThreadingHTTPServer", BusyPort)
     assert bridge.main() == 1
     assert bridge.get_task(task_id)["status"] == "running"
+
+
+@pytest.mark.parametrize("error", [
+    '{"error":{"code":"transport_error","message":"lost response"}}',
+    'connection closed after dispatch',
+    '{"error":{"code":"agent_not_found"}}',
+])
+def test_prompt_failure_never_retargets_outside_the_held_agent_lock(monkeypatch, error):
+    dispatched = []
+
+    def run(*args, **kwargs):
+        dispatched.append(args[2])
+        return {"ok": False, "stdout": "", "stderr": error}
+
+    monkeypatch.setattr(bridge, "run_herdr", run)
+    monkeypatch.setattr(bridge, "resolve_agent", lambda _: "backup")
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: "diagnostic")
+    with pytest.raises(bridge.SentinelPromptError):
+        bridge._run_herdr_prompt("primary", "perform side effect", 1000)
+    assert dispatched == ["primary"]
+
+
+def test_sync_timeout_settlement_is_retried_without_resending(monkeypatch):
+    original = bridge._transition_where
+    executed, writes = [], []
+
+    def execute(agent, task_id, *args):
+        executed.append(task_id)
+        raise TimeoutError("delivery uncertain")
+
+    def persist(conn, to, *args, **kwargs):
+        if to == "orphaned":
+            writes.append(1)
+            if len(writes) <= 2:
+                raise sqlite3.OperationalError("database is locked")
+        return original(conn, to, *args, **kwargs)
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    monkeypatch.setattr(bridge, "_transition_where", persist)
+    handler = request("/ask", {"task": "audit", "agent": "primary"})
+    handler._do_POST_guarded()
+    assert handler.replies[-1][0] == 504
+    for _ in range(2):
+        lookup = request("/tasks/" + executed[0])
+        lookup._do_GET()
+    assert bridge.get_task(executed[0])["status"] == "orphaned"
+    assert len(executed) == 1 and len(writes) == 3
+
+
+@pytest.mark.parametrize("error", [OSError("local I/O failure"), ValueError("unexpected output")])
+def test_unexpected_sync_execution_error_keeps_queryable_recovery(monkeypatch, error):
+    executed = []
+
+    def execute(agent, task_id, *args):
+        executed.append(task_id)
+        raise error
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    handler = request("/ask", {"task": "audit", "agent": "primary"})
+    handler._do_POST_guarded()
+    status, reply = handler.replies[-1]
+    assert status == 500 and reply["task_id"] == executed[0]
+    assert bridge.get_task(executed[0])["status"] == "orphaned"
+    result_file(executed[0], "late answer")
+    lookup = request("/tasks/" + executed[0])
+    lookup._do_GET()
+    assert lookup.replies[-1][1]["task"]["result_text"] == "late answer"
+
+
+def test_routing_diagnostics_failure_does_not_lose_completed_sync_result(monkeypatch):
+    original = bridge.get_agent_quota_block
+
+    def diagnostics_unavailable(*args):
+        raise sqlite3.OperationalError("database is locked")
+
+    def execute(agent, task_id, *args):
+        if agent == "primary":
+            raise bridge.AgentQuotaExhaustedError(agent, "insufficient credits")
+        result_file(task_id, "completed on backup")
+        # Only optional post-execution routing diagnostics fail.
+        monkeypatch.setattr(bridge, "get_agent_quota_block", diagnostics_unavailable)
+        return "completed on backup"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    handler = request("/ask", {"task": "audit", "agent": "primary"})
+    handler._do_POST_guarded()
+    status, reply = handler.replies[-1]
+    monkeypatch.setattr(bridge, "get_agent_quota_block", original)
+    assert status == 200
+    assert bridge.get_task(reply["task_id"])["result_text"] == "completed on backup"
+
+
+def test_dependency_cancellation_recovers_already_delivered_parent_result():
+    parent, _ = bridge.enqueue_task("parent", 1000, "primary")
+    child, _ = bridge.enqueue_task("child", 1000, "primary", depends_on=(parent,))
+    bridge.claim_task(parent)
+    bridge.orphan_task(parent, "wait expired")
+    result_file(parent, "late parent answer")
+    assert bridge.cancel_blocked_tasks() == 0
+    assert bridge.get_task(parent)["status"] == "done"
+    assert bridge.get_task(child)["status"] == "queued"
+    assert bridge.peek_next_task()["task_id"] == child
+
+
+def test_scope_warning_handles_agent_on_another_windows_drive(monkeypatch):
+    import ntpath
+
+    monkeypatch.setattr(bridge, "RESULT_DIR", "C:\\bridge\\results")
+    monkeypatch.setattr(bridge, "list_agents", lambda: ([
+        {"name": "other-drive", "cwd": "E:\\work"},
+    ], {"ok": True}))
+    # Exercise Windows path semantics on every test platform.
+    monkeypatch.setattr(bridge.os.path, "abspath", ntpath.abspath)
+    monkeypatch.setattr(bridge.os.path, "commonpath", ntpath.commonpath)
+    assert "other-drive" in bridge.result_dir_scope_warning()
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("Herdr unavailable"),
+                                  subprocess.TimeoutExpired("fake-herdr", 10)])
+def test_advisory_agent_discovery_failure_does_not_prevent_startup(monkeypatch, error):
+    def unavailable():
+        raise error
+
+    monkeypatch.setattr(bridge, "list_agents", unavailable)
+    monkeypatch.setattr(bridge, "startup_security_problems", lambda: [])
+    monkeypatch.setattr(bridge, "harden_permissions", lambda: [])
+    monkeypatch.setattr(bridge, "ThreadingHTTPServer", StartupServer)
+    started = []
+    monkeypatch.setattr(bridge, "serve_bridge", lambda server: started.append(True))
+    assert bridge.main() == 0
+    assert started == [True]

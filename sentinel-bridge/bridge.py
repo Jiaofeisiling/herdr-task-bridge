@@ -1268,7 +1268,7 @@ def adopt_all_late_results():
 
 
 def record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
-                        status, error_text):
+                        status, error_text, _defer=True):
     """Settle a failed synchronous ask, retaining its original execution target.
 
     Also accepts failures predating begin_sync_attempt (for example an
@@ -1300,6 +1300,13 @@ def record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
         return True
     except Exception as e:
         print(f"[ask {task_id}] could not record the failure: {e}")
+        if _defer:
+            with _pending_sync_guard:
+                _pending_sync_failures[(os.path.realpath(DB_PATH), task_id)] = (
+                    task_id, task, timeout_ms, agent_name, slurm_policy, status, error_text,
+                )
+            _work_available.set()
+            return True  # recovery remains queryable; only settlement will be retried
         return False
 
 
@@ -1763,6 +1770,22 @@ def cancel_blocked_tasks():
             if conn.execute("SELECT 1 FROM task_deps LIMIT 1").fetchone() is None:
                 return cancelled
 
+            recoverable = conn.execute("""
+                SELECT DISTINCT u.task_id FROM tasks u
+                JOIN task_deps d ON d.depends_on = u.task_id
+                JOIN tasks t ON t.task_id = d.task_id
+                WHERE t.status = 'queued' AND u.status IN ('error', 'orphaned')
+            """).fetchall()
+
+        # Recovery uses its own transaction. Do it before deciding which
+        # descendants to cancel, then re-read under the write lock so a
+        # concurrent adoption cannot be followed by a stale cancellation.
+        for row in recoverable:
+            adopt_late_result(row["task_id"])
+
+        with db_session() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
             blocked = conn.execute(f"""
                 SELECT t.task_id AS task_id, u.task_id AS upstream,
                        u.status AS upstream_status
@@ -1911,7 +1934,12 @@ def routing_note(requested, used):
     if used == requested:
         return None
 
-    block = get_agent_quota_block(requested)
+    try:
+        block = get_agent_quota_block(requested)
+    except (sqlite3.Error, OSError):
+        # Optional diagnostic enrichment must not replace a delivered result
+        # with an error, or prevent its persistence from being retried.
+        block = None
     why = ""
     if block:
         why = f" ({block['kind'].replace('_', ' ')}: {block['detail']})"
@@ -1931,6 +1959,7 @@ def settle_completed_task(task_id, result, note, used_agent):
 
 
 _pending_sync_completions = {}
+_pending_sync_failures = {}
 _pending_sync_guard = threading.Lock()
 
 
@@ -1941,7 +1970,20 @@ def defer_sync_completion(task_id, result, note):
 
 
 def retry_sync_completions(task_id=None):
+    """Retry synchronous result/failure persistence, never task execution."""
     database = os.path.realpath(DB_PATH)
+    with _pending_sync_guard:
+        failures = [(key, value) for key, value in _pending_sync_failures.items()
+                    if key[0] == database and (task_id is None or key[1] == task_id)]
+    for key, args in failures:
+        if not record_sync_failure(*args, _defer=False):
+            row = get_task(key[1])
+            if not row or row["status"] == "running":
+                continue
+        with _pending_sync_guard:
+            if _pending_sync_failures.get(key) == args:
+                _pending_sync_failures.pop(key, None)
+
     with _pending_sync_guard:
         pending = [(key, value) for key, value in _pending_sync_completions.items()
                    if key[0] == database and (task_id is None or key[1] == task_id)]
@@ -2748,7 +2790,12 @@ def result_dir_scope_warning():
     puzzling runtime failure into a line in the startup log. Advisory only:
     the bridge cannot see an agent's allowlist, just this one common cause.
     """
-    agents, _ = list_agents()
+    try:
+        agents, _ = list_agents()
+    except (OSError, subprocess.TimeoutExpired):
+        # Discovery is advisory here. The HTTP service must still start so
+        # operators can inspect it while Herdr is unavailable or recovering.
+        return None
 
     if not agents:
         # herdr not up yet is normal at boot. Don't invent a warning out of
@@ -2763,7 +2810,12 @@ def result_dir_scope_warning():
         if not cwd:
             continue
 
-        if os.path.commonpath([result_dir, os.path.abspath(cwd)]) != os.path.abspath(cwd):
+        try:
+            inside = os.path.commonpath([result_dir, os.path.abspath(cwd)]) == os.path.abspath(cwd)
+        except ValueError:
+            # Windows paths on different drives share no common path.
+            inside = False
+        if not inside:
             outside.append(agent.get("name") or agent.get("pane_id") or "?")
 
     if not outside:
@@ -3000,7 +3052,7 @@ def build_result_reminder_prompt(task_id):
 """.strip()
 
 
-def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False):
+def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms):
     timeout_ms = remaining_ms(timeout_ms)
     try:
         result = run_herdr(
@@ -3063,26 +3115,10 @@ def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms, _retrying=False)
                 "still be executing the task."
             )
 
-        # Any other failure: the error says the target could not take the
-        # prompt (an unknown agent, say), so nothing reached an agent and
-        # re-sending cannot double-execute anything. That reasoning holds
-        # for these codes only -- it did not hold for the two above, and an
-        # earlier version of this comment claimed it for all of them. This is
-        # the one safe place to recover from a stale identifier, and it costs
-        # nothing on the happy path, unlike resolving every request up front.
-        if not _retrying:
-            try:
-                target = resolve_agent(agent_name)
-            except AgentNotFoundError:
-                # Resolution is here to recover, not to reinterpret. If it
-                # cannot help, the prompt failure is still the fact worth
-                # reporting -- masking it would hide herdr's own message.
-                target = agent_name
-
-            if target != agent_name:
-                return _run_herdr_prompt(
-                    target, delegated_prompt, timeout_ms, _retrying=True
-                )
+        # The caller resolved this identity, acquired its lock, and recorded
+        # the execution target. Retargeting here would bypass the new agent's
+        # lock and durable ownership. An unknown transport failure also says
+        # nothing about whether the first prompt ran. Never resend here.
 
         # herdr reports a refusal as a code -- "agent_blocked" -- and
         # nothing more. Why the agent is blocked (a permission request, a
@@ -4691,6 +4727,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         task_id = str(uuid.uuid4())
+        attempt_started = False
+        response_started = False
 
         try:
             if path == "/prompt":
@@ -4706,6 +4744,7 @@ class Handler(BaseHTTPRequestHandler):
                     failover=body.get("agent") is None,
                 )
 
+                response_started = True
                 self.send_json({
                     "ok": True,
                     "task_id": task_id,
@@ -4715,7 +4754,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             def execute(target):
+                nonlocal attempt_started
                 begin_sync_attempt(task_id, task, timeout_ms, agent_name, target, slurm_policy)
+                attempt_started = True
                 return execute_sentinel_task(
                     target, task_id, task, timeout_ms, read_lines, slurm_policy,
                 )
@@ -4726,6 +4767,7 @@ class Handler(BaseHTTPRequestHandler):
                 complete_task(task_id, result_text, note=note)
             except (sqlite3.Error, OSError) as error:
                 defer_sync_completion(task_id, result_text, note)
+                response_started = True
                 self.send_json({
                     "ok": False, "task_id": task_id, "agent": used_agent,
                     "status": "completion_pending",
@@ -4736,6 +4778,7 @@ class Handler(BaseHTTPRequestHandler):
 
             result_data, _ = parse_structured_result(result_text)
 
+            response_started = True
             self.send_json({
                 "ok": True,
                 "task_id": task_id,
@@ -4749,7 +4792,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         except QuotaFailoverExhaustedError as e:
-            if path == "/ask" and get_task(task_id):
+            if path == "/ask" and attempt_started:
                 record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
                                     "quota_exhausted", str(e))
             self.send_json(
@@ -4784,13 +4827,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         except SentinelBusyError as e:
-            if path == "/ask" and get_task(task_id):
+            if path == "/ask" and attempt_started:
                 record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
                                     "error", str(e))
             self.send_json(
                 {
                     "ok": False,
                     "status": "busy",
+                    **({"task_id": task_id} if attempt_started else {}),
                     "agent": agent_name,
                     "agent_status": e.agent_status,
                 },
@@ -4799,13 +4843,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         except SentinelUnavailableError as e:
-            if path == "/ask" and get_task(task_id):
+            if path == "/ask" and attempt_started:
                 record_sync_failure(task_id, task, timeout_ms, agent_name, slurm_policy,
                                     "error", str(e))
             self.send_json(
                 {
                     "ok": False,
                     "status": "unavailable",
+                    **({"task_id": task_id} if attempt_started else {}),
                     "agent": agent_name,
                     "reason": "unable_to_query_sentinel",
                     "detail": str(e),
@@ -4873,6 +4918,20 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     payload["hint"] = SYNC_RECOVERY_HINT
 
+            self.send_json(payload, 500)
+            return
+
+        except Exception as e:
+            if response_started:
+                raise  # a lost HTTP reply must not rewrite the execution outcome
+            payload = {"ok": False, "error": f"internal error: {e}"}
+            if path == "/ask" and attempt_started:
+                payload["task_id"] = task_id
+                if record_sync_failure(
+                    task_id, task, timeout_ms, agent_name, slurm_policy,
+                    "orphaned", str(e),
+                ):
+                    payload["hint"] = SYNC_RECOVERY_HINT
             self.send_json(payload, 500)
             return
 
