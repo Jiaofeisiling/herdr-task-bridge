@@ -539,3 +539,186 @@ def test_advisory_agent_discovery_failure_does_not_prevent_startup(monkeypatch, 
     monkeypatch.setattr(bridge, "serve_bridge", lambda server: started.append(True))
     assert bridge.main() == 0
     assert started == [True]
+
+
+@pytest.mark.parametrize("reader", ["get", "list"])
+def test_expiring_quota_snapshot_does_not_delete_concurrent_renewal(monkeypatch, reader):
+    bridge.mark_agent_quota_blocked("primary", "old block")
+    with bridge.db_session() as conn:
+        conn.execute("UPDATE quota_blocks SET detected_at = ?", ("2000-01-01T00:00:00+00:00",))
+    monkeypatch.setattr(bridge, "QUOTA_BLOCK_TTL_SECONDS", 60)
+    original = bridge._quota_block_expired
+    renew, renewed = threading.Event(), threading.Event()
+    errors = []
+
+    def writer():
+        try:
+            assert renew.wait(2)
+            bridge.mark_agent_quota_blocked("primary", "fresh block")
+        except Exception as error:
+            errors.append(error)
+        finally:
+            renewed.set()
+
+    def expired(block):
+        if block["detail"] == "old block":
+            renew.set()
+            assert renewed.wait(2)
+        return original(block)
+
+    monkeypatch.setattr(bridge, "_quota_block_expired", expired)
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    try:
+        if reader == "get":
+            bridge.get_agent_quota_block("primary")
+        else:
+            bridge.list_agent_quota_blocks()
+        assert not errors
+        block = bridge.get_agent_quota_block("primary")
+        assert block and block["detail"] == "fresh block"
+    finally:
+        renew.set()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize("status", ["orphaned", "error"])
+def test_pending_completion_uses_known_answer_after_state_changes_without_file(status):
+    task_id = bridge.create_task("audit", 1000, "primary")
+    bridge.claim_task(task_id)
+    bridge.defer_sync_completion(task_id, "answer already read", "routing note")
+    bridge.record_sync_failure(task_id, "audit", 1000, "primary", None, status, "original failure")
+    bridge.retry_sync_completions(task_id)
+    row = bridge.get_task(task_id)
+    assert row["status"] == "done"
+    assert row["result_text"] == "answer already read"
+    assert "original failure" in row["error_text"] and "routing note" in row["error_text"]
+    assert not bridge._pending_sync_completions
+
+
+def test_sync_success_is_durable_when_shutdown_wins_completion_race(monkeypatch):
+    def execute(agent, task_id, *args):
+        result_file(task_id, "completed answer")
+        bridge.orphan_task(task_id, "shutdown raced with completion")
+        return "completed answer"
+
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    handler = request("/ask", {"task": "audit", "agent": "primary"})
+
+    def reply(obj, status=200):
+        if status == 200:
+            row = bridge.get_task(obj["task_id"])
+            assert row["status"] == "done" and row["result_text"] == "completed answer"
+        handler.replies.append((status, obj))
+
+    handler.send_json = reply
+    handler._do_POST_guarded()
+    assert handler.replies[-1][0] == 200
+
+
+class ShutdownServer:
+    def __init__(self):
+        self.closed = threading.Event()
+
+    def shutdown(self):
+        pass
+
+    def server_close(self):
+        self.closed.set()
+
+
+def test_shutdown_drains_background_execution_and_result_settlement(monkeypatch):
+    task_id = bridge.create_task("audit", 1000, "primary")
+    executing, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    stop = threading.Event()
+    server = ShutdownServer()
+
+    def execute(**kwargs):
+        executing.set()
+        assert release.wait(3)
+        result_file(task_id, "background answer")
+        return "background answer"
+
+    worker = threading.Thread(target=bridge.task_worker, args=(stop,), daemon=True)
+    monkeypatch.setattr(bridge, "_worker_thread", worker)
+    monkeypatch.setattr(bridge, "_worker_stop", stop)
+    monkeypatch.setattr(bridge, "_inflight", 0)
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    worker.start()
+    shutdown = threading.Thread(target=lambda: (
+        bridge.graceful_shutdown(server, grace_sec=2), stopped.set()), daemon=True)
+    try:
+        assert executing.wait(2)
+        shutdown.start()
+        assert server.closed.wait(2)
+        assert not stopped.wait(0.15), "shutdown ignored the background worker"
+        release.set()
+        shutdown.join(timeout=3)
+        worker.join(timeout=3)
+        assert stopped.is_set() and not worker.is_alive()
+        assert bridge.get_task(task_id)["status"] == "done"
+    finally:
+        release.set()
+        stop.set()
+        bridge._work_available.set()
+        worker.join(timeout=3)
+        if shutdown.ident is not None:
+            shutdown.join(timeout=3)
+
+
+@pytest.mark.parametrize("reminder", [False, True])
+def test_shutdown_prevents_new_prompts_and_result_reminders(monkeypatch, reminder):
+    dispatched = []
+
+    def run(*args, **kwargs):
+        dispatched.append(args[3])
+        monkeypatch.setattr(bridge, "_shutting_down", True)
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(bridge, "run_herdr", run)
+    monkeypatch.setattr(bridge, "_terminal_read", lambda *a: ("", None))
+    monkeypatch.setattr(bridge, "_read_terminal_tail", lambda *a: "")
+    if not reminder:
+        monkeypatch.setattr(bridge, "_shutting_down", True)
+    with pytest.raises(TimeoutError, match="shutting down"):
+        bridge.execute_sentinel_task("primary", "shutdown-test", "audit", 1000)
+    assert len(dispatched) == int(reminder)
+
+
+def test_repeated_signals_cannot_finish_shutdown_before_the_first_drain(monkeypatch):
+    import signal
+
+    handlers, calls = {}, []
+    entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    monkeypatch.setattr(bridge.signal, "signal", lambda sig, fn: handlers.update({sig: fn}))
+    monkeypatch.setattr(bridge, "task_worker", lambda stop: None)
+
+    def drain(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(3)
+        return True
+
+    monkeypatch.setattr(bridge, "graceful_shutdown", drain)
+
+    class SignalsServer:
+        def serve_forever(self):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            assert entered.wait(2)
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    server_thread = threading.Thread(target=lambda: (
+        bridge.serve_bridge(SignalsServer()), returned.set()), daemon=True)
+    # serve_bridge normally runs in its own process; preserve these globals here.
+    monkeypatch.setattr(bridge, "_worker_thread", None)
+    monkeypatch.setattr(bridge, "_worker_stop", None)
+    server_thread.start()
+    try:
+        assert entered.wait(2)
+        assert not returned.wait(0.15), "second signal bypassed the first drain"
+        assert len(calls) == 1
+    finally:
+        release.set()
+        server_thread.join(timeout=3)
+    assert returned.is_set()

@@ -1199,8 +1199,11 @@ def task_view(row):
 LATE_RESULT_STATUSES = ("error", "orphaned")
 
 
-def adopt_late_result(task_id):
+def adopt_late_result(task_id, result_text=None, note=None):
     """Take a result that arrived after the bridge had stopped waiting.
+
+    A caller that already read the answer can supply it directly, including
+    when database retries have outlived the original recovery file.
 
     Measured on the live host: 189 result files sitting uncollected, of which
     76 belonged to tasks marked error and 2 to orphaned ones. Every one was a
@@ -1219,12 +1222,12 @@ def adopt_late_result(task_id):
 
     # Left in place until it is safely in the database: deleting first would
     # lose the answer if the write failed.
-    content = read_result_file(task_id, cleanup=False)
+    content = result_text if result_text is not None else read_result_file(task_id, cleanup=False)
 
     if content is None:
         return None
 
-    note = (
+    recovery_note = (
         "Late delivery: the result arrived after the bridge had stopped "
         f"waiting, and was recovered at {now_iso()}."
     )
@@ -1235,7 +1238,7 @@ def adopt_late_result(task_id):
         task_id, "done", LATE_RESULT_STATUSES,
         recovered_at=now_iso(),
         error_text="\n".join(
-            n for n in (task["error_text"], note, format_note) if n
+            n for n in (task["error_text"], recovery_note, note, format_note) if n
         ),
         **columns,
     )
@@ -1969,6 +1972,18 @@ def defer_sync_completion(task_id, result, note):
     _work_available.set()
 
 
+def persist_sync_completion(task_id, result, note):
+    """Commit a known answer even when shutdown won the running-state race."""
+    if complete_task(task_id, result, note=note):
+        return True
+    # The answer has already been read. A recovery must not require the
+    # original file to remain accessible while its database writes retry.
+    if adopt_late_result(task_id, result_text=result, note=note):
+        return True
+    row = get_task(task_id)
+    return bool(row and row["status"] == "done")
+
+
 def retry_sync_completions(task_id=None):
     """Retry synchronous result/failure persistence, never task execution."""
     database = os.path.realpath(DB_PATH)
@@ -1989,12 +2004,8 @@ def retry_sync_completions(task_id=None):
                    if key[0] == database and (task_id is None or key[1] == task_id)]
     for key, (result, note) in pending:
         try:
-            if not complete_task(key[1], result, note=note):
-                row = get_task(key[1])
-                if row and row["status"] in LATE_RESULT_STATUSES:
-                    row = adopt_late_result(key[1]) or row
-                if not row or row["status"] != "done":
-                    continue
+            if not persist_sync_completion(key[1], result, note):
+                continue
         except (sqlite3.Error, OSError) as error:
             print(f"[ask {key[1]}] completion still pending: {error}")
             continue
@@ -2089,7 +2100,12 @@ def get_agent_quota_block(agent_name):
         for row in rows:
             block = dict(row)
             if _quota_block_expired(block):
-                conn.execute("DELETE FROM quota_blocks WHERE agent = ?", (block["agent"],))
+                # A concurrent refusal may have renewed this row after SELECT.
+                # Delete only the exact snapshot whose expiration we checked.
+                conn.execute(
+                    "DELETE FROM quota_blocks WHERE agent = ? AND detected_at = ? AND detail = ?",
+                    (block["agent"], block["detected_at"], block["detail"]),
+                )
             elif active is None:
                 block["kind"] = provider_failure_kind(block.get("detail"))
                 active = block
@@ -2106,9 +2122,13 @@ def list_agent_quota_blocks():
     for row in rows:
         block = dict(row)
         if _quota_block_expired(block):
-            # Expiring one legacy alias must not clear another active row.
+            # Expiring a snapshot must not clear a concurrently renewed row,
+            # or a different active alias.
             with db_session() as conn:
-                conn.execute("DELETE FROM quota_blocks WHERE agent = ?", (block["agent"],))
+                conn.execute(
+                    "DELETE FROM quota_blocks WHERE agent = ? AND detected_at = ? AND detail = ?",
+                    (block["agent"], block["detected_at"], block["detail"]),
+                )
             continue
         block["kind"] = provider_failure_kind(block.get("detail"))
         live.append(block)
@@ -3053,6 +3073,12 @@ def build_result_reminder_prompt(task_id):
 
 
 def _run_herdr_prompt(agent_name, delegated_prompt, timeout_ms):
+    with _shutdown_guard:
+        if _shutting_down:
+            # This may be a reminder after actual work, so use the uncertain
+            # execution path rather than a busy error that could requeue it.
+            raise TimeoutError("Bridge is shutting down; no further prompt was sent. "
+                               "The agent may still be executing the earlier task.")
     timeout_ms = remaining_ms(timeout_ms)
     try:
         result = run_herdr(
@@ -3817,11 +3843,16 @@ def track_inflight():
 
 
 def wait_for_inflight(grace_sec):
+    """Drain HTTP handlers and the stopped worker, including its settlement."""
     deadline = time.monotonic() + grace_sec
 
     while True:
         with _inflight_lock:
-            if _inflight == 0:
+            worker_alive = (
+                _worker_thread is not None and _worker_thread.is_alive()
+                and _worker_thread is not threading.current_thread()
+            )
+            if _inflight == 0 and not worker_alive:
                 return True
 
         if time.monotonic() >= deadline:
@@ -3848,8 +3879,8 @@ def graceful_shutdown(server, grace_sec=None, signame="signal"):
     seconds after, as bridge-restart does.
 
     So: close the listener first, which frees the port at once and stops new
-    work arriving; then give requests already in flight a short, bounded
-    time; then say plainly why the running task is being orphaned. Returns
+    work arriving; then give requests and the background worker a bounded
+    time to persist their outcomes; then orphan anything still running. Returns
     whether the drain finished within the grace period.
 
     A second call is a no-op. bridge-restart sends two signals in quick
@@ -4763,15 +4794,19 @@ class Handler(BaseHTTPRequestHandler):
 
             result_text, used_agent = run_with_quota_failover(agent_name, execute)
             note = routing_note(agent_name, used_agent)
+            persistence_error = None
             try:
-                complete_task(task_id, result_text, note=note)
+                if not persist_sync_completion(task_id, result_text, note):
+                    persistence_error = "Task changed state before its result could be committed"
             except (sqlite3.Error, OSError) as error:
+                persistence_error = str(error)
+            if persistence_error is not None:
                 defer_sync_completion(task_id, result_text, note)
                 response_started = True
                 self.send_json({
                     "ok": False, "task_id": task_id, "agent": used_agent,
                     "status": "completion_pending",
-                    "error": f"Result delivered; database persistence is pending: {error}",
+                    "error": f"Result delivered; database persistence is pending: {persistence_error}",
                     "hint": "Query this task_id later. Do not execute the task again.",
                 }, 503)
                 return
@@ -5002,11 +5037,14 @@ def serve_bridge(server):
 
     shutdown_done = threading.Event()
     signalled = threading.Event()
+    signal_guard = threading.Lock()
 
     def on_signal(signum, frame):
         # server.shutdown() waits for serve_forever() to return, and this
         # handler runs on the thread that is inside it, so it has to be called
         # from another thread or it would wait on itself.
+        if not signal_guard.acquire(blocking=False):
+            return  # only the first drain may release shutdown_done
         signalled.set()
         name = signal.Signals(signum).name
 

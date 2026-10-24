@@ -7,6 +7,12 @@ is folded into 4.1.0.
 
 ## Unreleased
 
+- Expire only the quota-row snapshot that was checked, preserving concurrent
+  circuit renewals. Persist already-read synchronous answers after shutdown
+  changes their state, even if the original result file is unavailable.
+- Drain background task execution and settlement during graceful shutdown,
+  refuse further prompts/reminders once shutdown begins, and let only the
+  first signal control completion of the shutdown drain.
 - Never resend a failed prompt through a newly resolved target outside its
   dispatch lock. Unknown delivery errors retain the original execution target.
 - Retry synchronous failure settlement after database outages, retain task IDs
