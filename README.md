@@ -13,6 +13,8 @@ English | [简体中文](README.zh-CN.md)
 
 v4 provides the Windows CLI, the HTTP bridge behind an SSH tunnel, the SQLite asynchronous task queue with task dependencies, multi-agent routing, mutual exclusion, and conservative recovery. The "Target architecture" below also covers the Windows Gateway, active notification, and dedicated monitoring worker that are **not yet implemented** (the bridge's half of the event stream, which they would consume, is); this document distinguishes what exists from what is planned.
 
+**Linux HPC use and responsibility.** This project is intended for use on any Linux HPC server that meets its runtime and connectivity requirements; NeSI is the reference deployment, not a platform restriction. Before using it, check and follow the target server's AI usage rules, access policies, and data handling requirements. Do not use this tool to bypass restrictions or perform prohibited AI activities. Users are responsible for obtaining permission, reviewing commands, and using computing resources responsibly. The tool does not grant permission or guarantee compliance. To the extent permitted by applicable law and the [MIT License](LICENSE), the authors and maintainers accept no liability for its use or resulting consequences.
+
 ## What this project is
 
 This is not a thin wrapper around a remote shell, and not two AIs chatting freely. It connects roles with distinct, complementary responsibilities:
