@@ -343,6 +343,225 @@ function Get-SentinelTokenPath {
     return Join-Path $dir "token"
 }
 
+function New-SentinelFileSecurity {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $security = New-Object Security.AccessControl.FileSecurity
+    $security.SetOwner($sid)
+    $security.SetAccessRuleProtection($true, $false)
+    $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $sid, [Security.AccessControl.FileSystemRights]::FullControl,
+        [Security.AccessControl.AccessControlType]::Allow))
+    return $security
+}
+
+function Assert-SentinelTokenPath {
+    param([string]$Path)
+    $entry = [IO.Path]::GetFullPath($Path)
+    while ($entry) {
+        if ([IO.File]::Exists($entry) -or [IO.Directory]::Exists($entry)) {
+            if (([IO.File]::GetAttributes($entry) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Token storage cannot use a symbolic link or reparse point: $entry"
+            }
+        }
+        $entry = [IO.Path]::GetDirectoryName($entry)
+    }
+}
+
+function Set-SentinelAccessControl {
+    param([string]$Path, $Security)
+    $info = if ([IO.Directory]::Exists($Path)) { [IO.DirectoryInfo]::new($Path) } else { [IO.FileInfo]::new($Path) }
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $info.SetAccessControl($Security) }
+    else { [IO.FileSystemAclExtensions]::SetAccessControl($info, $Security) }
+}
+
+function New-SentinelTokenDirectory {
+    param([string]$Path)
+    Assert-SentinelTokenPath $Path
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $security = New-Object Security.AccessControl.DirectorySecurity
+            $security.SetOwner($sid)
+            $security.SetAccessRuleProtection($true, $false)
+            $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow))
+            $directory = [IO.DirectoryInfo]::new($Path)
+            if ([IO.Directory]::Exists($Path)) {
+                $existing = Get-Acl -LiteralPath $Path -ErrorAction Stop
+                if ($existing.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) {
+                    throw "Token directory must be owned by the current identity: $Path"
+                }
+                # Upgrade an existing user-owned configuration directory;
+                # inherited sandbox/legacy write grants must not redirect saves.
+                Set-SentinelAccessControl $Path $security
+            }
+            elseif ($PSVersionTable.PSEdition -eq 'Desktop') { $directory.Create($security) }
+            else { [IO.FileSystemAclExtensions]::Create($directory, $security) }
+    }
+    elseif (-not [IO.Directory]::Exists($Path)) {
+            [IO.Directory]::CreateDirectory($Path, [IO.UnixFileMode]448) | Out-Null # 0700
+    }
+    Assert-SentinelTokenPath $Path
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        # Administrators/SYSTEM are trusted OS principals; other identities
+        # must not be able to change this directory's token/lock namespace.
+        $trusted = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+                     'S-1-5-18', 'S-1-5-32-544')
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if ($acl.Owner -and $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) {
+            throw "Token directory has an untrusted owner: $Path"
+        }
+        $writes = [Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+            if ($rule.AccessControlType -eq 'Allow' -and ($rule.FileSystemRights -band $writes) -ne 0 -and
+                $rule.IdentityReference.Value -notin $trusted) {
+                throw "Token directory is writable by another identity: $Path"
+            }
+        }
+    }
+    elseif (([IO.File]::GetUnixFileMode($Path) -band [IO.UnixFileMode]18) -ne 0) { # group/other write
+        throw "Token directory is writable by another identity: $Path"
+    }
+}
+
+function Assert-SentinelPrivateFile {
+    param([string]$Path)
+    Assert-SentinelTokenPath $Path
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected -or $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) {
+            throw "Token file owner or inheritance is unsafe: $Path"
+        }
+        $allowed = $false
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -eq 'Allow') {
+                if ($rule.IdentityReference.Value -ne $sid.Value) { throw "Token file grants another identity access: $Path" }
+                if (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq
+                    [Security.AccessControl.FileSystemRights]::FullControl) { $allowed = $true }
+            }
+            else { throw "Token file has an unexpected deny rule: $Path" }
+        }
+        if (-not $allowed) { throw "Token file does not grant its owner full access: $Path" }
+    }
+    elseif (([int][IO.File]::GetUnixFileMode($Path)) -ne 384) { throw "Token file must have mode 0600: $Path" }
+}
+
+function Set-SentinelPrivateFile {
+    param([string]$Path)
+    Assert-SentinelTokenPath $Path
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        Set-SentinelAccessControl $Path (New-SentinelFileSecurity)
+    }
+    else { [IO.File]::SetUnixFileMode($Path, [IO.UnixFileMode]384) }
+    Assert-SentinelPrivateFile $Path
+}
+
+function New-SentinelPrivateFile {
+    param([string]$Path)
+    Assert-SentinelTokenPath $Path
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $security = New-SentinelFileSecurity
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            return [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security)
+        }
+        return [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($Path), [IO.FileMode]::CreateNew,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security)
+    }
+    # Require creation-time Unix permissions; never fall back to writing then chmod.
+    $options = [IO.FileStreamOptions]::new()
+    $options.Mode = [IO.FileMode]::CreateNew
+    $options.Access = [IO.FileAccess]::Write
+    $options.Share = [IO.FileShare]::None
+    $options.UnixCreateMode = [IO.UnixFileMode]384 # 0600 (umask may only remove bits)
+    return [IO.FileStream]::new($Path, $options)
+}
+
+function Write-SentinelTokenFile {
+    param($Stream, [string]$Token)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Token)
+    $Stream.Write($bytes, 0, $bytes.Length)
+    $Stream.Flush($true)
+}
+
+function Commit-SentinelTokenFile {
+    param([string]$TemporaryPath, [string]$Path, [string]$BackupPath)
+    if ([IO.File]::Exists($Path)) { [IO.File]::Replace($TemporaryPath, $Path, $BackupPath) }
+    else { [IO.File]::Move($TemporaryPath, $Path) }
+}
+
+function Save-SentinelToken {
+    param([string]$Path, [string]$Token, [int]$LockTimeoutMs = 10000)
+    $Path = [IO.Path]::GetFullPath($Path)
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    New-SentinelTokenDirectory $directory
+    $lockPath = Join-Path $directory '.token.lock'
+    $temporary = Join-Path $directory ('.token.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = Join-Path $directory ('.token.' + [guid]::NewGuid().ToString('N') + '.bak')
+    $lock = $null
+    $stream = $null
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($LockTimeoutMs)
+    try {
+        while ($null -eq $lock) {
+            try {
+                if ([IO.File]::Exists($lockPath)) {
+                    Assert-SentinelPrivateFile $lockPath
+                    $lock = [IO.File]::Open($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                }
+                else { $lock = New-SentinelPrivateFile $lockPath }
+            }
+            catch [IO.IOException] {
+                if ([DateTime]::UtcNow -ge $deadline) { throw "Timed out waiting for another token save to finish." }
+                Start-Sleep -Milliseconds 50
+            }
+        }
+        Assert-SentinelTokenPath $Path
+        if ([IO.File]::Exists($Path)) { Set-SentinelPrivateFile $Path }
+        $stream = New-SentinelPrivateFile $temporary
+        Assert-SentinelPrivateFile $temporary
+        Write-SentinelTokenFile $stream $Token
+        $stream.Dispose()
+        $stream = $null
+        Assert-SentinelPrivateFile $temporary
+        Commit-SentinelTokenFile $temporary $Path $backup
+        Assert-SentinelPrivateFile $Path
+        if ([IO.File]::Exists($backup)) {
+            Assert-SentinelPrivateFile $backup
+            [IO.File]::Delete($backup)
+        }
+    }
+    catch {
+        $failure = $_
+        # ReplaceFile failures can leave the old file under its backup name.
+        # Restore it before reporting failure; never relax its permissions.
+        if ([IO.File]::Exists($backup)) {
+            try {
+                Assert-SentinelPrivateFile $backup
+                if ([IO.File]::Exists($Path)) {
+                    Set-SentinelPrivateFile $Path
+                    [IO.File]::Replace($backup, $Path, [NullString]::Value)
+                }
+                else { [IO.File]::Move($backup, $Path) }
+            }
+            catch { throw "Token save failed and automatic recovery failed; the old token is retained at $backup. $($_.Exception.Message)" }
+        }
+        throw $failure
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+        if ($null -ne $lock) { $lock.Dispose() }
+        # Keep the lock file: unlinking it would let concurrent writers lock
+        # different files under the same path.
+    }
+}
+
 # The token and where it came from, or $null. The environment variable wins.
 function Get-SentinelTokenInfo {
     if ($env:SENTINEL_BRIDGE_TOKEN) {
@@ -765,16 +984,10 @@ switch ($Command) {
         }
 
         $path = Get-SentinelTokenPath
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
-        [System.IO.File]::WriteAllText($path, $token, (New-Object System.Text.UTF8Encoding($false)))
-
-        # Readable by its owner alone. Cutting inheritance keeps a parent
-        # directory's permissions from applying.
-        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
-            & icacls.exe $path /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
-        }
-        else {
-            & chmod 600 $path
+        try { Save-SentinelToken -Path $path -Token $token }
+        catch {
+            [Console]::Error.WriteLine("sentinel.ps1 login: could not save the token safely. $($_.Exception.Message)")
+            exit 1
         }
 
         Write-Output "Saved the access token to $path (readable only by you)."

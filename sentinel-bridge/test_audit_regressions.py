@@ -722,3 +722,124 @@ def test_repeated_signals_cannot_finish_shutdown_before_the_first_drain(monkeypa
         release.set()
         server_thread.join(timeout=3)
     assert returned.is_set()
+
+
+def test_preclaim_failure_skips_faulty_agent_without_delaying_healthy_work(monkeypatch):
+    first = bridge.create_task("fault", 1000, "primary")
+    second = bridge.create_task("healthy", 1000, "backup")
+    stop = threading.Event()
+    original_claim = bridge.claim_task
+    attempts, sleeps = [], []
+
+    def claim(task_id):
+        attempts.append(task_id)
+        if len(attempts) > 5:
+            stop.set()  # bound the old busy loop
+        if task_id == first:
+            raise sqlite3.OperationalError("pre-claim fault")
+        return original_claim(task_id)
+
+    def execute(**kwargs):
+        result_file(second, "healthy answer")
+        stop.set()
+        return "healthy answer"
+
+    monkeypatch.setattr(bridge, "claim_task", claim)
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    monkeypatch.setattr(bridge.time, "sleep", lambda seconds: sleeps.append(seconds))
+    bridge.task_worker(stop)
+    assert attempts == [first, second]
+    assert not sleeps
+    assert bridge.get_task(second)["status"] == "done"
+    assert bridge.get_task(first)["status"] == "queued"
+
+
+def test_auto_selection_uses_one_quota_snapshot_and_no_per_candidate_discovery(monkeypatch):
+    agents = [{**a, "agent": "opencode"} for a in AGENTS]
+    counts = {"discovery": 0, "snapshot": 0}
+
+    def discover():
+        counts["discovery"] += 1
+        return agents, {"ok": True}
+
+    def snapshot():
+        counts["snapshot"] += 1
+        return [{"agent": "w1:p1"}]
+
+    monkeypatch.setattr(bridge, "AGENT_PRIORITY", ("primary", "backup"))
+    monkeypatch.setattr(bridge, "list_agents", discover)
+    monkeypatch.setattr(bridge, "list_agent_quota_blocks", snapshot)
+    assert bridge.resolve_agent(None) == "backup"
+    assert counts == {"discovery": 1, "snapshot": 1}
+
+
+def test_invalid_default_policy_is_rejected_before_startup_changes_tasks(monkeypatch):
+    task_id = bridge.create_task("unchanged", 1000, "primary")
+    bridge.claim_task(task_id)
+    monkeypatch.setattr(bridge, "AUTH_TOKEN", "x" * 32)
+    monkeypatch.setattr(bridge, "DEFAULT_SLURM_POLICY", "invalid-policy")
+    with pytest.raises(ValueError, match="slurm_policy"):
+        bridge.validate_slurm_policy(None)
+    monkeypatch.setattr(bridge.sys, "argv", ["bridge.py", "--check"])
+    assert bridge.main() == 2
+    monkeypatch.setattr(bridge.sys, "argv", ["bridge.py"])
+    assert bridge.main() == 2
+    assert bridge.get_task(task_id)["status"] == "running"
+
+
+def test_windows_directory_scope_is_case_insensitive(monkeypatch):
+    import ntpath
+    monkeypatch.setattr(bridge, "RESULT_DIR", r"e:\Project\results")
+    monkeypatch.setattr(bridge, "list_agents", lambda: ([{"name": "a", "cwd": r"E:\project"}], {"ok": True}))
+    monkeypatch.setattr(bridge.os.path, "abspath", ntpath.abspath)
+    monkeypatch.setattr(bridge.os.path, "commonpath", ntpath.commonpath)
+    monkeypatch.setattr(bridge.os.path, "normcase", ntpath.normcase)
+    assert bridge.result_dir_scope_warning() is None
+
+
+@pytest.fixture
+def smoke_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("smoke_regression", Path(__file__).parent.parent / "scripts" / "smoke.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_smoke_classifies_direct_and_wrapped_timeouts_consistently(monkeypatch, smoke_module, wrapped):
+    import urllib.error
+    error = TimeoutError("simulated timeout")
+    if wrapped:
+        error = urllib.error.URLError(error)
+
+    def request(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(smoke_module, "request", request)
+    with pytest.raises(smoke_module.ChannelDown, match="never replied"):
+        smoke_module.check_channel("http://unused.invalid", None)
+
+
+def test_smoke_preserves_special_characters_in_agent_query(monkeypatch, smoke_module):
+    from urllib.parse import parse_qs, urlparse
+    identifier = "agent name&part#tail"
+    urls = []
+
+    class ProbeComplete(Exception):
+        pass
+
+    def request(url, **kwargs):
+        if url.endswith("/agents"):
+            return 200, {"agents": [{"name": identifier, "agent": "opencode"}]}
+        urls.append(url)
+        raise ProbeComplete
+
+    monkeypatch.setattr(smoke_module, "default_token", lambda: None)
+    monkeypatch.setattr(smoke_module.sys, "argv", ["smoke.py", "--url", "http://unused.invalid"])
+    monkeypatch.setattr(smoke_module, "check_channel", lambda *a: {"version": 28, "default_agent": None, "worker_alive": True})
+    monkeypatch.setattr(smoke_module, "request", request)
+    with pytest.raises(ProbeComplete):
+        smoke_module.main()
+    assert parse_qs(urlparse(urls[0]).query)["agent"] == [identifier]
+    assert " " not in urls[0]

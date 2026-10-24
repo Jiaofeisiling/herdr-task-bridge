@@ -24,6 +24,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import urlencode
 
 DEFAULT_URL = "http://127.0.0.1:8765"
 PROBE_TIMEOUT = 8
@@ -76,6 +77,16 @@ def request(url, method="GET", body=None, timeout=30, token=None):
             return e.code, {}
 
 
+def timeout_diagnostic(base):
+    return (
+        f"connected to {base} but it never replied within {PROBE_TIMEOUT}s.\n"
+        "  The local port is still being forwarded, but the forward's\n"
+        "  path to the host is dead. Disconnect and reconnect VS Code --\n"
+        "  reloading the window usually does not rebuild the forward.\n"
+        "  The bridge process on the host is probably fine."
+    )
+
+
 def check_channel(base, token):
     """Tell a dead channel apart from a dead bridge before testing anything.
 
@@ -92,20 +103,15 @@ def check_channel(base, token):
     try:
         status, body = request(base + "/health", timeout=PROBE_TIMEOUT, token=token)
     except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise ChannelDown(timeout_diagnostic(base)) from e
         raise ChannelDown(
             f"cannot reach {base} ({e.reason}).\n"
             "  Nothing is listening. Reconnect VS Code to the host so the\n"
             "  port forward is re-established, then run this again."
         )
     except TimeoutError:
-        raise ChannelDown(
-            f"connected to {base} but it never replied within "
-            f"{PROBE_TIMEOUT}s.\n"
-            "  The local port is still being forwarded, but the forward's\n"
-            "  path to the host is dead. Disconnect and reconnect VS Code --\n"
-            "  reloading the window usually does not rebuild the forward.\n"
-            "  The bridge process on the host is probably fine."
-        )
+        raise ChannelDown(timeout_diagnostic(base))
 
     if body.get("reason") == "worker_dead":
         # Named rather than left as a generic 503: this is the state that
@@ -193,14 +199,14 @@ def main():
 
     for identifier in identifiers:
         status, body = request(
-            f"{base}/ready?agent={identifier}", token=args.token
+            f"{base}/ready?{urlencode({'agent': identifier})}", token=args.token
         )
         check(f"/ready resolves {identifier}", status == 200 and body.get("ok"),
               f"status={body.get('agent_status')} reason={body.get('reason', '-')}")
 
     for family in sorted(families):
         status, body = request(
-            f"{base}/ready?agent={family}", token=args.token
+            f"{base}/ready?{urlencode({'agent': family})}", token=args.token
         )
         check(f"/ready resolves runtime family '{family}'",
               status == 200 and body.get("ok"))

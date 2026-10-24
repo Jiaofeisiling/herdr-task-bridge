@@ -1692,9 +1692,46 @@ Describe "login" {
 
         $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
             -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn "the-new-token-0123456789abcd"
-        Wait-SentinelExit -Process $proc | Out-Null
+        $result = Wait-SentinelExit -Process $proc
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
 
         (Get-Content -LiteralPath (Join-Path $Script:Dir "token") -Raw).Trim() | Should -Be "the-new-token-0123456789abcd"
+    }
+
+    It "uses the actual SID when USERNAME does not resolve" -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        $proc = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @("login") `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir; USERNAME = 'sentinel-nonexistent-account-for-test' } `
+            -StdIn "typed-by-the-owner-0123456789ab"
+        $result = Wait-SentinelExit -Process $proc
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        (Get-Acl -LiteralPath (Join-Path $Script:Dir 'token')).GetOwner([Security.Principal.SecurityIdentifier]).Value |
+            Should -Be ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    }
+
+    It "serializes concurrent login processes and keeps one complete private token" {
+        $tokens = @('concurrent-first-token-0123456789', 'concurrent-second-token-0123456789')
+        $first = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @('login') `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn $tokens[0]
+        $second = Start-SentinelUnderTest -BaseUrl "http://127.0.0.1:1" -ScriptArgs @('login') `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn $tokens[1]
+        foreach ($proc in @($first, $second)) {
+            $result = Wait-SentinelExit -Process $proc
+            $result.ExitCode | Should -Be 0 -Because $result.StdErr
+            ($result.StdOut + $result.StdErr) | Should -Not -Match 'concurrent-(first|second)-token'
+        }
+        $tokens | Should -Contain ([IO.File]::ReadAllText((Join-Path $Script:Dir 'token')))
+        @(Get-ChildItem -LiteralPath $Script:Dir -Force | Where-Object Name -Match '\.(tmp|bak)$').Count | Should -Be 0
+    }
+
+    It 'reports a storage failure without claiming that login succeeded' {
+        New-Item -ItemType Directory -Force -Path (Join-Path $Script:Dir 'token') | Out-Null
+        $proc = Start-SentinelUnderTest -BaseUrl 'http://127.0.0.1:1' -ScriptArgs @('login') `
+            -Env @{ SENTINEL_CONFIG_DIR = $Script:Dir } -StdIn 'new-placeholder-token-0123456789'
+        $result = Wait-SentinelExit -Process $proc
+        $result.ExitCode | Should -Be 1
+        $result.StdErr | Should -Match 'could not save the token safely'
+        $result.StdOut | Should -Not -Match 'Saved the access token'
+        ($result.StdOut + $result.StdErr) | Should -Not -Match 'new-placeholder-token-0123456789'
     }
 
     It "refuses an empty answer and stores nothing" {
@@ -1731,5 +1768,109 @@ Describe "login" {
         $result.ExitCode | Should -Be 1
         $result.StdErr | Should -Match "unrecognised"
         Test-Path -LiteralPath (Join-Path $Script:Dir "token") | Should -BeFalse
+    }
+}
+
+Describe 'token transaction recovery' {
+    BeforeAll {
+        # Load function definitions only: never execute the CLI's switch/exit.
+        $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($Script:ScriptPath, [ref]$null, [ref]$parseErrors)
+        if ($parseErrors) { throw $parseErrors[0] }
+        foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+            Invoke-Expression $definition.Extent.Text
+        }
+        $Script:ActualTokenWrite = ${function:Write-SentinelTokenFile}
+    }
+
+    BeforeEach {
+        $Script:TokenTestDir = Join-Path ([IO.Path]::GetTempPath()) ('sentinel-transaction-' + [guid]::NewGuid())
+        $Script:TokenTestPath = Join-Path $Script:TokenTestDir 'token'
+        $Script:OldValue = 'old-placeholder-token-0123456789'
+        Save-SentinelToken -Path $Script:TokenTestPath -Token $Script:OldValue
+    }
+
+    AfterEach {
+        $absolute = [IO.Path]::GetFullPath($Script:TokenTestDir)
+        $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        if (-not $absolute.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected test cleanup path' }
+        Remove-Item -LiteralPath $absolute -Recurse -Force -ErrorAction Stop
+    }
+
+    It 'preserves the old readable private token when <Failure> fails' -ForEach @(
+        @{ Failure = 'private creation' }, @{ Failure = 'partial write' },
+        @{ Failure = 'replacement' }, @{ Failure = 'after replacement' }
+    ) {
+        switch ($Failure) {
+            'private creation' { Mock New-SentinelPrivateFile { throw 'simulated private creation failure' } }
+            'partial write' { Mock Write-SentinelTokenFile {
+                param($Stream, $Token)
+                $Stream.WriteByte(65)
+                throw 'simulated partial write failure'
+            } }
+            'replacement' { Mock Commit-SentinelTokenFile { throw 'simulated replacement failure' } }
+            'after replacement' { Mock Commit-SentinelTokenFile {
+                param($TemporaryPath, $Path, $BackupPath)
+                [IO.File]::Replace($TemporaryPath, $Path, $BackupPath)
+                throw 'simulated failure after replacement'
+            } }
+        }
+        { Save-SentinelToken -Path $Script:TokenTestPath -Token 'new-placeholder-token-0123456789' } | Should -Throw '*simulated*'
+        [IO.File]::ReadAllText($Script:TokenTestPath) | Should -Be $Script:OldValue
+        { Assert-SentinelPrivateFile $Script:TokenTestPath } | Should -Not -Throw
+        @(Get-ChildItem -LiteralPath $Script:TokenTestDir -Force | Where-Object Name -Match '\.(tmp|bak)$').Count | Should -Be 0
+    }
+
+    It 'times out competing saves without truncating or unlocking the old token' {
+        $lock = [IO.File]::Open((Join-Path $Script:TokenTestDir '.token.lock'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            { Save-SentinelToken -Path $Script:TokenTestPath -Token 'new-placeholder-token-0123456789' -LockTimeoutMs 100 } | Should -Throw '*Timed out*'
+            [IO.File]::ReadAllText($Script:TokenTestPath) | Should -Be $Script:OldValue
+            Assert-SentinelPrivateFile $Script:TokenTestPath
+        }
+        finally { $lock.Dispose() }
+    }
+
+    It 'protects and exclusively holds the temporary file before writing its first byte' {
+        Mock Write-SentinelTokenFile {
+            param($Stream, $Token)
+            $temporary = (Get-ChildItem -LiteralPath $Script:TokenTestDir -Force -Filter '*.tmp').FullName
+            $Stream.Length | Should -Be 0
+            Assert-SentinelPrivateFile $temporary
+            if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+                { [IO.File]::ReadAllText($temporary) } | Should -Throw
+            }
+            & $Script:ActualTokenWrite $Stream $Token
+        }
+        Save-SentinelToken -Path $Script:TokenTestPath -Token 'new-placeholder-token-0123456789'
+        Should -Invoke Write-SentinelTokenFile -Times 1 -Exactly
+        [IO.File]::ReadAllText($Script:TokenTestPath) | Should -Be 'new-placeholder-token-0123456789'
+    }
+
+    It 'tightens a broad old ACL before any new secret is written' -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        $acl = Get-Acl -LiteralPath $Script:TokenTestPath
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            [Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+            [Security.AccessControl.FileSystemRights]::Read,
+            [Security.AccessControl.AccessControlType]::Allow))
+        Set-SentinelAccessControl $Script:TokenTestPath $acl
+        Mock Write-SentinelTokenFile {
+            param($Stream, $Token)
+            Assert-SentinelPrivateFile $Script:TokenTestPath
+            [IO.File]::ReadAllText($Script:TokenTestPath) | Should -Be $Script:OldValue
+            & $Script:ActualTokenWrite $Stream $Token
+        }
+        Save-SentinelToken -Path $Script:TokenTestPath -Token 'new-placeholder-token-0123456789'
+        Assert-SentinelPrivateFile $Script:TokenTestPath
+    }
+
+    It 'refuses a redirected directory without writing through its junction' -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        $junction = Join-Path $Script:TokenTestDir 'redirected'
+        New-Item -ItemType Junction -Path $junction -Target $Script:TokenTestDir | Out-Null
+        try {
+            { Save-SentinelToken -Path (Join-Path $junction 'token') -Token 'new-placeholder-token-0123456789' } | Should -Throw '*reparse point*'
+            [IO.File]::ReadAllText($Script:TokenTestPath) | Should -Be $Script:OldValue
+        }
+        finally { [IO.Directory]::Delete($junction) }
     }
 }

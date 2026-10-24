@@ -7,6 +7,14 @@ is folded into 4.1.0.
 
 ## Unreleased
 
+- Skip pre-claim agent faults without blocking healthy agents. Select automatic
+  and rerouted targets from a batch quota snapshot instead of per-alias discovery.
+- Reject invalid default Slurm policies before startup recovery and in runtime
+  validation. Compare Windows result directory scopes without case sensitivity.
+- Store login tokens through creation-time private permissions, a persistent
+  cross-process lock, atomic replacement and backup recovery. Use the current
+  Windows SID and managed ACL APIs under both PowerShell 5.1 and 7.
+- Escape smoke-test agent query values and classify wrapped timeouts consistently.
 - Expire only the quota-row snapshot that was checked, preserving concurrent
   circuit renewals. Persist already-read synchronous answers after shutdown
   changes their state, even if the original result file is unavailable.

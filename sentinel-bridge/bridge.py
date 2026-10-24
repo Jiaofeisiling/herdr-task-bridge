@@ -228,7 +228,7 @@ DEFAULT_SLURM_POLICY = os.environ.get("SENTINEL_SLURM_POLICY", "submit")
 
 def validate_slurm_policy(policy):
     if policy is None:
-        return DEFAULT_SLURM_POLICY
+        policy = DEFAULT_SLURM_POLICY
 
     if policy not in SLURM_POLICIES:
         # Never fall back to the default on an unrecognised value: a typo
@@ -601,6 +601,11 @@ def startup_security_problems():
     Kept apart from auth_token_warning(), which only warns: these stop it.
     """
     problems = []
+    if DEFAULT_SLURM_POLICY not in SLURM_POLICIES:
+        problems.append(
+            f"SENTINEL_SLURM_POLICY={DEFAULT_SLURM_POLICY!r} is invalid. "
+            f"Must be one of: {', '.join(sorted(SLURM_POLICIES))}."
+        )
 
     if not AUTH_TOKEN:
         if not ALLOW_NO_AUTH:
@@ -2278,14 +2283,26 @@ def agent_identifiers(agent):
     return [v for v in (agent.get("name"), agent.get("pane_id")) if v]
 
 
-def auto_pick_key(agent):
+def auto_pick_key(agent, blocked_names=()):
     """Sort key for choosing an agent when the caller named none.
 
     Being able to start now outranks being cheap, cost order decides among the
     rest, and a stable identifier breaks the remaining ties so consecutive
     defaults don't wander between agents for no visible reason.
     """
+    if blocked_names:
+        first = next(iter(blocked_names), None)
+        if isinstance(first, dict):
+            names = {b["agent"] for b in blocked_names if isinstance(b, dict) and "agent" in b}
+        elif isinstance(blocked_names, set):
+            names = blocked_names
+        else:
+            names = set(blocked_names)
+    else:
+        names = ()
+
     return (
+        any(identifier in names for identifier in agent_identifiers(agent)),
         agent.get("agent_status") not in AVAILABLE_STATES,
         agent_priority_rank(agent),
         agent_identifiers(agent)[0],
@@ -2371,7 +2388,10 @@ def resolve_agent(identifier):
                 "work. Check `herdr agent list`."
             )
 
-        return agent_identifiers(min(addressable, key=auto_pick_key))[0]
+        blocked_names = {block["agent"] for block in list_agent_quota_blocks()}
+        return agent_identifiers(min(
+            addressable, key=lambda agent: auto_pick_key(agent, blocked_names),
+        ))[0]
 
     if not agents:
         # herdr being down is a different failure with a different fix,
@@ -2621,10 +2641,11 @@ def _reroute_target(live):
     The best one that can be addressed and whose provider is not blocked --
     a task moved to an agent that would refuse it has gained nothing.
     """
+    blocked_names = {block["agent"] for block in list_agent_quota_blocks()}
     eligible = [
         a for a in live
         if agent_identifiers(a)
-        and not any(get_agent_quota_block(i) for i in agent_identifiers(a))
+        and not any(identifier in blocked_names for identifier in agent_identifiers(a))
     ]
 
     if not eligible:
@@ -2831,7 +2852,9 @@ def result_dir_scope_warning():
             continue
 
         try:
-            inside = os.path.commonpath([result_dir, os.path.abspath(cwd)]) == os.path.abspath(cwd)
+            inside = os.path.normcase(os.path.commonpath(
+                [result_dir, os.path.abspath(cwd)]
+            )) == os.path.normcase(os.path.abspath(cwd))
         except ValueError:
             # Windows paths on different drives share no common path.
             inside = False
@@ -3760,6 +3783,10 @@ def task_worker(stop_event=None):
                         )
                     settlement = (fail_task, (task_id, detail))
                     print(f"[task {task_id}] error: {e}")
+                else:
+                    print(f"[task {task_id}] pre-claim error on {agent_name!r}: {e}")
+                    busy_this_pass.add(agent_name)
+                    continue
 
         except Exception as e:
             # Anything else -- a DB hiccup in peek_next_task/claim_task,

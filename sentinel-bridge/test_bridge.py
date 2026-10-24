@@ -315,7 +315,7 @@ def live_server(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _one_agent_running(monkeypatch):
+def _one_agent_running(monkeypatch, tmp_path):
     """A herdr with at least one agent is the baseline the bridge assumes.
 
     Since SENTINEL_AGENT became optional, a request that names no agent
@@ -326,6 +326,9 @@ def _one_agent_running(monkeypatch):
     Stubbed at list_agents rather than run_herdr on purpose: tests that
     assert the bridge makes no gratuitous run_herdr calls keep working.
     """
+    # Auto selection now reads persisted circuits; each test owns its database.
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "fixture-tasks.db"))
+    bridge.init_db()
     monkeypatch.setattr(
         bridge,
         "list_agents",
@@ -7064,3 +7067,95 @@ def test_a_prune_that_finds_nothing_does_not_pause(tmp_path, monkeypatch):
 
     assert bridge.prune_old_tasks() == 0
     assert pauses == []
+
+
+# --- Tier 0 Bug Regression Tests ---
+
+def test_task_worker_preclaim_failure_skips_agent_without_delaying_healthy(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *args: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "list_agents", lambda: ([
+        {"name": "primary", "agent": "opencode", "agent_status": "idle"},
+        {"name": "backup", "agent": "claude", "agent_status": "idle"},
+    ], {"ok": True}))
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *a: ("idle", {"ok": True}))
+    bridge.init_db()
+    first = bridge.create_task("fault", 1000, "primary")
+    second = bridge.create_task("healthy", 1000, "backup")
+    stop = threading_module.Event()
+    original_claim = bridge.claim_task
+    attempts = []
+    sleeps = []
+
+    def claim(task_id):
+        attempts.append(task_id)
+        if len(attempts) > 5:
+            stop.set()
+        if task_id == first:
+            raise sqlite3.OperationalError("pre-claim error")
+        return original_claim(task_id)
+
+    def execute(**kwargs):
+        res_path = bridge.result_file_path(second)
+        os.makedirs(os.path.dirname(res_path), exist_ok=True)
+        with open(res_path, "w", encoding="utf-8") as f:
+            f.write("healthy answer")
+        stop.set()
+        return "healthy answer"
+
+    monkeypatch.setattr(bridge, "claim_task", claim)
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: sleeps.append(s))
+    bridge.task_worker(stop)
+
+    assert attempts == [first, second]
+    assert not sleeps
+    assert bridge.get_task(second)["status"] == "done"
+    assert bridge.get_task(first)["status"] == "queued"
+
+
+def test_auto_pick_batches_quota_blocks_and_prioritizes_healthy_same_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    bridge.init_db()
+
+    agents = [
+        {"name": "claude-1", "pane_id": "w1:p1", "agent": "claude", "agent_status": "idle"},
+        {"name": "claude-2", "pane_id": "w1:p2", "agent": "claude", "agent_status": "idle"},
+    ]
+    snapshot_calls = []
+
+    def fake_list_agents():
+        return agents, {"ok": True}
+
+    def fake_list_quota_blocks():
+        snapshot_calls.append(True)
+        return [{"agent": "claude-1"}]
+
+    monkeypatch.setattr(bridge, "list_agents", fake_list_agents)
+    monkeypatch.setattr(bridge, "list_agent_quota_blocks", fake_list_quota_blocks)
+
+    picked = bridge.resolve_agent(None)
+    assert picked == "claude-2"
+    assert len(snapshot_calls) == 1
+
+
+def test_startup_security_problems_and_validate_slurm_policy_reject_invalid_default(monkeypatch):
+    monkeypatch.setattr(bridge, "DEFAULT_SLURM_POLICY", "invalid-policy")
+
+    with pytest.raises(ValueError, match="slurm_policy"):
+        bridge.validate_slurm_policy(None)
+
+    problems = bridge.startup_security_problems()
+    assert any("SENTINEL_SLURM_POLICY" in p for p in problems)
+
+
+def test_windows_directory_scope_is_case_insensitive_in_scope_warning(monkeypatch):
+    import ntpath
+    monkeypatch.setattr(bridge, "RESULT_DIR", r"e:\Project\results")
+    monkeypatch.setattr(bridge, "list_agents", lambda: ([{"name": "a", "cwd": r"E:\project"}], {"ok": True}))
+    monkeypatch.setattr(bridge.os.path, "abspath", ntpath.abspath)
+    monkeypatch.setattr(bridge.os.path, "commonpath", ntpath.commonpath)
+    monkeypatch.setattr(bridge.os.path, "normcase", ntpath.normcase)
+    assert bridge.result_dir_scope_warning() is None
