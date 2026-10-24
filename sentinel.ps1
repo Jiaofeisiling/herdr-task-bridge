@@ -402,6 +402,9 @@ function New-SentinelTokenDirectory {
     }
     elseif (-not [IO.Directory]::Exists($Path)) {
             [IO.Directory]::CreateDirectory($Path, [IO.UnixFileMode]448) | Out-Null # 0700
+            # Creation is already private. Restore owner bits removed by a
+            # restrictive umask before attempting to use the new directory.
+            [IO.File]::SetUnixFileMode($Path, [IO.UnixFileMode]448)
     }
     Assert-SentinelTokenPath $Path
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
@@ -480,7 +483,17 @@ function New-SentinelPrivateFile {
     $options.Access = [IO.FileAccess]::Write
     $options.Share = [IO.FileShare]::None
     $options.UnixCreateMode = [IO.UnixFileMode]384 # 0600 (umask may only remove bits)
-    return [IO.FileStream]::new($Path, $options)
+    $stream = [IO.FileStream]::new($Path, $options)
+    try {
+        # umask can remove owner access too. Fix only the held, still-empty
+        # file before writing a secret or publishing the persistent lock.
+        [IO.File]::SetUnixFileMode($stream.SafeFileHandle, [IO.UnixFileMode]384)
+        return $stream
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
 }
 
 function Write-SentinelTokenFile {
@@ -511,6 +524,11 @@ function Save-SentinelToken {
         while ($null -eq $lock) {
             try {
                 if ([IO.File]::Exists($lockPath)) {
+                    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+                        # Recover an empty lock left with owner bits masked by
+                        # an earlier save. chmod preserves its inode and lock.
+                        Set-SentinelPrivateFile $lockPath
+                    }
                     Assert-SentinelPrivateFile $lockPath
                     $lock = [IO.File]::Open($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
                 }

@@ -2118,10 +2118,13 @@ def get_agent_quota_block(agent_name):
 
 
 def list_agent_quota_blocks():
-    with db_session() as conn:
-        rows = conn.execute(
-            "SELECT * FROM quota_blocks ORDER BY detected_at DESC"
-        ).fetchall()
+    try:
+        with db_session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM quota_blocks ORDER BY detected_at DESC"
+            ).fetchall()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        return []
 
     live = []
     for row in rows:
@@ -2129,11 +2132,14 @@ def list_agent_quota_blocks():
         if _quota_block_expired(block):
             # Expiring a snapshot must not clear a concurrently renewed row,
             # or a different active alias.
-            with db_session() as conn:
-                conn.execute(
-                    "DELETE FROM quota_blocks WHERE agent = ? AND detected_at = ? AND detail = ?",
-                    (block["agent"], block["detected_at"], block["detail"]),
-                )
+            try:
+                with db_session() as conn:
+                    conn.execute(
+                        "DELETE FROM quota_blocks WHERE agent = ? AND detected_at = ? AND detail = ?",
+                        (block["agent"], block["detected_at"], block["detail"]),
+                    )
+            except (sqlite3.OperationalError, sqlite3.DatabaseError):
+                pass
             continue
         block["kind"] = provider_failure_kind(block.get("detail"))
         live.append(block)
@@ -2290,22 +2296,28 @@ def auto_pick_key(agent, blocked_names=()):
     rest, and a stable identifier breaks the remaining ties so consecutive
     defaults don't wander between agents for no visible reason.
     """
-    if blocked_names:
+    if isinstance(blocked_names, set):
+        names = blocked_names
+    elif isinstance(blocked_names, dict):
+        names = set(blocked_names.keys())
+    elif blocked_names:
         first = next(iter(blocked_names), None)
         if isinstance(first, dict):
             names = {b["agent"] for b in blocked_names if isinstance(b, dict) and "agent" in b}
-        elif isinstance(blocked_names, set):
-            names = blocked_names
         else:
             names = set(blocked_names)
     else:
         names = ()
 
+    ids = agent_identifiers(agent)
+    primary_id = ids[0] if ids else ""
+
     return (
-        any(identifier in names for identifier in agent_identifiers(agent)),
+        any(identifier in names for identifier in ids),
+        not bool(ids),
         agent.get("agent_status") not in AVAILABLE_STATES,
         agent_priority_rank(agent),
-        agent_identifiers(agent)[0],
+        primary_id,
     )
 
 
@@ -2388,7 +2400,10 @@ def resolve_agent(identifier):
                 "work. Check `herdr agent list`."
             )
 
-        blocked_names = {block["agent"] for block in list_agent_quota_blocks()}
+        try:
+            blocked_names = {block["agent"] for block in list_agent_quota_blocks()}
+        except Exception:
+            blocked_names = set()
         return agent_identifiers(min(
             addressable, key=lambda agent: auto_pick_key(agent, blocked_names),
         ))[0]
@@ -2641,7 +2656,11 @@ def _reroute_target(live):
     The best one that can be addressed and whose provider is not blocked --
     a task moved to an agent that would refuse it has gained nothing.
     """
-    blocked_names = {block["agent"] for block in list_agent_quota_blocks()}
+    try:
+        blocked_names = {block["agent"] for block in list_agent_quota_blocks()}
+    except Exception:
+        blocked_names = set()
+
     eligible = [
         a for a in live
         if agent_identifiers(a)
@@ -2651,7 +2670,9 @@ def _reroute_target(live):
     if not eligible:
         return None
 
-    return agent_identifiers(min(eligible, key=auto_pick_key))[0]
+    return agent_identifiers(min(
+        eligible, key=lambda a: auto_pick_key(a, blocked_names),
+    ))[0]
 
 
 def settle_unreachable_task(task_row):
@@ -3732,6 +3753,10 @@ def task_worker(stop_event=None):
                 if claimed:
                     settlement = (orphan_task, (task_id, str(e)))
                     print(f"[task {task_id}] orphaned")
+                else:
+                    print(f"[task {task_id}] pre-claim timeout on {agent_name!r}: {e}")
+                    busy_this_pass.add(agent_name)
+                    continue
 
             except QuotaFailoverExhaustedError as e:
                 detail = str(e)
@@ -3740,6 +3765,10 @@ def task_worker(stop_event=None):
                 if claimed:
                     settlement = (quota_exhausted_task, (task_id, detail))
                     print(f"[task {task_id}] quota exhausted: {e}")
+                else:
+                    print(f"[task {task_id}] pre-claim quota exhaustion on {agent_name!r}: {e}")
+                    busy_this_pass.add(agent_name)
+                    continue
 
             except (SentinelBusyError, SentinelUnavailableError) as unavailable:
                 settled = (

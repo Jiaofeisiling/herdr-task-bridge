@@ -7079,8 +7079,6 @@ def test_task_worker_preclaim_failure_skips_agent_without_delaying_healthy(tmp_p
         {"name": "primary", "agent": "opencode", "agent_status": "idle"},
         {"name": "backup", "agent": "claude", "agent_status": "idle"},
     ], {"ok": True}))
-    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
-    monkeypatch.setattr(bridge, "get_agent_status", lambda *a: ("idle", {"ok": True}))
     bridge.init_db()
     first = bridge.create_task("fault", 1000, "primary")
     second = bridge.create_task("healthy", 1000, "backup")
@@ -7095,6 +7093,49 @@ def test_task_worker_preclaim_failure_skips_agent_without_delaying_healthy(tmp_p
             stop.set()
         if task_id == first:
             raise sqlite3.OperationalError("pre-claim error")
+        return original_claim(task_id)
+
+    def execute(**kwargs):
+        res_path = bridge.result_file_path(second)
+        os.makedirs(os.path.dirname(res_path), exist_ok=True)
+        with open(res_path, "w", encoding="utf-8") as f:
+            f.write("healthy answer")
+        stop.set()
+        return "healthy answer"
+
+    monkeypatch.setattr(bridge, "claim_task", claim)
+    monkeypatch.setattr(bridge, "execute_sentinel_task", execute)
+    monkeypatch.setattr(bridge.time, "sleep", lambda s: sleeps.append(s))
+    bridge.task_worker(stop)
+
+    assert attempts == [first, second]
+    assert not sleeps
+    assert bridge.get_task(second)["status"] == "done"
+    assert bridge.get_task(first)["status"] == "queued"
+
+
+def test_task_worker_preclaim_timeout_skips_agent_without_delaying_healthy(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "tasks.db"))
+    monkeypatch.setattr(bridge, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "get_agent_status", lambda *args: ("idle", {"ok": True}))
+    monkeypatch.setattr(bridge, "list_agents", lambda: ([
+        {"name": "primary", "agent": "opencode", "agent_status": "idle"},
+        {"name": "backup", "agent": "claude", "agent_status": "idle"},
+    ], {"ok": True}))
+    bridge.init_db()
+    first = bridge.create_task("fault-timeout", 1000, "primary")
+    second = bridge.create_task("healthy", 1000, "backup")
+    stop = threading_module.Event()
+    original_claim = bridge.claim_task
+    attempts = []
+    sleeps = []
+
+    def claim(task_id):
+        attempts.append(task_id)
+        if len(attempts) > 5:
+            stop.set()
+        if task_id == first:
+            raise TimeoutError("pre-claim timeout")
         return original_claim(task_id)
 
     def execute(**kwargs):
@@ -7141,6 +7182,24 @@ def test_auto_pick_batches_quota_blocks_and_prioritizes_healthy_same_runtime(tmp
     assert len(snapshot_calls) == 1
 
 
+def test_auto_pick_key_handles_unaddressable_agent_without_index_error():
+    assert bridge.auto_pick_key({})[1] is True
+    assert bridge.auto_pick_key({"name": ""})[1] is True
+
+    addressable = {"name": "good", "agent_status": "idle"}
+    unaddressable = {}
+    assert bridge.auto_pick_key(addressable) < bridge.auto_pick_key(unaddressable)
+
+
+def test_auto_pick_handles_uninitialized_database_gracefully(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "DB_PATH", str(tmp_path / "nonexistent-tasks.db"))
+    monkeypatch.setattr(bridge, "list_agents", lambda: ([
+        {"name": "agent-1", "agent": "opencode", "agent_status": "idle"},
+    ], {"ok": True}))
+
+    assert bridge.resolve_agent(None) == "agent-1"
+
+
 def test_startup_security_problems_and_validate_slurm_policy_reject_invalid_default(monkeypatch):
     monkeypatch.setattr(bridge, "DEFAULT_SLURM_POLICY", "invalid-policy")
 
@@ -7149,6 +7208,9 @@ def test_startup_security_problems_and_validate_slurm_policy_reject_invalid_defa
 
     problems = bridge.startup_security_problems()
     assert any("SENTINEL_SLURM_POLICY" in p for p in problems)
+
+    monkeypatch.setattr(bridge.sys, "argv", ["bridge.py", "--check"])
+    assert bridge.main() == 2
 
 
 def test_windows_directory_scope_is_case_insensitive_in_scope_warning(monkeypatch):

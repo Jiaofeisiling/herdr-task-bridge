@@ -98,3 +98,27 @@ jobs:
       - name: Run sentinel.ps1 test suite
         shell: pwsh
         run: Invoke-Pester -Path ./sentinel.Tests.ps1 -Output Detailed -CI
+
+  pester-posix-token:
+    name: pester (Linux token storage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($attempt in 1..3) {
+            try {
+              Install-Module Pester -RequiredVersion 5.6.1 -Scope CurrentUser -Force -SkipPublisherCheck
+              break
+            } catch {
+              if ($attempt -eq 3) { throw }
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+          }
+
+      - name: Run native POSIX token regressions
+        shell: pwsh
+        run: Invoke-Pester -Path ./sentinel.Tests.ps1 -FullNameFilter 'login*','POSIX token storage*','token transaction recovery*' -Output Detailed -CI

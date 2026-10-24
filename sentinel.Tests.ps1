@@ -1771,6 +1771,185 @@ Describe "login" {
     }
 }
 
+Describe 'POSIX token storage' -Skip:([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    BeforeAll {
+        $ast = [Management.Automation.Language.Parser]::ParseFile($Script:ScriptPath, [ref]$null, [ref]$null)
+        foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+            Invoke-Expression $definition.Extent.Text
+        }
+        $Script:PosixActualWrite = ${function:Write-SentinelTokenFile}
+
+        function Start-PosixTokenChild {
+            param([string]$Code, [string]$Mask = '022')
+            # The shell sets umask only in this child; never change the test
+            # host's process-wide mask. Values travel as arguments, not shell code.
+            $prelude = @'
+$ErrorActionPreference = 'Stop'
+try {
+    $ast = [Management.Automation.Language.Parser]::ParseFile($env:SENTINEL_TEST_SCRIPT, [ref]$null, [ref]$null)
+    foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+        Invoke-Expression $definition.Extent.Text
+    }
+'@
+            $ending = @'
+} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+'@
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($prelude + "`n" + $Code + "`n" + $ending))
+            $psi = [Diagnostics.ProcessStartInfo]::new('/bin/sh')
+            foreach ($arg in @('-c', 'umask "$1"; exec "$2" -NoProfile -NonInteractive -EncodedCommand "$3"', 'sentinel-test', $Mask, $Script:HostExe, $encoded)) {
+                $psi.ArgumentList.Add($arg)
+            }
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.Environment['SENTINEL_TEST_SCRIPT'] = $Script:ScriptPath
+            $psi.Environment['SENTINEL_TEST_DIR'] = $Script:PosixDir
+            return [Diagnostics.Process]::Start($psi)
+        }
+    }
+
+    BeforeEach {
+        $Script:PosixDir = Join-Path ([IO.Path]::GetTempPath()) ('sentinel-posix-' + [guid]::NewGuid())
+        $Script:PosixPath = Join-Path $Script:PosixDir 'token'
+        $Script:PosixOld = 'old-posix-placeholder-0123456789'
+        Save-SentinelToken $Script:PosixPath $Script:PosixOld
+    }
+
+    AfterEach {
+        $absolute = [IO.Path]::GetFullPath($Script:PosixDir)
+        if (-not $absolute.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::Ordinal)) {
+            throw 'Unexpected POSIX cleanup path'
+        }
+        $fresh = Join-Path $absolute 'fresh'
+        if ([IO.Directory]::Exists($fresh)) { [IO.File]::SetUnixFileMode($fresh, [IO.UnixFileMode]448) }
+        Remove-Item -LiteralPath $absolute -Recurse -Force -ErrorAction Stop
+    }
+
+    It 'creates usable private files and directories under umask <Mask>' -ForEach @(
+        @{ Mask = '000' }, @{ Mask = '022' }, @{ Mask = '077' }, @{ Mask = '0400' }, @{ Mask = '0777' }
+    ) {
+        $child = Start-PosixTokenChild -Mask $Mask -Code @'
+$fresh = Join-Path $env:SENTINEL_TEST_DIR 'fresh'
+$path = Join-Path $fresh 'token'
+Save-SentinelToken $path 'new-posix-placeholder-0123456789'
+Save-SentinelToken $path 'next-posix-placeholder-0123456789'
+if ([int][IO.File]::GetUnixFileMode($fresh) -ne 448) { throw 'Directory mode is not 0700' }
+foreach ($file in @($path, (Join-Path $fresh '.token.lock'))) {
+    if ([int][IO.File]::GetUnixFileMode($file) -ne 384) { throw 'File mode is not 0600' }
+}
+'@
+        $result = Wait-SentinelExit $child
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        ($result.StdOut + $result.StdErr) | Should -Not -Match 'posix-placeholder'
+        [IO.File]::ReadAllText((Join-Path $Script:PosixDir 'fresh/token')) | Should -Be 'next-posix-placeholder-0123456789'
+    }
+
+    It 'checks mode 0600 while the new file is still empty' {
+        $child = Start-PosixTokenChild -Mask '0400' -Code @'
+$path = Join-Path $env:SENTINEL_TEST_DIR 'empty'
+$stream = New-SentinelPrivateFile $path
+try {
+    if ($stream.Length -ne 0 -or [int][IO.File]::GetUnixFileMode($stream.SafeFileHandle) -ne 384) {
+        throw 'Private creation failed before writing'
+    }
+} finally { $stream.Dispose() }
+'@
+        $result = Wait-SentinelExit $child
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+    }
+
+    It 'recovers a persistent lock left without owner read access by an earlier save' {
+        $lockPath = Join-Path $Script:PosixDir '.token.lock'
+        [IO.File]::SetUnixFileMode($lockPath, [IO.UnixFileMode]128) # 0200
+        Save-SentinelToken $Script:PosixPath 'next-posix-placeholder-0123456789'
+        [IO.File]::ReadAllText($Script:PosixPath) | Should -Be 'next-posix-placeholder-0123456789'
+        Assert-SentinelPrivateFile $lockPath
+        Assert-SentinelPrivateFile $Script:PosixPath
+    }
+
+    It 'waits for another process and recovers when that lock holder is killed' {
+        $holder = Start-PosixTokenChild -Code @'
+$lock = [IO.File]::Open((Join-Path $env:SENTINEL_TEST_DIR '.token.lock'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+try {
+    [IO.File]::WriteAllText((Join-Path $env:SENTINEL_TEST_DIR 'ready'), 'ready')
+    Start-Sleep -Seconds 30
+} finally { $lock.Dispose() }
+'@
+        $waiter = $null
+        try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while (-not [IO.File]::Exists((Join-Path $Script:PosixDir 'ready'))) {
+                if ($holder.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw 'Lock holder did not become ready' }
+                Start-Sleep -Milliseconds 50
+            }
+            $waiter = Start-PosixTokenChild -Code @'
+[IO.File]::WriteAllText((Join-Path $env:SENTINEL_TEST_DIR 'waiting'), 'waiting')
+Save-SentinelToken (Join-Path $env:SENTINEL_TEST_DIR 'token') 'next-posix-placeholder-0123456789'
+'@
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while (-not [IO.File]::Exists((Join-Path $Script:PosixDir 'waiting'))) {
+                if ($waiter.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw 'Waiting process did not become ready' }
+                Start-Sleep -Milliseconds 50
+            }
+            Start-Sleep -Milliseconds 700
+            $waiter.HasExited | Should -BeFalse
+            [IO.File]::ReadAllText($Script:PosixPath) | Should -Be $Script:PosixOld
+            $holder.Kill()
+            $holder.WaitForExit()
+            $result = Wait-SentinelExit $waiter
+            $result.ExitCode | Should -Be 0 -Because $result.StdErr
+            [IO.File]::ReadAllText($Script:PosixPath) | Should -Be 'next-posix-placeholder-0123456789'
+            Assert-SentinelPrivateFile $Script:PosixPath
+        }
+        finally {
+            foreach ($child in @($holder, $waiter)) {
+                if ($null -ne $child -and -not $child.HasExited) { $child.Kill(); $child.WaitForExit() }
+            }
+        }
+    }
+
+    It 'reports a real permission failure and preserves the old readable private token' {
+        [IO.File]::SetUnixFileMode($Script:PosixDir, [IO.UnixFileMode]320) # 0500
+        try {
+            $child = Start-SentinelUnderTest -BaseUrl 'http://127.0.0.1:1' -ScriptArgs @('login') `
+                -Env @{ SENTINEL_CONFIG_DIR = $Script:PosixDir } -StdIn 'next-posix-placeholder-0123456789'
+            $result = Wait-SentinelExit $child
+            $result.ExitCode | Should -Be 1
+            $result.StdErr | Should -Match 'could not save the token safely'
+            $result.StdOut | Should -Not -Match 'Saved the access token'
+            ($result.StdOut + $result.StdErr) | Should -Not -Match 'posix-placeholder'
+            [IO.File]::ReadAllText($Script:PosixPath) | Should -Be $Script:PosixOld
+            Assert-SentinelPrivateFile $Script:PosixPath
+        }
+        finally { [IO.File]::SetUnixFileMode($Script:PosixDir, [IO.UnixFileMode]448) }
+        @(Get-ChildItem -LiteralPath $Script:PosixDir -Force | Where-Object Name -Match '\.(tmp|bak)$').Count | Should -Be 0
+    }
+
+    It 'tightens an existing broad POSIX mode before writing a new token' {
+        [IO.File]::SetUnixFileMode($Script:PosixPath, [IO.UnixFileMode]438) # 0666
+        Mock Write-SentinelTokenFile {
+            param($Stream, $Token)
+            Assert-SentinelPrivateFile $Script:PosixPath
+            [IO.File]::ReadAllText($Script:PosixPath) | Should -Be $Script:PosixOld
+            & $Script:PosixActualWrite $Stream $Token
+        }
+        Save-SentinelToken $Script:PosixPath 'next-posix-placeholder-0123456789'
+        Should -Invoke Write-SentinelTokenFile -Times 1 -Exactly
+        Assert-SentinelPrivateFile $Script:PosixPath
+    }
+
+    It 'rejects a symbolic link without modifying its token target' {
+        $link = Join-Path $Script:PosixDir 'redirect'
+        [IO.Directory]::CreateSymbolicLink($link, $Script:PosixDir) | Out-Null
+        try {
+            { Save-SentinelToken (Join-Path $link 'token') 'next-posix-placeholder-0123456789' } | Should -Throw '*symbolic link*'
+            [IO.File]::ReadAllText($Script:PosixPath) | Should -Be $Script:PosixOld
+            Assert-SentinelPrivateFile $Script:PosixPath
+        }
+        finally { [IO.Directory]::Delete($link) }
+    }
+}
+
 Describe 'token transaction recovery' {
     BeforeAll {
         # Load function definitions only: never execute the CLI's switch/exit.
