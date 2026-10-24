@@ -843,3 +843,46 @@ def test_smoke_preserves_special_characters_in_agent_query(monkeypatch, smoke_mo
         smoke_module.main()
     assert parse_qs(urlparse(urls[0]).query)["agent"] == [identifier]
     assert " " not in urls[0]
+
+
+@pytest.mark.parametrize("duplicate,exact_name,wrong_success,expected", [
+    (False, False, False, 0),
+    (True, False, False, 0),
+    (True, True, False, 0),
+    (True, False, True, 1),
+])
+def test_smoke_checks_runtime_ambiguity_without_rejecting_healthy_deployment(
+    monkeypatch, smoke_module, duplicate, exact_name, wrong_success, expected,
+):
+    from urllib.parse import parse_qs, urlparse
+    agents = [{"name": "primary", "agent": "opencode"}]
+    if duplicate:
+        agents.append({"name": "opencode" if exact_name else "backup", "agent": "opencode"})
+    monkeypatch.setattr(bridge, "list_agents", lambda: (agents, {"ok": True}))
+
+    def probe(url, method="GET", body=None, **kwargs):
+        parsed = urlparse(url)
+        if parsed.path == "/agents":
+            return 200, {"agents": agents}
+        if parsed.path == "/ready":
+            selector = parse_qs(parsed.query)["agent"][0]
+            if wrong_success and selector == "opencode":
+                return 200, {"ok": True}
+            try:
+                bridge.resolve_agent(selector)
+                return 200, {"ok": True, "agent_status": "idle"}
+            except bridge.AgentNotFoundError as error:
+                return 404, {"ok": False, "reason": "agent_not_found", "error": str(error)}
+        if parsed.path == "/ask":
+            return 404, {"reason": "agent_not_found"}
+        if parsed.path in ("/delegate", "/read"):
+            return 400, {}
+        if parsed.path == "/quota":
+            return 200, {"blocked_agents": []}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(smoke_module, "default_token", lambda: None)
+    monkeypatch.setattr(smoke_module.sys, "argv", ["smoke.py", "--url", "http://unused.invalid"])
+    monkeypatch.setattr(smoke_module, "check_channel", lambda *a: {"version": 28, "default_agent": None, "worker_alive": True})
+    monkeypatch.setattr(smoke_module, "request", probe)
+    assert smoke_module.main() == expected

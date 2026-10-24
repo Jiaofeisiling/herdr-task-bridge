@@ -174,7 +174,8 @@ def main():
     # herdr drops an agent's name when the agent process restarts, and pane
     # ids shift when panes are recreated, so any fixed value here would rot.
     identifiers = []
-    families = set()
+    families = {}
+    exact_identifiers = set()
     for agent in agents:
         # Guarded because this reads whatever herdr reported, not anything
         # this script produced. The same assumption -- every entry is a
@@ -186,8 +187,10 @@ def main():
         identifier = agent.get("name") or agent.get("pane_id")
         if identifier:
             identifiers.append(identifier)
+        exact_identifiers.update(value for value in (agent.get("name"), agent.get("pane_id")) if value)
         if agent.get("agent"):
-            families.add(agent["agent"])
+            family = agent["agent"]
+            families[family] = families.get(family, 0) + 1
 
     if not identifiers:
         print("\nAgents are running but none has a name or a pane id, so "
@@ -208,8 +211,12 @@ def main():
         status, body = request(
             f"{base}/ready?{urlencode({'agent': family})}", token=args.token
         )
-        check(f"/ready resolves runtime family '{family}'",
-              status == 200 and body.get("ok"))
+        if families[family] > 1 and family not in exact_identifiers:
+            check(f"/ready rejects ambiguous runtime family '{family}'",
+                  status == 404 and body.get("reason") == "agent_not_found")
+        else:
+            check(f"/ready resolves runtime family '{family}'",
+                  status == 200 and body.get("ok"))
 
     status, body = request(
         base + "/ready?agent=definitely-not-an-agent", token=args.token
