@@ -115,6 +115,13 @@ def cmd_prompt(args, config):
     marker = _busy_marker(agent)
     open(marker, "w").close()
     try:
+        # Test-only gate: exercise overlap without depending on relative speeds.
+        release_file = behavior.get("release_file")
+        deadline = time.monotonic() + 60
+        while release_file and not os.path.exists(release_file):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("fake agent release gate timed out")
+            time.sleep(0.05)
         time.sleep(float(behavior.get("delay", 0)))
 
         # The delegation prompt says where the result goes, on the line after

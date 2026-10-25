@@ -118,6 +118,17 @@ AGENT_NAME_MAX_LENGTH = 200
 # stuck". Override via env var for deployments that need a different limit.
 MAX_QUEUE_DEPTH = int(os.environ.get("SENTINEL_MAX_QUEUE_DEPTH", "50"))
 
+# Bound asynchronous execution independently of the HTTP request threads.
+WORKER_CONCURRENCY = os.environ.get("SENTINEL_WORKER_CONCURRENCY", "4")
+
+
+def validate_worker_concurrency(value):
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        value = int(value)
+    if type(value) is not int or not 1 <= value <= 32:
+        raise ValueError("SENTINEL_WORKER_CONCURRENCY must be an integer from 1 to 32")
+    return value
+
 # A quota/balance failure belongs to the model provider, not Herdr. Open a
 # circuit per agent so the queue immediately uses a different runtime instead
 # of repeatedly spending requests on an account that cannot answer.
@@ -601,6 +612,10 @@ def startup_security_problems():
     Kept apart from auth_token_warning(), which only warns: these stop it.
     """
     problems = []
+    try:
+        validate_worker_concurrency(WORKER_CONCURRENCY)
+    except ValueError as error:
+        problems.append(str(error))
     if DEFAULT_SLURM_POLICY not in SLURM_POLICIES:
         problems.append(
             f"SENTINEL_SLURM_POLICY={DEFAULT_SLURM_POLICY!r} is invalid. "
@@ -2174,6 +2189,7 @@ def clear_agent_quota_blocks(agent_name=None):
 # created lazily and never removed; a handful of long-lived Lock objects
 # for the agents this bridge ever sees is not worth cleaning up.
 _agent_locks = {}
+_queued_agent_locks = {}
 _agent_locks_guard = threading.Lock()
 _agent_locks_changed = threading.Condition(_agent_locks_guard)
 
@@ -2229,11 +2245,21 @@ AVAILABLE_STATES = {
 
 
 def get_agent_lock(agent_name):
+    return _get_alias_lock(agent_name, _agent_locks)
+
+
+def get_queued_agent_lock(agent_name):
+    # Hold the requested agent's queue slot through fallback and settlement.
+    # Actual dispatch still uses get_agent_lock, shared with synchronous calls.
+    return _get_alias_lock(agent_name, _queued_agent_locks)
+
+
+def _get_alias_lock(agent_name, registry):
     # Include old queued rows, which can still carry a pane id alias.
     aliases = live_agent_aliases(agent_name)
     with _agent_locks_guard:
         known = list(dict.fromkeys(
-            _agent_locks[alias]._root() for alias in aliases if alias in _agent_locks
+            registry[alias]._root() for alias in aliases if alias in registry
         ))
         lock = known[0] if known else AgentLock()
         for other in known[1:]:
@@ -2242,7 +2268,7 @@ def get_agent_lock(agent_name):
         # Remember both addresses so a temporary discovery outage, or a
         # name disappearing, cannot give a known pane a second lock.
         for alias in aliases:
-            _agent_locks[alias] = lock
+            registry[alias] = lock
         return lock
 
 
@@ -2914,6 +2940,24 @@ def read_result_file(task_id, cleanup=True):
         print(f"[result] unreadable result file {path}: {e}")
         return None
 
+    fenced = _FENCED_BLOCK.match(content)
+    body = fenced.group(1).strip() if fenced else content
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        payload = None  # Legacy text remains an accepted result format.
+    if isinstance(payload, dict) and "task_id" in payload:
+        receipt_id = payload["task_id"]
+        matches = isinstance(receipt_id, str) and receipt_id == task_id
+        if isinstance(receipt_id, str) and not matches:
+            try:
+                matches = uuid.UUID(receipt_id) == uuid.UUID(task_id)
+            except ValueError:
+                pass
+        if not matches:
+            print(f"[result] task id mismatch for {task_id}; retaining the file for diagnosis")
+            return None
+
     if cleanup:
         discard_result_file(task_id)
 
@@ -3107,11 +3151,16 @@ def quota_failover_candidates(primary_agent):
 
 def build_result_reminder_prompt(task_id):
     return f"""
-你刚才那条委派任务已经做完了，但结果没有写进约定的文件。
+当前委派任务编号：{task_id}
+本轮调用已返回，但桥尚未收到与此任务对应的有效结果，执行状态仍不确定。
 
-不要重新执行任务，不要再运行任何命令，不要改动任何文件。
+不要重新执行任务，不要继续检查、计算或提交作业。仅允许写入下述结果文件，
+可使用完成此写入必需的文件工具或命令，不得修改其他文件。
+只报告此任务已确认的结果；不要把其他任务、旧轮次或其他执行端的回执写到这里。
+若任务未执行、连接失败或无法确认，请如实记录失败或不确定，不要声称已经完成。
+如使用 JSON，请填写 task_id 为 {json.dumps(task_id)}。
 
-只需要把你刚才已经得到的结果写入：
+把已有结果写入：
 {result_file_path(task_id)}
 """.strip()
 
@@ -3652,6 +3701,86 @@ _work_available = threading.Event()
 
 _worker_thread = None
 _worker_stop = None
+_worker_drain_deadline = None
+_worker_maintenance_guard = threading.Lock()
+_worker_last_prune = {}
+
+
+class TaskWorkerPool(threading.Thread):
+    """A bounded worker group whose thread lives until every member exits."""
+    def __init__(self, stop_event, max_workers=None):
+        super().__init__(daemon=True, name="sentinel-task-workers")
+        self.stop_event = stop_event
+        count = validate_worker_concurrency(
+            WORKER_CONCURRENCY if max_workers is None else max_workers)
+        self.workers = [threading.Thread(
+            target=self._run_worker, daemon=True,
+            name=f"sentinel-task-worker-{index + 1}",
+        ) for index in range(count)]
+        self._failed = threading.Event()
+
+    def _run_worker(self):
+        try:
+            task_worker(self.stop_event)
+        finally:
+            if not self.stop_event.is_set() and not _shutting_down:
+                self._failed.set()
+                self.stop_event.set()
+                _work_available.set()
+
+    def run(self):
+        started = []
+        try:
+            for worker in self.workers:
+                worker.start()
+                started.append(worker)
+            for worker in started:
+                worker.join()
+        finally:
+            self.stop_event.set()
+            _work_available.set()
+            for worker in started:
+                worker.join()
+
+    def healthy(self):
+        return (self.is_alive() and not self._failed.is_set()
+                and all(worker.is_alive() for worker in self.workers))
+
+
+def worker_is_healthy():
+    if _worker_thread is None:
+        return None
+    if isinstance(_worker_thread, TaskWorkerPool):
+        return _worker_thread.healthy()
+    return _worker_thread.is_alive()
+
+
+def _retry_worker_settlement(stop_event):
+    if _shutting_down or (stop_event is not None and stop_event.is_set()):
+        deadline = _worker_drain_deadline if _shutting_down else None
+        remaining = ((deadline or 0) - time.monotonic())
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+    else:
+        time.sleep(WORKER_POLL_SECONDS)
+    return True
+
+
+def _prune_worker_history():
+    if not TASK_RETENTION_DAYS or not _worker_maintenance_guard.acquire(False):
+        return
+    try:
+        key = os.path.realpath(DB_PATH)
+        now = time.monotonic()
+        if now - _worker_last_prune.get(key, float("-inf")) < PRUNE_INTERVAL_SEC:
+            return
+        pruned = prune_old_tasks()
+        _worker_last_prune[key] = now
+        if pruned:
+            print(f"[prune] removed {pruned} finished task(s) older than {TASK_RETENTION_DAYS} day(s)")
+    finally:
+        _worker_maintenance_guard.release()
 
 
 def task_worker(stop_event=None):
@@ -3663,176 +3792,222 @@ def task_worker(stop_event=None):
     # is what stops one busy agent's oldest task from starving a
     # different, already-idle agent's tasks sitting behind it.
     busy_this_pass = set()
-    last_prune = float("-inf")
     settlement = None
+    queue_slot = None
 
-    while True:
-        if settlement is not None:
-            finish, args = settlement
+    try:
+        while True:
+            if settlement is not None:
+                finish, args = settlement
+                try:
+                    finish(*args)
+                    settlement = None
+                    if queue_slot is not None:
+                        queue_slot.release()
+                        queue_slot = None
+                    if finish is not requeue_task:
+                        _work_available.set()
+                except Exception as error:
+                    print(f"[worker] task state was not persisted; retrying only persistence: {error}")
+                    if not _retry_worker_settlement(stop_event):
+                        return
+                    continue
+
+            if _shutting_down or (stop_event is not None and stop_event.is_set()):
+                return
             try:
-                finish(*args)
-                settlement = None
-            except Exception as error:
-                print(f"[worker] task state was not persisted; retrying only persistence: {error}")
-                if _shutting_down or (stop_event is not None and stop_event.is_set()):
-                    return
-                time.sleep(WORKER_POLL_SECONDS)
-                continue
+                if _worker_maintenance_guard.acquire(False):
+                    try:
+                        retry_sync_completions()
+                        cancel_blocked_tasks()
+                    finally:
+                        _worker_maintenance_guard.release()
+                task_row = peek_next_task(exclude_agents=busy_this_pass)
 
-        if _shutting_down or (stop_event is not None and stop_event.is_set()):
-            return
-        try:
-            retry_sync_completions()
-            cancel_blocked_tasks()
-            task_row = peek_next_task(exclude_agents=busy_this_pass)
+                if task_row is None:
+                    busy_this_pass.clear()
 
-            if task_row is None:
-                busy_this_pass.clear()
+                    _prune_worker_history()
 
-                if TASK_RETENTION_DAYS and time.monotonic() - last_prune >= PRUNE_INTERVAL_SEC:
-                    last_prune = time.monotonic()
-                    pruned = prune_old_tasks()
-                    if pruned:
-                        print(f"[prune] removed {pruned} finished task(s) older than "
-                              f"{TASK_RETENTION_DAYS} day(s)")
+                    # Cleared before the next look, never after it: a task queued
+                    # in between sets it again, so it is found rather than slept
+                    # through.
+                    _work_available.wait(WORKER_POLL_SECONDS)
+                    _work_available.clear()
+                    continue
 
-                # Cleared before the next look, never after it: a task queued
-                # in between sets it again, so it is found rather than slept
-                # through.
-                _work_available.wait(WORKER_POLL_SECONDS)
-                _work_available.clear()
-                continue
+                # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
+                # 避免维护两份重复的加锁逻辑。
+                agent_name = task_row["agent"]
+                task_id = task_row["task_id"]
+                claimed = False
 
-            # 复用 /ask 用的同一把锁 + 同一套 busy 判断，
-            # 避免维护两份重复的加锁逻辑。
-            agent_name = task_row["agent"]
-            task_id = task_row["task_id"]
-            claimed = False
-
-            try:
-                def operation(target):
-                    with db_session() as conn:
-                        changed = conn.execute(
-                            "UPDATE tasks SET executed_agent = ? "
-                            "WHERE task_id = ? AND status = 'running'", (target, task_id),
-                        ).rowcount
-                    if not changed:
-                        raise SentinelUnavailableError("Task is no longer running")
-                    return execute_sentinel_task(
-                        agent_name=target, task_id=task_id, task=task_row["task"],
-                        timeout_ms=task_row["timeout_ms"],
-                        slurm_policy=task_row["slurm_policy"],
-                    )
-
-                if get_agent_quota_block(agent_name):
-                    # The primary was already proved unavailable for quota
-                    # reasons. Claim once, then actively use a fallback
-                    # without sending another prompt to that account.
-                    if not claim_task(task_id):
+                try:
+                    slot = get_queued_agent_lock(agent_name)
+                    if not slot.acquire(blocking=False):
+                        busy_this_pass.add(agent_name)
                         continue
-                    claimed = True
-                    with execution_budget(task_row["timeout_ms"]):
-                        result, used_agent = run_with_quota_failover(agent_name, operation)
-                else:
-                    with acquire_agent_for_delegation(agent_name):
+                    queue_slot = slot
+                    def operation(target):
+                        with db_session() as conn:
+                            changed = conn.execute(
+                                "UPDATE tasks SET executed_agent = ? "
+                                "WHERE task_id = ? AND status = 'running'", (target, task_id),
+                            ).rowcount
+                        if not changed:
+                            raise SentinelUnavailableError("Task is no longer running")
+                        return execute_sentinel_task(
+                            agent_name=target, task_id=task_id, task=task_row["task"],
+                            timeout_ms=task_row["timeout_ms"],
+                            slurm_policy=task_row["slurm_policy"],
+                        )
+
+                    if get_agent_quota_block(agent_name):
+                        # The primary was already proved unavailable for quota
+                        # reasons. Claim once, then actively use a fallback
+                        # without sending another prompt to that account.
                         if not claim_task(task_id):
                             continue
                         claimed = True
                         with execution_budget(task_row["timeout_ms"]):
-                            result, used_agent = run_with_quota_failover(
-                                agent_name, operation, primary_locked=True,
-                            )
+                            result, used_agent = run_with_quota_failover(agent_name, operation)
+                    else:
+                        with acquire_agent_for_delegation(agent_name):
+                            if not claim_task(task_id):
+                                continue
+                            claimed = True
+                            with execution_budget(task_row["timeout_ms"]):
+                                result, used_agent = run_with_quota_failover(
+                                    agent_name, operation, primary_locked=True,
+                                )
 
-                settlement = (settle_completed_task, (
-                    task_id, result, routing_note(agent_name, used_agent), used_agent,
-                ))
+                    settlement = (settle_completed_task, (
+                        task_id, result, routing_note(agent_name, used_agent), used_agent,
+                    ))
 
-            except TimeoutError as e:
-                # The agent may still be executing, so it cannot safely be
-                # retried on another provider.
-                if claimed:
-                    settlement = (orphan_task, (task_id, str(e)))
-                    print(f"[task {task_id}] orphaned")
-                else:
-                    print(f"[task {task_id}] pre-claim timeout on {agent_name!r}: {e}")
-                    busy_this_pass.add(agent_name)
-                    continue
+                except TimeoutError as e:
+                    # The agent may still be executing, so it cannot safely be
+                    # retried on another provider.
+                    if claimed:
+                        settlement = (orphan_task, (task_id, str(e)))
+                        print(f"[task {task_id}] orphaned")
+                    else:
+                        print(f"[task {task_id}] pre-claim timeout on {agent_name!r}: {e}")
+                        busy_this_pass.add(agent_name)
+                        continue
 
-            except QuotaFailoverExhaustedError as e:
-                detail = str(e)
-                if e.raw_output:
-                    detail += "\n\nRaw provider output:\n" + e.raw_output
-                if claimed:
-                    settlement = (quota_exhausted_task, (task_id, detail))
-                    print(f"[task {task_id}] quota exhausted: {e}")
-                else:
-                    print(f"[task {task_id}] pre-claim quota exhaustion on {agent_name!r}: {e}")
-                    busy_this_pass.add(agent_name)
-                    continue
+                except QuotaFailoverExhaustedError as e:
+                    detail = str(e)
+                    if e.raw_output:
+                        detail += "\n\nRaw provider output:\n" + e.raw_output
+                    if claimed:
+                        settlement = (quota_exhausted_task, (task_id, detail))
+                        print(f"[task {task_id}] quota exhausted: {e}")
+                    else:
+                        print(f"[task {task_id}] pre-claim quota exhaustion on {agent_name!r}: {e}")
+                        busy_this_pass.add(agent_name)
+                        continue
 
-            except (SentinelBusyError, SentinelUnavailableError) as unavailable:
-                settled = (
-                    settle_unreachable_task(task_row)
-                    if isinstance(unavailable, SentinelUnavailableError)
-                    and not claimed
-                    else None
-                )
-                if settled:
-                    print(
-                        f"[task {task_id}] {settled}: its agent "
-                        f"({agent_name}) no longer exists"
+                except (SentinelBusyError, SentinelUnavailableError) as unavailable:
+                    settled = (
+                        settle_unreachable_task(task_row)
+                        if isinstance(unavailable, SentinelUnavailableError)
+                        and not claimed
+                        else None
                     )
+                    if settled:
+                        print(
+                            f"[task {task_id}] {settled}: its agent "
+                            f"({agent_name}) no longer exists"
+                        )
+                        continue
+
+                    if claimed:
+                        # A quota fallback exists but is temporarily occupied or
+                        # unreachable. Preserve the task and retry later; do not
+                        # misreport this as either a completed fallback or a
+                        # permanent quota failure.
+                        settlement = (requeue_task, (task_id,))
+
+                    # This agent's busy/unreachable -- remember that for the
+                    # rest of this pass and immediately look for a task
+                    # against a different agent, instead of sleeping and
+                    # retrying the same oldest-but-busy task.
+                    busy_this_pass.add(agent_name)
                     continue
 
-                if claimed:
-                    # A quota fallback exists but is temporarily occupied or
-                    # unreachable. Preserve the task and retry later; do not
-                    # misreport this as either a completed fallback or a
-                    # permanent quota failure.
-                    settlement = (requeue_task, (task_id,))
+                except Exception as e:
+                    if claimed:
+                        detail = str(e)
+                        # Any failure carrying a terminal tail gets it attached,
+                        # not just a missing result: a refused prompt says only
+                        # "agent_blocked", and the reason is on the screen.
+                        raw_output = getattr(e, "raw_output", "")
+                        if raw_output:
+                            detail += (
+                                "\n\nRaw Sentinel output (last 4000 chars):\n"
+                                + raw_output
+                            )
+                        settlement = (fail_task, (task_id, detail))
+                        print(f"[task {task_id}] error: {e}")
+                    else:
+                        print(f"[task {task_id}] pre-claim error on {agent_name!r}: {e}")
+                        busy_this_pass.add(agent_name)
+                        continue
 
-                # This agent's busy/unreachable -- remember that for the
-                # rest of this pass and immediately look for a task
-                # against a different agent, instead of sleeping and
-                # retrying the same oldest-but-busy task.
-                busy_this_pass.add(agent_name)
-                continue
+                finally:
+                    if settlement is None and queue_slot is not None:
+                        queue_slot.release()
+                        queue_slot = None
 
             except Exception as e:
-                if claimed:
-                    detail = str(e)
-                    # Any failure carrying a terminal tail gets it attached,
-                    # not just a missing result: a refused prompt says only
-                    # "agent_blocked", and the reason is on the screen.
-                    raw_output = getattr(e, "raw_output", "")
-                    if raw_output:
-                        detail += (
-                            "\n\nRaw Sentinel output (last 4000 chars):\n"
-                            + raw_output
-                        )
-                    settlement = (fail_task, (task_id, detail))
-                    print(f"[task {task_id}] error: {e}")
-                else:
-                    print(f"[task {task_id}] pre-claim error on {agent_name!r}: {e}")
-                    busy_this_pass.add(agent_name)
-                    continue
-
-        except Exception as e:
-            # Anything else -- a DB hiccup in peek_next_task/claim_task,
-            # or even orphan_task/fail_task/complete_task itself failing --
-            # must not kill this thread. A dead worker is invisible: /health
-            # keeps reporting healthy and /delegate keeps accepting work
-            # that will now never run. Log it loudly and keep polling.
-            print(f"[worker] unexpected error, will retry: {e}")
-            time.sleep(WORKER_POLL_SECONDS)
+                # Anything else -- a DB hiccup in peek_next_task/claim_task,
+                # or even orphan_task/fail_task/complete_task itself failing --
+                # must not kill this thread. A dead worker is invisible: /health
+                # keeps reporting healthy and /delegate keeps accepting work
+                # that will now never run. Log it loudly and keep polling.
+                print(f"[worker] unexpected error, will retry: {e}")
+                time.sleep(WORKER_POLL_SECONDS)
+    finally:
+        if queue_slot is not None:
+            queue_slot.release()
 
 
 def run_herdr(*args, timeout=None):
+    timeout = remaining_seconds(timeout if timeout is not None else HERDR_DEFAULT_TIMEOUT_SEC)
+    if args[:2] == ("agent", "prompt"):
+        # Make shutdown exclusion atomic with creation, not with the potentially
+        # hours-long --wait. Waiting and killing a timed-out driver hold no guard.
+        with _shutdown_guard:
+            if _shutting_down:
+                raise TimeoutError("Bridge is shutting down; no further prompt was sent. "
+                                   "The earlier task may still be executing.")
+            process = subprocess.Popen(
+                [HERDR, *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        with process:
+            try:
+                stdout, stderr = process.communicate(timeout=remaining_seconds(timeout))
+            except subprocess.TimeoutExpired as error:
+                process.kill()
+                if os.name == "nt":
+                    error.stdout, error.stderr = process.communicate()
+                else:
+                    # Descendants may still hold the pipes. Reap only the
+                    # killed driver, as subprocess.run does on POSIX.
+                    process.wait()
+                raise
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+        return {"ok": process.returncode == 0, "returncode": process.returncode,
+                "stdout": stdout, "stderr": stderr}
     result = subprocess.run(
         [HERDR, *args],
         text=True,
         capture_output=True,
-        timeout=remaining_seconds(timeout if timeout is not None else HERDR_DEFAULT_TIMEOUT_SEC),
+        timeout=timeout,
     )
 
     return {
@@ -3855,6 +4030,7 @@ def build_delegation_prompt(task, task_id, slurm_policy=None):
     # self-justifying sentences were cut.
     return f"""
 以下是一条远程委派的任务。
+任务编号：{task_id}。结果只对应此编号，不要复用其他任务的回执。
 
 ===== 任务开始 =====
 {task}
@@ -3869,7 +4045,7 @@ def build_delegation_prompt(task, task_id, slurm_policy=None):
 {path}
 
 推荐写成一个 JSON 对象，调用方能直接读到状态和 job ID（写纯文本也行，同样会被收下）：
-{{"status": "success|partial|failed|blocked", "summary": "做了什么、结论是什么、有没有卡住", "job_ids": [], "artifacts": [], "metrics": {{}}, "warnings": [], "changed_files": []}}
+{{"task_id": {json.dumps(task_id)}, "status": "success|partial|failed|blocked", "summary": "做了什么、结论是什么、有没有卡住", "job_ids": [], "artifacts": [], "metrics": {{}}, "warnings": [], "changed_files": []}}
 只有 summary 必填；改动了什么写进 changed_files。文件会被整份取走，别写凭据。
 """.strip()
 
@@ -3943,18 +4119,18 @@ def graceful_shutdown(server, grace_sec=None, signame="signal"):
     succession (the screen session is quit, then the process is killed), and
     the second must not repeat what the first did.
     """
-    global _shutting_down
+    global _shutting_down, _worker_drain_deadline
 
     with _shutdown_guard:
         if _shutting_down:
             return True
+        grace = SHUTDOWN_GRACE_SEC if grace_sec is None else grace_sec
+        _worker_drain_deadline = time.monotonic() + grace
         _shutting_down = True
 
     if _worker_stop is not None:
         _worker_stop.set()
     _work_available.set()
-
-    grace = SHUTDOWN_GRACE_SEC if grace_sec is None else grace_sec
 
     print(f"[shutdown] {signame} received; closing the listener")
     server.shutdown()
@@ -4132,9 +4308,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            worker_alive = (
-                _worker_thread.is_alive() if _worker_thread else None
-            )
+            worker_alive = worker_is_healthy()
 
             payload = {
                 "ok": True,
@@ -5080,9 +5254,7 @@ def main():
 def serve_bridge(server):
     global _worker_thread, _worker_stop
     _worker_stop = threading.Event()
-    worker = threading.Thread(
-        target=task_worker, args=(_worker_stop,), daemon=True, name="sentinel-task-worker",
-    )
+    worker = TaskWorkerPool(_worker_stop)
     _worker_thread = worker
     worker.start()
 

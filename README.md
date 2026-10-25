@@ -146,7 +146,7 @@ The service has two execution modes:
 - **Synchronous** — `/ask` and `/prompt` hold the selected agent's lock and keep the request open until the agent finishes.
 - **Asynchronous** — `/delegate` stores a task in SQLite and returns a `task_id` immediately. A background worker executes queued tasks and exposes their state through `/tasks/<id>`.
 
-Locks are **per agent**, so work directed to different agents is isolated. The asynchronous worker itself is intentionally single-threaded; this release does not promise parallel execution of queued tasks across agents. `/health` is independent of Herdr and SQLite, so it answers whether the bridge process is alive even when agents or tasks are busy.
+Locks are **per agent**. The asynchronous queue uses a bounded worker group (default **4**, configured with `SENTINEL_WORKER_CONCURRENCY`, range 1–32), so independent tasks on different agents can run concurrently. Queued tasks addressed to the same agent, including name/pane aliases, remain serial through execution and result persistence. Fallback dispatch takes the actual target agent's lock, shared with synchronous requests. Set concurrency to `1` for serial queue execution. Shared project files still require separate branches/worktrees or explicit writer coordination. `/health` checks every worker without consulting Herdr or SQLite; shutdown stops new claims and drains the entire worker group within its grace period.
 
 ## Quick start
 
@@ -258,6 +258,8 @@ An agent may write its result file as a JSON object instead of prose:
 ```
 
 Only `summary` is required. A fenced ` ```json ` block is accepted. The bridge reads the fields out of the text it was given and serves them as `result_data` with `result_format: "json"`; `result_text` is always the original, so nothing that read it breaks. Prose gives `result_format: "text"` and `result_data: null`.
+
+Delegation and result-only reminders identify the current `task_id`. If a JSON receipt explicitly includes `task_id`, it must match (hyphenated and compact UUID forms are equivalent); a mismatch is retained for diagnosis and is not accepted as the current result. Legacy text and JSON without this optional field remain compatible, so they do not provide the same identity check. A missing receipt leaves execution uncertain: a reminder may only report existing results or failure, never rerun the original work.
 
 A result that looks like JSON but is not usable — cut off, a missing `summary`, a field of the wrong type — is kept as text with a note in `error_text` saying why. It does not fail the task: the work was delivered and only the format slipped.
 
@@ -390,6 +392,7 @@ The remote service reads the following environment variables:
 | `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | Client-side: the label sent as `X-Sentinel-Client` for the audit trail. |
 | `SENTINEL_CONFIG_DIR` | `~/.sentinel` | Client-side: the directory holding the token file `login` writes. |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | Maximum number of queued asynchronous tasks. |
+| `SENTINEL_WORKER_CONCURRENCY` | `4` | Maximum concurrent asynchronous workers, 1–32. Same-agent tasks remain serial. Invalid values prevent startup. |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | unset | Comma-separated, ordered fallback-agent allowlist after a quota failure. |
 | `SENTINEL_SLURM_POLICY` | `submit` | Deployment default Slurm policy; a request's `slurm_policy` overrides it. |
 | `SENTINEL_AGENT_PRIORITY` | unset | Ordered cost preference, cheapest first, matched on agent name or runtime family. Only orders agents that can take work now. |

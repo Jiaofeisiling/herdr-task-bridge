@@ -146,7 +146,7 @@ Linux 主机上的 bridge.py（ThreadingHTTPServer + SQLite）
 - **同步**：`/ask` 和 `/prompt` 会持有目标 agent 的锁，并保持 HTTP 请求直到 agent 完成。
 - **异步**：`/delegate` 将任务写入 SQLite 后立即返回 `task_id`。后台 worker 执行排队任务，状态可通过 `/tasks/<id>` 查询。
 
-锁是**按 agent 分开的**，因此投递给不同 agent 的同步工作彼此隔离。异步 worker 本身有意保持单线程；当前版本不承诺异步队列能跨 agent 并行执行。`/health` 不依赖 Herdr 或 SQLite，所以即使 agent 或任务繁忙，也能只回答 bridge 进程是否存活。
+锁是**按 agent 分开的**。异步队列使用有上限的 worker 组（默认 **4**，由 `SENTINEL_WORKER_CONCURRENCY` 配置，范围 1–32），允许不同 agent 的独立任务并行执行。同一 agent 的异步任务（含名称与 pane 别名）从执行到结果持久化保持串行；故障切换还会取得实际目标 agent 的锁，并与同步请求共用。设为 `1` 可恢复串行队列。共享项目文件仍须使用独立 branch/worktree 或明确的写入协调。`/health` 检查全部 worker，不查询 Herdr 或 SQLite；关停会停止领取新任务，并在宽限期内等待整个 worker 组完成结算。
 
 ## 快速开始
 
@@ -258,6 +258,8 @@ agent 可以把结果文件写成 JSON 对象，而不是一段文字：
 ```
 
 只有 `summary` 必填。用 ` ```json ` 围栏包起来也能识别。桥从收到的文本里读出这些字段，以 `result_data` 和 `result_format: "json"` 提供；`result_text` 永远是原文，所以任何读它的东西都不会坏。纯文本则是 `result_format: "text"`、`result_data: null`。
+
+委派和结果补写提醒会标明当前 `task_id`。JSON 回执若显式填写了 `task_id`，必须与当前任务一致（UUID 带连字符和紧凑形式等价）；不匹配的文件会保留供诊断，不作为当前结果接收。纯文本及未填写此可选字段的旧 JSON 仍兼容，因此不具备相同的编号核验能力。缺少回执时，执行状态仍不确定；补写提醒只允许报告已有结果或失败，不允许重跑原任务。
 
 看起来像 JSON 却不可用的结果——被截断、缺 `summary`、字段类型不对——按文本保留，并在 `error_text` 里加一条说明原因。它**不会**让任务失败：工作已经交付，出问题的只是格式。
 
@@ -390,6 +392,7 @@ sentinel quota-reset -Agent "your-agent-name"
 | `SENTINEL_CLIENT_NAME` | `sentinel.ps1` | 客户端：作为 `X-Sentinel-Client` 发送、用于审计的标签。 |
 | `SENTINEL_CONFIG_DIR` | `~/.sentinel` | 客户端：存放 `login` 所写令牌文件的目录。 |
 | `SENTINEL_MAX_QUEUE_DEPTH` | `50` | 异步队列允许的最大排队任务数。 |
+| `SENTINEL_WORKER_CONCURRENCY` | `4` | 异步 worker 并发上限，范围 1–32。同一 agent 仍串行，非法值会阻止启动。 |
 | `SENTINEL_QUOTA_FAILOVER_AGENTS` | 未设置 | 额度失败后的逗号分隔、有序备用 agent 白名单。 |
 | `SENTINEL_SLURM_POLICY` | `submit` | 部署级默认 Slurm 策略；请求里的 `slurm_policy` 可覆盖。 |
 | `SENTINEL_AGENT_PRIORITY` | 未设置 | 成本偏好顺序，便宜的在前；按 agent 名或运行时家族匹配。只对当前能接活的 agent 排序。 |

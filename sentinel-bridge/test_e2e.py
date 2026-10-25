@@ -216,6 +216,29 @@ def test_a_task_runs_through_the_real_process_and_its_structured_result_is_serve
 # -- a process killed without warning --------------------------------------
 
 
+def test_real_worker_pool_finishes_another_agent_while_first_is_still_running(world):
+    release = world.root / "release-alpha"
+    world.configure([ALPHA, BETA], {
+        "alpha": {"release_file": str(release), "text": "alpha complete"},
+        "beta": {"text": "beta complete"},
+    })
+    bridge = world.start_bridge(SENTINEL_WORKER_CONCURRENCY=2)
+    first = delegate(bridge, "first alpha", agent="alpha")
+    try:
+        wait_for(lambda: any(p["agent"] == "alpha" for p in world.prompts()))
+        second = delegate(bridge, "second alpha alias", agent="w1:p1")
+        independent = delegate(bridge, "independent beta", agent="beta")
+        assert bridge.wait_status(independent, "done", "error")["status"] == "done"
+        assert bridge.task(first)["status"] == "running"
+        assert bridge.task(second)["status"] == "queued"
+        assert sorted(p["agent"] for p in world.prompts()) == ["alpha", "beta"]
+    finally:
+        release.write_text("released", encoding="utf-8")
+    assert bridge.wait_status(first, "done", "error")["status"] == "done"
+    assert bridge.wait_status(second, "done", "error")["status"] == "done"
+    assert sorted(p["agent"] for p in world.prompts()) == ["alpha", "alpha", "beta"]
+
+
 def test_a_killed_bridge_orphans_its_running_task_and_never_reruns_it(world):
     # The claim: when the bridge dies mid-task the work may or may not have
     # happened, so it must not be run again. It would be broken if the task
